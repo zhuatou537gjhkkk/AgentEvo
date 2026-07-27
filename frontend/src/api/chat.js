@@ -336,7 +336,7 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
                     return;
                 }
 
-                if (eventType === 'tool_start' || eventType === 'tool_end' || eventType === 'thought' || eventType === 'metrics') {
+                if (eventType === 'tool_start' || eventType === 'tool_end' || eventType === 'tool_error' || eventType === 'thought' || eventType === 'metrics') {
                     onToolEvent(parsed);
                 }
             } catch {

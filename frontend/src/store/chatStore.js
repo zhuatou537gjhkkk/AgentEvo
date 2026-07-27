@@ -15,6 +15,7 @@ import {
     createSessionBranch,
     deleteMessagePair,
 } from '../api/chat';
+import { createToolExecutionStateMachine } from '../utils/toolExecutionStateMachine';
 
 const initialMessage = {
     id: 'init',
@@ -1255,6 +1256,46 @@ export const useChatStore = create(persist((set, get) => ({
             });
         };
 
+        // ── 创建本轮工具执行状态机 ─────────────────────
+        const toolStateMachine = createToolExecutionStateMachine({
+            timeoutMs: 60000,
+            perToolTimeout: new Map([['web_search', 90000]]),
+        });
+
+        const syncToolLogs = () => {
+            const entries = toolStateMachine.getAll();
+            const logs = entries.map((entry) => ({
+                id: entry.id,
+                name: entry.name,
+                input: entry.input,
+                output: entry.output,
+                status: entry.status,
+                error: entry.error,
+                retryCount: entry.retryCount,
+                startedAt: entry.startedAt,
+                endedAt: entry.endedAt,
+            }));
+
+            set((state) => ({
+                messages: (() => {
+                    const nextMessages = [...state.messages];
+                    const tailIndex = nextMessages.length - 1;
+                    const tail = nextMessages[tailIndex];
+
+                    if (!tail || tail.role !== 'assistant') {
+                        return state.messages;
+                    }
+
+                    nextMessages[tailIndex] = {
+                        ...tail,
+                        toolLogs: logs,
+                    };
+
+                    return nextMessages;
+                })(),
+            }));
+        };
+
         set({
             activeAbortController: controller,
             activeStreamToken: streamToken,
@@ -1286,76 +1327,93 @@ export const useChatStore = create(persist((set, get) => ({
                 cancelChunkFrame();
                 flushPendingAssistantChunk();
 
-                set((state) => ({
-                    messages: (() => {
-                        const nextMessages = [...state.messages];
-                        const tailIndex = nextMessages.length - 1;
-                        const tail = nextMessages[tailIndex];
+                // ── 通过状态机处理工具事件 ─────────────
+                const toolCallId = toolData?.toolCallId || '';
 
-                        if (!tail || tail.role !== 'assistant') {
-                            return state.messages;
-                        }
+                if (toolData?.type === 'tool_start') {
+                    if (toolCallId) {
+                        toolStateMachine.create(toolCallId, toolData.toolName || 'unknown', toolData.input);
+                        toolStateMachine.start(toolCallId);
+                    }
+                    syncToolLogs();
+                } else if (toolData?.type === 'tool_end') {
+                    if (toolCallId) {
+                        toolStateMachine.end(toolCallId, toolData.output);
+                    }
+                    syncToolLogs();
+                } else if (toolData?.type === 'tool_error') {
+                    if (toolCallId) {
+                        toolStateMachine.error(toolCallId, toolData.error || '工具执行异常');
+                    }
+                    syncToolLogs();
+                } else if (toolData?.type === 'thought' && toolData?.text) {
+                    // 思考日志保持原有处理方式
+                    set((state) => ({
+                        messages: (() => {
+                            const nextMessages = [...state.messages];
+                            const tailIndex = nextMessages.length - 1;
+                            const tail = nextMessages[tailIndex];
 
-                        const currentToolLogs = Array.isArray(tail.toolLogs) ? [...tail.toolLogs] : [];
-                        const currentThoughtLogs = Array.isArray(tail.thoughtLogs) ? [...tail.thoughtLogs] : [];
-
-                        if (toolData?.type === 'tool_start') {
-                            currentToolLogs.push({
-                                name: toolData.toolName,
-                                input: toolData.input,
-                                status: 'running',
-                            });
-                        }
-
-                        if (toolData?.type === 'tool_end') {
-                            for (let i = currentToolLogs.length - 1; i >= 0; i -= 1) {
-                                const log = currentToolLogs[i];
-                                if (log.name === toolData.toolName && log.status === 'running') {
-                                    currentToolLogs[i] = {
-                                        ...log,
-                                        status: 'success',
-                                    };
-                                    break;
-                                }
+                            if (!tail || tail.role !== 'assistant') {
+                                return state.messages;
                             }
-                        }
 
-                        if (toolData?.type === 'thought' && toolData?.text) {
+                            const currentThoughtLogs = Array.isArray(tail.thoughtLogs) ? [...tail.thoughtLogs] : [];
                             currentThoughtLogs.push({
                                 text: toolData.text,
                                 status: toolData.status || 'running',
                                 at: toolData.at || new Date().toISOString(),
                             });
-                        }
 
-                        const nextMetrics = toolData?.type === 'metrics'
-                            ? {
-                                latency_ms: Number(toolData?.metrics?.latency_ms) || 0,
-                                prompt_tokens: Number(toolData?.metrics?.prompt_tokens) || 0,
-                                completion_tokens: Number(toolData?.metrics?.completion_tokens) || 0,
-                                total_tokens: Number(toolData?.metrics?.total_tokens) || 0,
-                                model: String(toolData?.metrics?.model || ''),
+                            nextMessages[tailIndex] = {
+                                ...tail,
+                                thoughtLogs: currentThoughtLogs,
+                            };
+
+                            return nextMessages;
+                        })(),
+                    }));
+                } else if (toolData?.type === 'metrics') {
+                    set((state) => ({
+                        messages: (() => {
+                            const nextMessages = [...state.messages];
+                            const tailIndex = nextMessages.length - 1;
+                            const tail = nextMessages[tailIndex];
+
+                            if (!tail || tail.role !== 'assistant') {
+                                return state.messages;
                             }
-                            : tail.metrics;
 
-                        nextMessages[tailIndex] = {
-                            ...tail,
-                            toolLogs: currentToolLogs,
-                            thoughtLogs: currentThoughtLogs,
-                            metrics: nextMetrics,
-                        };
+                            nextMessages[tailIndex] = {
+                                ...tail,
+                                metrics: {
+                                    latency_ms: Number(toolData?.metrics?.latency_ms) || 0,
+                                    prompt_tokens: Number(toolData?.metrics?.prompt_tokens) || 0,
+                                    completion_tokens: Number(toolData?.metrics?.completion_tokens) || 0,
+                                    total_tokens: Number(toolData?.metrics?.total_tokens) || 0,
+                                    model: String(toolData?.metrics?.model || ''),
+                                },
+                            };
 
-                        return nextMessages;
-                    })(),
-                }));
+                            return nextMessages;
+                        })(),
+                    }));
+                }
             },
             () => {
                 const latest = get();
                 if (latest.currentSessionId !== sessionId || latest.activeStreamToken !== streamToken) {
                     cancelChunkFrame();
                     pendingAssistantChunk = '';
+                    // 清理状态机
+                    toolStateMachine.destroy();
                     return;
                 }
+
+                // 流正常结束，取消所有未完成的工具
+                toolStateMachine.cancelAll();
+                syncToolLogs();
+                toolStateMachine.destroy();
 
                 cancelChunkFrame();
                 flushPendingAssistantChunk();
@@ -1404,8 +1462,15 @@ export const useChatStore = create(persist((set, get) => ({
                 if (latest.currentSessionId !== sessionId || latest.activeStreamToken !== streamToken) {
                     cancelChunkFrame();
                     pendingAssistantChunk = '';
+                    // 清理状态机
+                    toolStateMachine.destroy();
                     return;
                 }
+
+                // 流出错，取消所有进行中的工具
+                toolStateMachine.cancelAll();
+                syncToolLogs();
+                toolStateMachine.destroy();
 
                 cancelChunkFrame();
                 flushPendingAssistantChunk();

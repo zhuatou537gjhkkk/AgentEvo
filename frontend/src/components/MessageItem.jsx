@@ -306,13 +306,51 @@ function MessageItem({ message }) {
             return null;
         }
 
+        const statusConfig = {
+            pending: { icon: '⏸', label: '等待中', color: 'text-slate-400', bg: 'bg-slate-700/50' },
+            executing: { icon: '⏳', label: '执行中', color: 'text-blue-400', bg: 'bg-blue-700/30' },
+            success: { icon: '✅', label: '成功', color: 'text-emerald-400', bg: 'bg-emerald-700/20' },
+            error: { icon: '❌', label: '失败', color: 'text-red-400', bg: 'bg-red-700/30' },
+            timeout: { icon: '⏰', label: '超时', color: 'text-amber-400', bg: 'bg-amber-700/30' },
+            cancelled: { icon: '⊘', label: '已取消', color: 'text-slate-400', bg: 'bg-slate-700/50' },
+        };
+
         return (
-            <div className="mb-2 rounded-md bg-gray-800 p-2 font-mono text-xs text-green-400 dark:bg-slate-900 dark:text-emerald-300">
-                {toolLogs.map((log, index) => (
-                    <div key={`${log.name}-${index}`} className="whitespace-pre-wrap break-words">
-                        {`> 执行工具: ${log.name} ... ${log.status === 'running' ? '⏳' : '✅'}`}
-                    </div>
-                ))}
+            <div className="mb-2 rounded-md bg-gray-800 p-2 font-mono text-xs dark:bg-slate-900">
+                {toolLogs.map((log, index) => {
+                    const config = statusConfig[log.status] || statusConfig.executing;
+                    const duration = log.startedAt && log.endedAt
+                        ? ` ${log.endedAt - log.startedAt}ms`
+                        : '';
+                    const isError = log.status === 'error' || log.status === 'timeout';
+                    const hasError = Boolean(log.error);
+                    const hasRetry = log.retryCount > 0;
+
+                    return (
+                        <div key={log.id || `${log.name}-${index}`} className="mb-1 last:mb-0">
+                            <div className="flex items-start gap-2">
+                                <span className={`mt-0.5 shrink-0 rounded px-1 py-0.5 text-[11px] ${config.bg} ${config.color}`}>
+                                    {config.icon}
+                                </span>
+                                <div className="min-w-0 flex-1">
+                                    <span className={`whitespace-pre-wrap break-words ${config.color}`}>
+                                        {`> 执行工具: ${log.name} ${config.icon}${duration}`}
+                                    </span>
+                                    {hasRetry && (
+                                        <span className="ml-1 text-amber-400">
+                                            (重试 {log.retryCount} 次)
+                                        </span>
+                                    )}
+                                </div>
+                            </div>
+                            {isError && hasError && (
+                                <div className="ml-8 mt-1 break-words text-red-400/80">
+                                    错误: {log.error}
+                                </div>
+                            )}
+                        </div>
+                    );
+                })}
             </div>
         );
     };
@@ -617,8 +655,12 @@ export default memo(
             prevProps.message?.metrics?.model === nextProps.message?.metrics?.model &&
             prevLogs.length === nextLogs.length &&
             prevThoughtLogs.length === nextThoughtLogs.length &&
+            prevLastLog?.id === nextLastLog?.id &&
             prevLastLog?.name === nextLastLog?.name &&
             prevLastLog?.status === nextLastLog?.status &&
+            prevLastLog?.error === nextLastLog?.error &&
+            prevLastLog?.retryCount === nextLastLog?.retryCount &&
+            prevLastLog?.endedAt === nextLastLog?.endedAt &&
             prevLastThought?.text === nextLastThought?.text &&
             prevLastThought?.status === nextLastThought?.status
         );

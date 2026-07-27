@@ -939,7 +939,7 @@ app.post("/chat", requireAuth, async (req, res) => {
         return;
     }
 
-    if (isKnowledgeIntent(message)) {
+    if (isKnowledgeIntent(message) && !resolvedImage) {
         const shouldUseLargeContext = mentionsActiveLargeFile(message, activeLargeFile);
 
         if (shouldUseLargeContext) {

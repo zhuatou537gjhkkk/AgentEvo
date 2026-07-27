@@ -46,12 +46,12 @@ const upload = multer({
 });
 
 const embeddings = new OpenAIEmbeddings({
-    modelName: process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-v2",
-    model: process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-v2",
+    modelName: process.env.OPENAI_EMBEDDING_MODEL || "qwen3.7-text-embedding",
+    model: process.env.OPENAI_EMBEDDING_MODEL || "qwen3.7-text-embedding",
     batchSize: EMBED_BATCH_SIZE,
     configuration: {
-        apiKey: process.env.OPENAI_API_KEY || process.env.DASHSCOPE_API_KEY,
-        baseURL: process.env.OPENAI_BASE_URL || process.env.DASHSCOPE_BASE_URL
+        apiKey: process.env.OPENAI_EMBEDDING_API_KEY || process.env.OPENAI_API_KEY || process.env.DASHSCOPE_API_KEY,
+        baseURL: process.env.OPENAI_EMBEDDING_BASE_URL || process.env.OPENAI_BASE_URL || process.env.DASHSCOPE_BASE_URL
     }
 });
 

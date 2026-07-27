@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, AIMessage, SystemMessage } from "@langchain/core/messages";
 import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
@@ -19,17 +20,27 @@ function estimateTokens(text) {
     return Math.max(1, Math.ceil(source.length / 4));
 }
 
+function buildChatOpenAIConfig() {
+    return {
+        apiKey: process.env.OPENAI_API_KEY,
+        configuration: {
+            baseURL: process.env.OPENAI_BASE_URL,
+        },
+        timeout: 120000,
+    };
+}
+
 function resolveModelName(hasImage = false, forceModel = null) {
     if (forceModel) {
         return forceModel;
     }
 
     if (hasImage) {
-        // 视觉模式建议将环境变量切换为支持多模态的模型，如 qwen-vl-max 或 qwen-vl-plus。
-        return process.env.QWEN_VISION_MODEL || process.env.OPENAI_MODEL || "qwen-vl-plus";
+        // agnes-2.0-flash 支持多模态识图，默认使用该模型
+        return process.env.QWEN_VISION_MODEL || process.env.OPENAI_MODEL || "agnes-2.0-flash";
     }
 
-    return process.env.QWEN_MODEL || process.env.OPENAI_MODEL || "qwen-turbo";
+    return process.env.QWEN_MODEL || process.env.OPENAI_MODEL || "agnes-2.0-flash";
 }
 
 function emitThought(res, text, status = "running") {
@@ -149,7 +160,8 @@ async function getAgentExecutor(enableWebSearch, temperature, systemPrompt) {
     const llm = new ChatOpenAI({
         modelName: resolveModelName(false),
         temperature,
-        streaming: true
+        streaming: true,
+        ...buildChatOpenAIConfig(),
     });
     const prompt = buildPrompt(enableWebSearch, systemPrompt);
     const agent = await createToolCallingAgent({
@@ -192,7 +204,8 @@ async function streamDirectChat({
     const llm = new ChatOpenAI({
         modelName: resolveModelName(hasImage, forceModel),
         temperature,
-        streaming: true
+        streaming: true,
+        ...buildChatOpenAIConfig(),
     });
 
     const messages = [
@@ -294,37 +307,58 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
             const webSearchTool = agentTools.find((tool) => tool.name === WEB_SEARCH_TOOL_NAME);
 
             if (webSearchTool) {
+                const forcedToolCallId = crypto.randomUUID();
                 const startedAt = new Date().toISOString();
                 console.log(
-                    `[agent][tool_start][forced] at=${startedAt} name=${WEB_SEARCH_TOOL_NAME} input=${JSON.stringify(normalizedUserMessage)}`
+                    `[agent][tool_start][forced] at=${startedAt} id=${forcedToolCallId} name=${WEB_SEARCH_TOOL_NAME} input=${JSON.stringify(normalizedUserMessage)}`
                 );
                 res.write(
                     `data: ${JSON.stringify({
                         type: "tool_start",
+                        toolCallId: forcedToolCallId,
                         toolName: WEB_SEARCH_TOOL_NAME,
                         input: normalizedUserMessage
                     })}\n\n`
                 );
 
                 let forcedSearchOutput = "";
+                let forcedSearchError = null;
 
                 try {
                     const toolResult = await webSearchTool.invoke(normalizedUserMessage);
                     forcedSearchOutput = normalizeChunkContent(toolResult).slice(0, FORCED_WEB_SEARCH_MAX_CHARS);
-                } catch (forcedSearchError) {
-                    forcedSearchOutput = `强制联网检索失败: ${forcedSearchError?.message || "unknown error"}`;
+                } catch (forcedSearchErrorObj) {
+                    forcedSearchError = forcedSearchErrorObj?.message || "unknown error";
+                    forcedSearchOutput = `强制联网检索失败: ${forcedSearchError}`;
                 }
 
                 const endedAt = new Date().toISOString();
-                console.log(
-                    `[agent][tool_end][forced] at=${endedAt} name=${WEB_SEARCH_TOOL_NAME} output=${JSON.stringify(forcedSearchOutput)}`
-                );
-                res.write(
-                    `data: ${JSON.stringify({
-                        type: "tool_end",
-                        toolName: WEB_SEARCH_TOOL_NAME
-                    })}\n\n`
-                );
+
+                if (forcedSearchError) {
+                    console.log(
+                        `[agent][tool_error][forced] at=${endedAt} id=${forcedToolCallId} name=${WEB_SEARCH_TOOL_NAME} error=${forcedSearchError}`
+                    );
+                    res.write(
+                        `data: ${JSON.stringify({
+                            type: "tool_error",
+                            toolCallId: forcedToolCallId,
+                            toolName: WEB_SEARCH_TOOL_NAME,
+                            error: forcedSearchError
+                        })}\n\n`
+                    );
+                } else {
+                    console.log(
+                        `[agent][tool_end][forced] at=${endedAt} id=${forcedToolCallId} name=${WEB_SEARCH_TOOL_NAME} output=${JSON.stringify(forcedSearchOutput)}`
+                    );
+                    res.write(
+                        `data: ${JSON.stringify({
+                            type: "tool_end",
+                            toolCallId: forcedToolCallId,
+                            toolName: WEB_SEARCH_TOOL_NAME,
+                            output: forcedSearchOutput.slice(0, 500)
+                        })}\n\n`
+                    );
+                }
 
                 if (forcedSearchOutput) {
                     inputForAgent = `${normalizedUserMessage}\n\n[系统提示] 已按“联网:开”强制执行一次 web_search，请优先基于以下检索结果回答；如证据不足可再调用 web_search 补充。\n${forcedSearchOutput}`;
@@ -333,60 +367,99 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
             }
         }
 
-        emitThought(res, "正在调用模型生成回答");
+        if (enableWebSearch) {
+            // 联网模式：使用 Agent 编排工具调用
+            emitThought(res, "正在调用模型生成回答");
 
-        const agentExecutor = await getAgentExecutor(enableWebSearch, temperature, systemPrompt);
-        const eventStream = await agentExecutor.streamEvents(
-            {
-                input: inputForAgent,
-                chat_history: formattedHistory,
-                current_date: new Date().toLocaleString()
-            },
-            { version: "v2" }
-        );
+            const agentExecutor = await getAgentExecutor(true, temperature, systemPrompt);
+            console.log(`[agent] model=${resolveModelName(false)} baseURL=${process.env.OPENAI_BASE_URL}`);
+            const eventStream = await agentExecutor.streamEvents(
+                {
+                    input: inputForAgent,
+                    chat_history: formattedHistory,
+                    current_date: new Date().toLocaleString()
+                },
+                { version: "v2" }
+            );
 
-        for await (const event of eventStream) {
-            if (event.event === "on_tool_start") {
-                const startedAt = new Date().toISOString();
-                console.log(
-                    `[agent][tool_start] at=${startedAt} name=${event.name || "unknown"} input=${JSON.stringify(event?.data?.input ?? {})}`
-                );
-                res.write(
-                    `data: ${JSON.stringify({
-                        type: "tool_start",
-                        toolName: event.name || "unknown",
-                        input: event?.data?.input ?? {}
-                    })}\n\n`
-                );
-                continue;
+            for await (const event of eventStream) {
+                console.log(`[agent][event] type=${event.event} name=${event.name || "-"}`);
+                if (event.event === "on_tool_start") {
+                    const toolCallId = event.run_id || crypto.randomUUID();
+                    console.log(
+                        `[agent][tool_start] id=${toolCallId} name=${event.name || "unknown"}`
+                    );
+                    res.write(
+                        `data: ${JSON.stringify({
+                            type: "tool_start",
+                            toolCallId,
+                            toolName: event.name || "unknown",
+                            input: event?.data?.input ?? {}
+                        })}\n\n`
+                    );
+                    continue;
+                }
+
+                if (event.event === "on_tool_end") {
+                    const toolCallId = event.run_id || "";
+                    const output = event?.data?.output ?? "";
+                    console.log(
+                        `[agent][tool_end] id=${toolCallId} name=${event.name || "unknown"}`
+                    );
+                    res.write(
+                        `data: ${JSON.stringify({
+                            type: "tool_end",
+                            toolCallId,
+                            toolName: event.name || "unknown",
+                            output: typeof output === "string" ? output.slice(0, 500) : ""
+                        })}\n\n`
+                    );
+                    continue;
+                }
+
+                if (event.event === "on_tool_error") {
+                    const toolCallId = event.run_id || "";
+                    const errorMessage = event?.data?.error?.message || event?.data?.error || "工具执行异常";
+                    console.log(
+                        `[agent][tool_error] id=${toolCallId} name=${event.name || "unknown"} error=${errorMessage}`
+                    );
+                    res.write(
+                        `data: ${JSON.stringify({
+                            type: "tool_error",
+                            toolCallId,
+                            toolName: event.name || "unknown",
+                            error: String(errorMessage)
+                        })}\n\n`
+                    );
+                    continue;
+                }
+
+                if (event.event !== "on_chat_model_stream") {
+                    continue;
+                }
+
+                const text = normalizeChunkContent(event?.data?.chunk?.content);
+
+                if (!text) {
+                    continue;
+                }
+
+                fullText += text;
+                res.write(`data: ${JSON.stringify({ type: "text", text })}\n\n`);
             }
-
-            if (event.event === "on_tool_end") {
-                const endedAt = new Date().toISOString();
-                console.log(
-                    `[agent][tool_end] at=${endedAt} name=${event.name || "unknown"} output=${JSON.stringify(event?.data?.output ?? "")}`
-                );
-                res.write(
-                    `data: ${JSON.stringify({
-                        type: "tool_end",
-                        toolName: event.name || "unknown"
-                    })}\n\n`
-                );
-                continue;
-            }
-
-            if (event.event !== "on_chat_model_stream") {
-                continue;
-            }
-
-            const text = normalizeChunkContent(event?.data?.chunk?.content);
-
-            if (!text) {
-                continue;
-            }
-
-            fullText += text;
-            res.write(`data: ${JSON.stringify({ type: "text", text })}\n\n`);
+        } else {
+            // 非联网模式：直接对话，无需 Agent
+            emitThought(res, "准备生成回答");
+            const directSystemInstruction = buildDirectAnswerSystemInstruction(false, systemPrompt);
+            fullText = await streamDirectChat({
+                userMessage: normalizedUserMessage,
+                image,
+                formattedHistory,
+                res,
+                systemInstruction: directSystemInstruction,
+                temperature,
+                forceModel
+            });
         }
 
         const assistantMessageId = saveMessage(userId, session_id, "assistant", fullText);
@@ -406,6 +479,7 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
         res.write("data: [DONE]\n\n");
         res.end();
     } catch (error) {
+        console.error(`[agent][fatal] message="${error.message}" stack="${error.stack}"`);
         emitThought(res, "生成过程发生错误", "error");
         res.write(
             `data: ${JSON.stringify({ error: error.message || "stream failed" })}\n\n`

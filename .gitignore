@@ -19,10 +19,16 @@ pnpm-debug.log*
 .env.*
 !.env.example
 
+# Claude Code
+.claude/
+
 # Build artifacts
 **/dist/
 **/build/
 **/coverage/
+
+# LeetCode progress (personal tracking, not for repo)
+leetcode-progress.json
 
 # SQLite
 *.db
@@ -31,3 +37,7 @@ pnpm-debug.log*
 *.db-wal
 *.db-shm
 *.db-journal
+
+# 本地文件
+docs
+test
