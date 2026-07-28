@@ -198,7 +198,8 @@ async function streamDirectChat({
     res,
     systemInstruction,
     temperature,
-    forceModel
+    forceModel,
+    abortController,
 }) {
     const hasImage = Boolean(image);
     const llm = new ChatOpenAI({
@@ -218,6 +219,10 @@ async function streamDirectChat({
     const stream = await llm.stream(messages);
 
     for await (const chunk of stream) {
+        if (abortController?.signal.aborted) {
+            console.log('[agent] streamDirectChat aborted by client disconnect');
+            break;
+        }
         const text = normalizeChunkContent(chunk?.content);
         if (!text) {
             continue;
@@ -244,6 +249,18 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
     const hasImage = Boolean(image);
     const startedAt = Date.now();
     const modelName = resolveModelName(hasImage, forceModel);
+
+    const abortController = new AbortController();
+    let clientDisconnected = false;
+    const onClientClose = () => {
+        clientDisconnected = true;
+        if (!abortController.signal.aborted) {
+            console.log('[agent] client disconnected, aborting upstream stream');
+            abortController.abort();
+        }
+    };
+    res.on('close', onClientClose);
+    const cleanupDisconnect = () => { res.off('close', onClientClose); };
 
     if (!skipUserMessageSave) {
         saveMessage(userId, session_id, "user", userMessageForStorage ?? normalizedUserMessage);
@@ -280,7 +297,8 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                 res,
                 systemInstruction: directSystemInstruction,
                 temperature,
-                forceModel
+                forceModel,
+                abortController,
             });
 
             const assistantMessageId = saveMessage(userId, session_id, "assistant", fullText);
@@ -299,6 +317,7 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
             emitThought(res, "回答生成完成", "done");
             res.write("data: [DONE]\n\n");
             res.end();
+            cleanupDisconnect();
             return;
         }
 
@@ -317,7 +336,8 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                         type: "tool_start",
                         toolCallId: forcedToolCallId,
                         toolName: WEB_SEARCH_TOOL_NAME,
-                        input: normalizedUserMessage
+                        input: normalizedUserMessage,
+                        at: startedAt
                     })}\n\n`
                 );
 
@@ -343,7 +363,8 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                             type: "tool_error",
                             toolCallId: forcedToolCallId,
                             toolName: WEB_SEARCH_TOOL_NAME,
-                            error: forcedSearchError
+                            error: forcedSearchError,
+                            at: endedAt
                         })}\n\n`
                     );
                 } else {
@@ -355,12 +376,14 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                             type: "tool_end",
                             toolCallId: forcedToolCallId,
                             toolName: WEB_SEARCH_TOOL_NAME,
-                            output: forcedSearchOutput.slice(0, 500)
+                            output: forcedSearchOutput.slice(0, 500),
+                            at: endedAt
                         })}\n\n`
                     );
                 }
 
                 if (forcedSearchOutput) {
+                    if (abortController.signal.aborted) { cleanupDisconnect(); return; }
                     inputForAgent = `${normalizedUserMessage}\n\n[系统提示] 已按“联网:开”强制执行一次 web_search，请优先基于以下检索结果回答；如证据不足可再调用 web_search 补充。\n${forcedSearchOutput}`;
                     emitThought(res, "已获取联网结果，正在组织回答");
                 }
@@ -383,9 +406,14 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
             );
 
             for await (const event of eventStream) {
+                if (abortController.signal.aborted) {
+                    console.log('[agent] agent event stream aborted by client disconnect');
+                    break;
+                }
                 console.log(`[agent][event] type=${event.event} name=${event.name || "-"}`);
                 if (event.event === "on_tool_start") {
                     const toolCallId = event.run_id || crypto.randomUUID();
+                    const toolStartedAt = new Date().toISOString();
                     console.log(
                         `[agent][tool_start] id=${toolCallId} name=${event.name || "unknown"}`
                     );
@@ -394,7 +422,8 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                             type: "tool_start",
                             toolCallId,
                             toolName: event.name || "unknown",
-                            input: event?.data?.input ?? {}
+                            input: event?.data?.input ?? {},
+                            at: toolStartedAt
                         })}\n\n`
                     );
                     continue;
@@ -403,6 +432,7 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                 if (event.event === "on_tool_end") {
                     const toolCallId = event.run_id || "";
                     const output = event?.data?.output ?? "";
+                    const toolEndedAt = new Date().toISOString();
                     console.log(
                         `[agent][tool_end] id=${toolCallId} name=${event.name || "unknown"}`
                     );
@@ -411,7 +441,8 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                             type: "tool_end",
                             toolCallId,
                             toolName: event.name || "unknown",
-                            output: typeof output === "string" ? output.slice(0, 500) : ""
+                            output: typeof output === "string" ? output.slice(0, 500) : "",
+                            at: toolEndedAt
                         })}\n\n`
                     );
                     continue;
@@ -420,6 +451,7 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                 if (event.event === "on_tool_error") {
                     const toolCallId = event.run_id || "";
                     const errorMessage = event?.data?.error?.message || event?.data?.error || "工具执行异常";
+                    const toolEndedAt = new Date().toISOString();
                     console.log(
                         `[agent][tool_error] id=${toolCallId} name=${event.name || "unknown"} error=${errorMessage}`
                     );
@@ -428,7 +460,8 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                             type: "tool_error",
                             toolCallId,
                             toolName: event.name || "unknown",
-                            error: String(errorMessage)
+                            error: String(errorMessage),
+                            at: toolEndedAt
                         })}\n\n`
                     );
                     continue;
@@ -448,18 +481,95 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                 res.write(`data: ${JSON.stringify({ type: "text", text })}\n\n`);
             }
         } else {
-            // 非联网模式：直接对话，无需 Agent
-            emitThought(res, "准备生成回答");
-            const directSystemInstruction = buildDirectAnswerSystemInstruction(false, systemPrompt);
-            fullText = await streamDirectChat({
-                userMessage: normalizedUserMessage,
-                image,
-                formattedHistory,
-                res,
-                systemInstruction: directSystemInstruction,
-                temperature,
-                forceModel
-            });
+            // 非联网模式：使用 Agent 编排（排除 web_search），支持 get_system_time / get_db_message_count 等工具
+            emitThought(res, "正在调用模型生成回答");
+
+            const agentExecutor = await getAgentExecutor(false, temperature, systemPrompt);
+            console.log(`[agent] model=${resolveModelName(false)} baseURL=${process.env.OPENAI_BASE_URL}`);
+            const eventStream = await agentExecutor.streamEvents(
+                {
+                    input: inputForAgent,
+                    chat_history: formattedHistory,
+                    current_date: new Date().toLocaleString()
+                },
+                { version: "v2" }
+            );
+
+            for await (const event of eventStream) {
+                if (abortController.signal.aborted) {
+                    console.log('[agent] agent event stream aborted by client disconnect');
+                    break;
+                }
+                console.log(`[agent][event] type=${event.event} name=${event.name || "-"}`);
+                if (event.event === "on_tool_start") {
+                    const toolCallId = event.run_id || crypto.randomUUID();
+                    const toolStartedAt = new Date().toISOString();
+                    console.log(
+                        `[agent][tool_start] id=${toolCallId} name=${event.name || "unknown"}`
+                    );
+                    res.write(
+                        `data: ${JSON.stringify({
+                            type: "tool_start",
+                            toolCallId,
+                            toolName: event.name || "unknown",
+                            input: event?.data?.input ?? {},
+                            at: toolStartedAt
+                        })}\n\n`
+                    );
+                    continue;
+                }
+
+                if (event.event === "on_tool_end") {
+                    const toolCallId = event.run_id || "";
+                    const output = event?.data?.output ?? "";
+                    const toolEndedAt = new Date().toISOString();
+                    console.log(
+                        `[agent][tool_end] id=${toolCallId} name=${event.name || "unknown"}`
+                    );
+                    res.write(
+                        `data: ${JSON.stringify({
+                            type: "tool_end",
+                            toolCallId,
+                            toolName: event.name || "unknown",
+                            output: typeof output === "string" ? output.slice(0, 500) : "",
+                            at: toolEndedAt
+                        })}\n\n`
+                    );
+                    continue;
+                }
+
+                if (event.event === "on_tool_error") {
+                    const toolCallId = event.run_id || "";
+                    const errorMessage = event?.data?.error?.message || event?.data?.error || "工具执行异常";
+                    const toolEndedAt = new Date().toISOString();
+                    console.log(
+                        `[agent][tool_error] id=${toolCallId} name=${event.name || "unknown"} error=${errorMessage}`
+                    );
+                    res.write(
+                        `data: ${JSON.stringify({
+                            type: "tool_error",
+                            toolCallId,
+                            toolName: event.name || "unknown",
+                            error: String(errorMessage),
+                            at: toolEndedAt
+                        })}\n\n`
+                    );
+                    continue;
+                }
+
+                if (event.event !== "on_chat_model_stream") {
+                    continue;
+                }
+
+                const text = normalizeChunkContent(event?.data?.chunk?.content);
+
+                if (!text) {
+                    continue;
+                }
+
+                fullText += text;
+                res.write(`data: ${JSON.stringify({ type: "text", text })}\n\n`);
+            }
         }
 
         const assistantMessageId = saveMessage(userId, session_id, "assistant", fullText);
@@ -475,15 +585,21 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
             total_tokens: promptTokens + completionTokens,
             model: modelName,
         });
-        emitThought(res, "回答生成完成", "done");
-        res.write("data: [DONE]\n\n");
+        if (!clientDisconnected) {
+            emitThought(res, "回答生成完成", "done");
+            res.write("data: [DONE]\n\n");
+        }
         res.end();
+        cleanupDisconnect();
     } catch (error) {
         console.error(`[agent][fatal] message="${error.message}" stack="${error.stack}"`);
-        emitThought(res, "生成过程发生错误", "error");
-        res.write(
-            `data: ${JSON.stringify({ error: error.message || "stream failed" })}\n\n`
-        );
+        if (!clientDisconnected) {
+            emitThought(res, "生成过程发生错误", "error");
+            res.write(
+                `data: ${JSON.stringify({ error: error.message || "stream failed" })}\n\n`
+            );
+        }
         res.end();
+        cleanupDisconnect();
     }
 }

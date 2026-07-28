@@ -190,8 +190,8 @@ export function createToolExecutionStateMachine(config = {}) {
     entry.timeoutId = timerId;
   }
 
-  function stampEnd(entry, status) {
-    const updated = { ...entry, status, endedAt: Date.now() };
+  function stampEnd(entry, status, endedAt) {
+    const updated = { ...entry, status, endedAt: endedAt || Date.now() };
 
     if (entry.timeoutId != null) {
       clearTimeout(entry.timeoutId);
@@ -229,7 +229,7 @@ export function createToolExecutionStateMachine(config = {}) {
     let updatedEntry;
 
     if (isTerminalStatus(nextStatus)) {
-      updatedEntry = stampEnd(entry, nextStatus);
+      updatedEntry = stampEnd(entry, nextStatus, payload.endedAt);
     } else {
       updatedEntry = { ...entry, status: nextStatus };
     }
@@ -273,12 +273,12 @@ export function createToolExecutionStateMachine(config = {}) {
 
   return {
     /** 创建一条工具调用记录并进入 PENDING 状态 */
-    create(id, name, input) {
+    create(id, name, input, startedAt) {
       if (entries.has(id)) {
         return entries.get(id);
       }
 
-      const entry = createToolCallEntry(id, name, input);
+      const entry = createToolCallEntry(id, name, input, startedAt);
       entries.set(id, entry);
       orderedIds.push(id);
 
@@ -297,14 +297,15 @@ export function createToolExecutionStateMachine(config = {}) {
     },
 
     /** EXECUTING -> SUCCESS */
-    end(id, output) {
-      return transition(id, Event.END, { output });
+    end(id, output, endedAt) {
+      return transition(id, Event.END, { output, endedAt });
     },
 
     /** EXECUTING -> ERROR */
-    error(id, err) {
+    error(id, err, endedAt) {
       return transition(id, Event.ERROR, {
         error: String(err || '未知错误'),
+        endedAt,
       });
     },
 
@@ -423,4 +424,119 @@ export function createToolExecutionStateMachine(config = {}) {
       }
     },
   };
+}
+
+// ── 格式化工具函数 ──────────────────────────────────────────
+
+/**
+ * 将毫秒数格式化为人类可读的耗时字符串。
+ *   < 1000ms → "320ms"
+ *   < 60000ms → "1.2s"
+ *   >= 60000ms → "2m 15s"
+ */
+export function formatDuration(ms) {
+  if (!Number.isFinite(ms) || ms < 0) {
+    return '';
+  }
+
+  if (ms < 1000) {
+    return `${Math.round(ms)}ms`;
+  }
+
+  if (ms < 60000) {
+    return `${(ms / 1000).toFixed(1)}s`;
+  }
+
+  const minutes = Math.floor(ms / 60000);
+  const seconds = Math.round((ms % 60000) / 1000);
+
+  return `${minutes}m ${seconds}s`;
+}
+
+/**
+ * 从工具调用记录中提取格式化耗时。
+ * @param {{ startedAt?: number, endedAt?: number }} entry
+ * @returns {string}
+ */
+export function getToolDuration(entry) {
+  if (!entry?.startedAt || !entry?.endedAt) {
+    return '';
+  }
+
+  return formatDuration(entry.endedAt - entry.startedAt);
+}
+
+// ── 工具时间间隔分组 ──────────────────────────────────────
+
+/**
+ * 默认分组间隔：5 秒
+ */
+export const DEFAULT_TOOL_GROUP_GAP_MS = 5000;
+
+/**
+ * 按执行时间将工具日志分组。
+ *
+ * 规则：
+ *   1. 按 startedAt 升序排列（防御性拷贝）
+ *   2. 相邻两个工具的 startedAt 差值 ≤ maxGapMs 时归入同一组
+ *   3. 组内保持时间顺序
+ *
+ * @param {Array<{ id: string, startedAt: number }>} logs  — 工具日志条目
+ * @param {number} [maxGapMs=5000]                          — 最大分组间隔 (毫秒)
+ * @returns {Array<Array>}  — 分组结果，每组是一个条目数组
+ */
+export function groupToolsByInterval(logs, maxGapMs = DEFAULT_TOOL_GROUP_GAP_MS) {
+  if (!Array.isArray(logs) || logs.length === 0) {
+    return [];
+  }
+
+  const sorted = [...logs].sort((a, b) => (a.startedAt || 0) - (b.startedAt || 0));
+
+  const groups = [];
+  let currentGroup = [sorted[0]];
+
+  for (let i = 1; i < sorted.length; i += 1) {
+    const prev = sorted[i - 1];
+    const current = sorted[i];
+    const gap = (current.startedAt || 0) - (prev.startedAt || 0);
+
+    if (gap <= maxGapMs) {
+      currentGroup.push(current);
+    } else {
+      groups.push(currentGroup);
+      currentGroup = [current];
+    }
+  }
+
+  groups.push(currentGroup);
+  return groups;
+}
+
+/**
+ * 获取工具组的聚合状态。
+ * 优先级: EXECUTING > ERROR > SUCCESS > 其他
+ *
+ * @param {Array<{ status: string }>} group — 同一组内的工具条目
+ * @returns {{ status: string, hasExecuting: boolean, hasError: boolean }}
+ */
+export function getGroupAggregateStatus(group) {
+  if (!Array.isArray(group) || group.length === 0) {
+    return { status: ToolStatus.PENDING, hasExecuting: false, hasError: false };
+  }
+
+  let hasExecuting = false;
+  let hasError = false;
+  let allSuccess = true;
+
+  for (const entry of group) {
+    const s = entry.status || ToolStatus.PENDING;
+    if (s === ToolStatus.EXECUTING) hasExecuting = true;
+    if (s === ToolStatus.ERROR || s === ToolStatus.TIMEOUT) hasError = true;
+    if (s !== ToolStatus.SUCCESS) allSuccess = false;
+  }
+
+  if (hasExecuting) return { status: ToolStatus.EXECUTING, hasExecuting: true, hasError };
+  if (hasError) return { status: ToolStatus.ERROR, hasExecuting: false, hasError: true };
+  if (allSuccess) return { status: ToolStatus.SUCCESS, hasExecuting: false, hasError: false };
+  return { status: ToolStatus.PENDING, hasExecuting: false, hasError: false };
 }

@@ -17,6 +17,10 @@ import {
 } from '../api/chat';
 import { createToolExecutionStateMachine } from '../utils/toolExecutionStateMachine';
 
+// 模块级 Map：存储活跃 FSM 及其 syncToolLogs，用于 stop 时立即取消工具
+// 不能放 Zustand state（非序列化对象会被 persist 中间件丢弃）
+const activeToolCleanupMap = new Map();
+
 const initialMessage = {
     id: 'init',
     role: 'assistant',
@@ -960,7 +964,20 @@ export const useChatStore = create(persist((set, get) => ({
         }
     },
     stopMessageStream: () => {
-        const controller = get().activeAbortController;
+        const state = get();
+        const controller = state.activeAbortController;
+        const streamToken = state.activeStreamToken;
+
+        // 立即取消所有工具调用，不等 SSE error 回调异步触发
+        if (streamToken) {
+            const cleanup = activeToolCleanupMap.get(streamToken);
+            if (cleanup) {
+                cleanup.fsm.cancelAll();
+                cleanup.syncToolLogs();
+                activeToolCleanupMap.delete(streamToken);
+            }
+        }
+
         if (controller) {
             controller.abort();
             set({
@@ -1008,6 +1025,28 @@ export const useChatStore = create(persist((set, get) => ({
                 return;
             }
         }
+    },
+    retryToolCall: async (toolCallId) => {
+        if (get().isTyping) {
+            return;
+        }
+
+        const messages = get().messages;
+        let userMessage = null;
+        for (let i = messages.length - 1; i >= 0; i -= 1) {
+            if (messages[i].role === 'user') {
+                userMessage = messages[i];
+                break;
+            }
+        }
+
+        if (!userMessage?.content) {
+            return;
+        }
+
+        await get().sendMessage(userMessage.content, {
+            enableWebSearch: true,
+        });
     },
     createBranchFromMessage: async (messageId) => {
         if (get().isTyping) {
@@ -1262,6 +1301,10 @@ export const useChatStore = create(persist((set, get) => ({
             perToolTimeout: new Map([['web_search', 90000]]),
         });
 
+        // ── 乱序结果缓存：tool_end/tool_error 先于 tool_start 到达时暂存 ──
+        // 生命周期跟随本次 sendMessage 闭包，流结束后自动 GC，无需手动清理
+        const toolResultCache = new Map();
+
         const syncToolLogs = () => {
             const entries = toolStateMachine.getAll();
             const logs = entries.map((entry) => ({
@@ -1296,6 +1339,9 @@ export const useChatStore = create(persist((set, get) => ({
             }));
         };
 
+        // 注册到模块级 Map，供 stopMessageStream 即时取消
+        activeToolCleanupMap.set(streamToken, { fsm: toolStateMachine, syncToolLogs });
+
         set({
             activeAbortController: controller,
             activeStreamToken: streamToken,
@@ -1327,23 +1373,59 @@ export const useChatStore = create(persist((set, get) => ({
                 cancelChunkFrame();
                 flushPendingAssistantChunk();
 
-                // ── 通过状态机处理工具事件 ─────────────
+                // ── 通过状态机处理工具事件 (含乱序缓存配对) ──
                 const toolCallId = toolData?.toolCallId || '';
 
                 if (toolData?.type === 'tool_start') {
                     if (toolCallId) {
-                        toolStateMachine.create(toolCallId, toolData.toolName || 'unknown', toolData.input);
+                        const toolStartedAt = toolData.at ? new Date(toolData.at).getTime() : undefined;
+                        toolStateMachine.create(toolCallId, toolData.toolName || 'unknown', toolData.input, toolStartedAt);
                         toolStateMachine.start(toolCallId);
+
+                        // 检查是否有先到达的缓存结果，自动配对
+                        const cached = toolResultCache.get(toolCallId);
+                        if (cached) {
+                            toolResultCache.delete(toolCallId);
+                            if (cached.type === 'tool_end') {
+                                toolStateMachine.end(toolCallId, cached.output, cached.endedAt);
+                            } else if (cached.type === 'tool_error') {
+                                toolStateMachine.error(toolCallId, cached.error, cached.endedAt);
+                            }
+                        }
                     }
                     syncToolLogs();
                 } else if (toolData?.type === 'tool_end') {
                     if (toolCallId) {
-                        toolStateMachine.end(toolCallId, toolData.output);
+                        const toolEndedAt = toolData.at ? new Date(toolData.at).getTime() : undefined;
+                        const entry = toolStateMachine.get(toolCallId);
+                        if (entry) {
+                            // 正常顺序：tool_start 已到达，直接更新
+                            toolStateMachine.end(toolCallId, toolData.output, toolEndedAt);
+                        } else {
+                            // 乱序：tool_end 先于 tool_start 到达，缓存等待配对
+                            toolResultCache.set(toolCallId, {
+                                type: 'tool_end',
+                                output: toolData.output,
+                                endedAt: toolEndedAt,
+                            });
+                        }
                     }
                     syncToolLogs();
                 } else if (toolData?.type === 'tool_error') {
                     if (toolCallId) {
-                        toolStateMachine.error(toolCallId, toolData.error || '工具执行异常');
+                        const toolEndedAt = toolData.at ? new Date(toolData.at).getTime() : undefined;
+                        const entry = toolStateMachine.get(toolCallId);
+                        if (entry) {
+                            // 正常顺序：tool_start 已到达，直接更新
+                            toolStateMachine.error(toolCallId, toolData.error || '工具执行异常', toolEndedAt);
+                        } else {
+                            // 乱序：tool_error 先于 tool_start 到达，缓存等待配对
+                            toolResultCache.set(toolCallId, {
+                                type: 'tool_error',
+                                error: toolData.error || '工具执行异常',
+                                endedAt: toolEndedAt,
+                            });
+                        }
                     }
                     syncToolLogs();
                 } else if (toolData?.type === 'thought' && toolData?.text) {
@@ -1406,6 +1488,7 @@ export const useChatStore = create(persist((set, get) => ({
                     cancelChunkFrame();
                     pendingAssistantChunk = '';
                     // 清理状态机
+                    activeToolCleanupMap.delete(streamToken);
                     toolStateMachine.destroy();
                     return;
                 }
@@ -1413,6 +1496,7 @@ export const useChatStore = create(persist((set, get) => ({
                 // 流正常结束，取消所有未完成的工具
                 toolStateMachine.cancelAll();
                 syncToolLogs();
+                activeToolCleanupMap.delete(streamToken);
                 toolStateMachine.destroy();
 
                 cancelChunkFrame();
@@ -1432,6 +1516,19 @@ export const useChatStore = create(persist((set, get) => ({
                     playVoice(finalAssistantContent, { messageId: assistantMessageId });
                 }
 
+                // 在 fetchMessagesBySession 覆盖之前，捕获本地 toolLogs/thoughtLogs
+                // 后端不存储这些字段，刷新历史会丢失工具卡片
+                const localMsgs = get().messages;
+                let localToolLogs = [];
+                let localThoughtLogs = [];
+                for (let i = localMsgs.length - 1; i >= 0; i -= 1) {
+                    if (localMsgs[i].role === 'assistant') {
+                        localToolLogs = localMsgs[i].toolLogs || [];
+                        localThoughtLogs = localMsgs[i].thoughtLogs || [];
+                        break;
+                    }
+                }
+
                 set({
                     isTyping: false,
                     activeAbortController: null,
@@ -1448,6 +1545,19 @@ export const useChatStore = create(persist((set, get) => ({
                         }
 
                         if (Array.isArray(history) && history.length > 0) {
+                            // 合并本地 toolLogs/thoughtLogs 到刷新后的最后一条 assistant 消息
+                            if (localToolLogs.length > 0 || localThoughtLogs.length > 0) {
+                                for (let i = history.length - 1; i >= 0; i -= 1) {
+                                    if (history[i].role === 'assistant') {
+                                        history[i] = {
+                                            ...history[i],
+                                            toolLogs: localToolLogs,
+                                            thoughtLogs: localThoughtLogs,
+                                        };
+                                        break;
+                                    }
+                                }
+                            }
                             set({ messages: history });
                         }
                     })
@@ -1463,6 +1573,7 @@ export const useChatStore = create(persist((set, get) => ({
                     cancelChunkFrame();
                     pendingAssistantChunk = '';
                     // 清理状态机
+                    activeToolCleanupMap.delete(streamToken);
                     toolStateMachine.destroy();
                     return;
                 }
@@ -1470,6 +1581,7 @@ export const useChatStore = create(persist((set, get) => ({
                 // 流出错，取消所有进行中的工具
                 toolStateMachine.cancelAll();
                 syncToolLogs();
+                activeToolCleanupMap.delete(streamToken);
                 toolStateMachine.destroy();
 
                 cancelChunkFrame();

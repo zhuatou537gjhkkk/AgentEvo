@@ -318,6 +318,17 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
         const decoder = new TextDecoder('utf-8');
         let buffer = '';
 
+        // 监听外部 abort signal，取消 reader → 断开 HTTP 连接 → 后端检测到断连
+        let abortHandler;
+        if (signal) {
+            abortHandler = () => {
+                reader.cancel();
+            };
+            if (!signal.aborted) {
+                signal.addEventListener('abort', abortHandler, { once: true });
+            }
+        }
+
         const handlePayload = (payload) => {
             if (!payload || payload === '[DONE]') {
                 return;
@@ -386,6 +397,10 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
         }
 
         onError(error);
+    } finally {
+        if (signal && abortHandler) {
+            signal.removeEventListener('abort', abortHandler);
+        }
     }
 }
 

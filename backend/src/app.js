@@ -109,6 +109,10 @@ function requireAuth(req, res, next) {
 
 function isDbCountIntent(input) {
     const text = String(input || "");
+    // 复合问题（多个问句）跳过快捷路径，交给 Agent 处理工具调用
+    if ((text.match(/[？?]/g) || []).length >= 2) {
+        return false;
+    }
     return /数据库|sqlite|历史消息|对话记录/.test(text) && /多少|几条|总数|条数|统计|count/.test(text);
 }
 

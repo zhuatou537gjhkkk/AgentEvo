@@ -21,6 +21,7 @@ pnpm-debug.log*
 
 # Claude Code
 .claude/
+CLAUDE.md
 
 # Build artifacts
 **/dist/

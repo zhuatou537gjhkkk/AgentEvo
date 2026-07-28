@@ -1,6 +1,8 @@
 import { memo, useEffect, useState } from 'react';
 import { useChatStore } from '../store/chatStore';
 import { playVoice, stopVoice } from '../store/chatStore';
+import ToolCallCard, { ToolGroupCard } from './ToolCallCard';
+import { groupToolsByInterval } from '../utils/toolExecutionStateMachine';
 
 function parseStructuredWebSearchContent(content) {
     const text = String(content || '').trim();
@@ -306,49 +308,26 @@ function MessageItem({ message }) {
             return null;
         }
 
-        const statusConfig = {
-            pending: { icon: '⏸', label: '等待中', color: 'text-slate-400', bg: 'bg-slate-700/50' },
-            executing: { icon: '⏳', label: '执行中', color: 'text-blue-400', bg: 'bg-blue-700/30' },
-            success: { icon: '✅', label: '成功', color: 'text-emerald-400', bg: 'bg-emerald-700/20' },
-            error: { icon: '❌', label: '失败', color: 'text-red-400', bg: 'bg-red-700/30' },
-            timeout: { icon: '⏰', label: '超时', color: 'text-amber-400', bg: 'bg-amber-700/30' },
-            cancelled: { icon: '⊘', label: '已取消', color: 'text-slate-400', bg: 'bg-slate-700/50' },
-        };
+        const groups = groupToolsByInterval(toolLogs);
 
         return (
-            <div className="mb-2 rounded-md bg-gray-800 p-2 font-mono text-xs dark:bg-slate-900">
-                {toolLogs.map((log, index) => {
-                    const config = statusConfig[log.status] || statusConfig.executing;
-                    const duration = log.startedAt && log.endedAt
-                        ? ` ${log.endedAt - log.startedAt}ms`
-                        : '';
-                    const isError = log.status === 'error' || log.status === 'timeout';
-                    const hasError = Boolean(log.error);
-                    const hasRetry = log.retryCount > 0;
-
+            <div className="mb-2 rounded-lg border border-[var(--panel-border)] bg-[var(--panel-soft)] divide-y divide-[var(--panel-border)] overflow-hidden">
+                {groups.map((group, idx) => {
+                    if (group.length === 1) {
+                        return (
+                            <ToolCallCard
+                                key={group[0].id || `single-${idx}`}
+                                log={group[0]}
+                                isTyping={isTyping}
+                            />
+                        );
+                    }
                     return (
-                        <div key={log.id || `${log.name}-${index}`} className="mb-1 last:mb-0">
-                            <div className="flex items-start gap-2">
-                                <span className={`mt-0.5 shrink-0 rounded px-1 py-0.5 text-[11px] ${config.bg} ${config.color}`}>
-                                    {config.icon}
-                                </span>
-                                <div className="min-w-0 flex-1">
-                                    <span className={`whitespace-pre-wrap break-words ${config.color}`}>
-                                        {`> 执行工具: ${log.name} ${config.icon}${duration}`}
-                                    </span>
-                                    {hasRetry && (
-                                        <span className="ml-1 text-amber-400">
-                                            (重试 {log.retryCount} 次)
-                                        </span>
-                                    )}
-                                </div>
-                            </div>
-                            {isError && hasError && (
-                                <div className="ml-8 mt-1 break-words text-red-400/80">
-                                    错误: {log.error}
-                                </div>
-                            )}
-                        </div>
+                        <ToolGroupCard
+                            key={`group-${idx}`}
+                            group={group}
+                            isTyping={isTyping}
+                        />
                     );
                 })}
             </div>
