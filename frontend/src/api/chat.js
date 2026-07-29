@@ -294,6 +294,7 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
     const {
         signal,
         enableWebSearch = false,
+        planMode = false,
         systemPrompt = '你是一个有用的 AI 助手。',
         temperature = 0.7,
         image = null,
@@ -314,6 +315,7 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
                     image,
                     image_id: imageId,
                     enable_web_search: enableWebSearch,
+                    plan_mode: planMode,
                     systemPrompt,
                     temperature,
                 }),
@@ -361,7 +363,7 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
                     return;
                 }
 
-                if (eventType === 'tool_start' || eventType === 'tool_end' || eventType === 'tool_error' || eventType === 'thought' || eventType === 'metrics' || eventType === 'ask_user_question') {
+                if (eventType === 'tool_start' || eventType === 'tool_end' || eventType === 'tool_error' || eventType === 'thought' || eventType === 'metrics' || eventType === 'ask_user_question' || eventType === 'todo_updated') {
                     onToolEvent(parsed);
                 }
             } catch {

@@ -659,6 +659,26 @@ const bochaSearchTool = new DynamicTool({
     }
 });
 
+const updateTodoTool = new DynamicTool({
+    name: "update_todo",
+    description: `更新当前任务的执行计划。在开始多步骤任务前，先调用此工具列出完整计划。
+输入为严格的 JSON 字符串，包含以下字段：
+- todos (array): 任务列表，每项包含 id (string: 唯一标识)、content (string: 任务描述)
+
+示例输入:
+{"todos":[{"id":"1","content":"搜索网络获取最新信息","status":"pending"},{"id":"2","content":"检索知识库文档","status":"pending"},{"id":"3","content":"整合信息生成最终回答","status":"pending"}]}`,
+    func: async (input) => {
+        let parsed;
+        try {
+            parsed = typeof input === "string" ? JSON.parse(input) : input;
+        } catch {
+            return JSON.stringify({ ok: false, error: "Invalid JSON" });
+        }
+        const todos = Array.isArray(parsed.todos) ? parsed.todos : [];
+        return JSON.stringify({ ok: true, count: todos.length });
+    }
+});
+
 const askUserQuestionTool = new DynamicTool({
     name: "ask_user_question",
     description: `当需要用户做出选择、补充信息或确认操作时调用此工具。
@@ -699,5 +719,6 @@ export const agentTools = [
     getDbMessageCountTool,
     searchKnowledgeBaseTool,
     bochaSearchTool,
+    updateTodoTool,
     askUserQuestionTool
 ];

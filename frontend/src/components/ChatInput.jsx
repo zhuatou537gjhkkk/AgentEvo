@@ -69,6 +69,8 @@ export default function ChatInput() {
     const currentSessionId = useChatStore((state) => state.currentSessionId);
     const enableWebSearch = useChatStore((state) => state.enableWebSearch);
     const setEnableWebSearch = useChatStore((state) => state.setEnableWebSearch);
+    const planMode = useChatStore((state) => state.planMode);
+    const setPlanMode = useChatStore((state) => state.setPlanMode);
     const selectedImage = useChatStore((state) => state.selectedImage);
     const setSelectedImage = useChatStore((state) => state.setSelectedImage);
     const clearSelectedImage = useChatStore((state) => state.clearSelectedImage);
@@ -439,6 +441,18 @@ export default function ChatInput() {
                             title="是否启用联网搜索"
                         >
                             联网: {enableWebSearch ? '开' : '关'}
+                        </button>
+
+                        <button
+                            type="button"
+                            onClick={() => setPlanMode(!planMode)}
+                            className={`h-9 rounded-lg border px-3 text-xs font-semibold transition outline-none ${planMode
+                                ? 'border-violet-300 bg-violet-50 text-violet-700 dark:border-violet-700 dark:bg-violet-900/30 dark:text-violet-100'
+                                : 'border-[var(--panel-border)] bg-[var(--panel-soft)] text-[var(--text-muted)]'
+                                }`}
+                            title="先列出计划再执行"
+                        >
+                            🗓 Plan: {planMode ? '开' : '关'}
                         </button>
                     </div>
 

@@ -892,11 +892,13 @@ app.post("/chat", requireAuth, async (req, res) => {
         image,
         image_id,
         enable_web_search,
+        plan_mode,
         systemPrompt,
         temperature
     } = req.body || {};
     const sessionId = Number(session_id);
     const enableWebSearch = enable_web_search === true;
+    const planMode = plan_mode === true;
     const resolvedImage = image || getUploadedImageDataUrl(image_id);
 
     if (image_id && !resolvedImage) {
@@ -960,6 +962,7 @@ app.post("/chat", requireAuth, async (req, res) => {
                 enableWebSearch: false,
                 skipUserMessageSave: true,
                 forceModel: LONG_CONTEXT_MODEL,
+                planMode,
                 onComplete: (metrics) => {
                     if (metrics?.messageId) {
                         saveMessageMetric(metrics.messageId, metrics);
@@ -991,6 +994,7 @@ app.post("/chat", requireAuth, async (req, res) => {
             await chatWithStream(req.user.id, sessionId, enhancedPrompt, resolvedImage, systemPrompt, temperature, res, {
                 enableWebSearch: false,
                 skipUserMessageSave: true,
+                planMode,
                 onComplete: (metrics) => {
                     if (metrics?.messageId) {
                         saveMessageMetric(metrics.messageId, metrics);
@@ -1023,6 +1027,7 @@ app.post("/chat", requireAuth, async (req, res) => {
 
     await chatWithStream(req.user.id, sessionId, message, resolvedImage, systemPrompt, temperature, res, {
         enableWebSearch,
+        planMode,
         onComplete: (metrics) => {
             if (metrics?.messageId) {
                 saveMessageMetric(metrics.messageId, metrics);

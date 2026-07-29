@@ -3,6 +3,7 @@ import { useChatStore } from '../store/chatStore';
 import { playVoice, stopVoice } from '../store/chatStore';
 import ToolCallCard, { ToolGroupCard } from './ToolCallCard';
 import UserQuestionCard from './UserQuestionCard';
+import TaskProgressCard from './TaskProgressCard';
 import { groupToolsByInterval } from '../utils/toolExecutionStateMachine';
 
 function parseStructuredWebSearchContent(content) {
@@ -304,9 +305,17 @@ function MessageItem({ message }) {
         playVoice(message.content, { messageId: message.id });
     };
 
+    const taskProgress = Array.isArray(message.taskProgress) ? message.taskProgress : [];
+
+    const renderTaskProgress = () => {
+        if (taskProgress.length === 0) return null;
+
+        return <TaskProgressCard progress={taskProgress} />;
+    };
+
     const renderToolLogs = () => {
-        // ask_user_question 由 UserQuestionCard 渲染，不在工具卡片区重复显示
-        const visibleToolLogs = toolLogs.filter((log) => log.name !== 'ask_user_question');
+        // ask_user_question / update_todo 由专用 UI 渲染，不在工具卡片区重复显示
+        const visibleToolLogs = toolLogs.filter((log) => log.name !== 'ask_user_question' && log.name !== 'update_todo');
         if (visibleToolLogs.length === 0) {
             return null;
         }
@@ -566,6 +575,7 @@ function MessageItem({ message }) {
                     ) : (
                         <div className="break-words pr-7 [&_ol]:list-decimal [&_ol]:pl-6 [&_p]:whitespace-pre-wrap [&_ul]:list-disc [&_ul]:pl-6">
                             {renderThoughtLogs()}
+                            {renderTaskProgress()}
                             {renderToolLogs()}
                             {renderQuestionLogs()}
                             {renderAssistantContent()}

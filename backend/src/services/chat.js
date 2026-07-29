@@ -11,6 +11,17 @@ const FORCED_WEB_SEARCH_MAX_CHARS = 8000;
 const DEFAULT_SYSTEM_PROMPT = "你是一个有用的 AI 助手。";
 const DEFAULT_TEMPERATURE = 0.7;
 
+const TOOL_ACTIVE_FORMS = {
+    web_search: "正在搜索网络...",
+    search_knowledge_base: "正在检索知识库...",
+    get_system_time: "正在获取系统时间...",
+    update_todo: "正在规划任务...",
+    ask_user_question: "等待用户回答...",
+};
+
+const PLAN_MODE_INSTRUCTION =
+    "重要：在调用任何其他工具之前，你必须先调用 update_todo 工具列出完整的执行计划。每个任务项包含 id（小写数字编号如 \"1\"、\"2\"）和 content（任务描述）。列出计划后，按计划逐项执行，每完成一项可再次调用 update_todo 更新对应任务状态为 completed。";
+
 function estimateTokens(text) {
     const source = String(text || "");
     if (!source.trim()) {
@@ -124,7 +135,7 @@ function buildDirectAnswerSystemInstruction(enableWebSearch, userSystemPrompt) {
         : `${userSystemPrompt}\n\n${creativeGuard}\n${noWebSearchGuard}`;
 }
 
-function buildPrompt(enableWebSearch, userSystemPrompt) {
+function buildPrompt(enableWebSearch, userSystemPrompt, planMode = false) {
     const baseInstruction =
         `${userSystemPrompt}\n\n当前系统时间是：{current_date}。请优先基于可验证信息回答，保持结论清晰、结构化。`;
 
@@ -140,9 +151,10 @@ function buildPrompt(enableWebSearch, userSystemPrompt) {
     const toolRetryInstruction =
         "如果工具返回“当前知识库为空”或“未检索到相关知识片段”，立即停止继续调用该工具，并直接给出不依赖该工具的回答。";
 
+    const planPrefix = planMode ? `${PLAN_MODE_INSTRUCTION}\n\n` : "";
     const systemInstruction = enableWebSearch
-        ? `${baseInstruction}\n\n${creativeTaskInstruction}\n\n${webSearchInstruction}\n\n${toolRetryInstruction}`
-        : `${baseInstruction}\n\n${creativeTaskInstruction}\n\n${noWebSearchInstruction}\n\n${toolRetryInstruction}`;
+        ? `${planPrefix}${baseInstruction}\n\n${creativeTaskInstruction}\n\n${webSearchInstruction}\n\n${toolRetryInstruction}`
+        : `${planPrefix}${baseInstruction}\n\n${creativeTaskInstruction}\n\n${noWebSearchInstruction}\n\n${toolRetryInstruction}`;
 
     return ChatPromptTemplate.fromMessages([
         ["system", systemInstruction],
@@ -152,7 +164,7 @@ function buildPrompt(enableWebSearch, userSystemPrompt) {
     ]);
 }
 
-async function getAgentExecutor(enableWebSearch, temperature, systemPrompt) {
+async function getAgentExecutor(enableWebSearch, temperature, systemPrompt, planMode = false) {
     const tools = enableWebSearch
         ? agentTools
         : agentTools.filter((tool) => tool.name !== WEB_SEARCH_TOOL_NAME);
@@ -163,18 +175,20 @@ async function getAgentExecutor(enableWebSearch, temperature, systemPrompt) {
         streaming: true,
         ...buildChatOpenAIConfig(),
     });
-    const prompt = buildPrompt(enableWebSearch, systemPrompt);
+    const prompt = buildPrompt(enableWebSearch, systemPrompt, planMode);
     const agent = await createToolCallingAgent({
         llm,
         tools,
         prompt
     });
 
+    // Plan 模式下多 2-3 个 update_todo 轮次，放宽上限以防 early stop 截断
+    const maxIterations = planMode ? 8 : 4;
     return new AgentExecutor({
         agent,
         tools,
-        maxIterations: 4,
-        earlyStoppingMethod: "generate"
+        maxIterations,
+        earlyStoppingMethod: "force"
     });
 }
 
@@ -241,6 +255,7 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
         skipUserMessageSave = false,
         userMessageForStorage,
         forceModel = null,
+        planMode = false,
         onComplete,
     } = options;
     const normalizedUserMessage = String(userMessage || "");
@@ -396,7 +411,7 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
             // 联网模式：使用 Agent 编排工具调用
             emitThought(res, "正在调用模型生成回答");
 
-            const agentExecutor = await getAgentExecutor(true, temperature, systemPrompt);
+            const agentExecutor = await getAgentExecutor(true, temperature, systemPrompt, planMode);
             console.log(`[agent] model=${resolveModelName(false)} baseURL=${process.env.OPENAI_BASE_URL}`);
             const eventStream = await agentExecutor.streamEvents(
                 {
@@ -412,22 +427,54 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                     console.log('[agent] agent event stream aborted by client disconnect');
                     break;
                 }
-                console.log(`[agent][event] type=${event.event} name=${event.name || "-"}`);
+                if (event.event !== "on_chat_model_stream") {
+                    console.log(`[agent][event] type=${event.event} name=${event.name || "-"}`);
+                }
                 if (event.event === "on_tool_start") {
                     const toolCallId = event.run_id || crypto.randomUUID();
                     const toolStartedAt = new Date().toISOString();
+                    const toolName = event.name || "unknown";
                     console.log(
-                        `[agent][tool_start] id=${toolCallId} name=${event.name || "unknown"}`
+                        `[agent][tool_start] id=${toolCallId} name=${toolName}`
                     );
                     res.write(
                         `data: ${JSON.stringify({
                             type: "tool_start",
                             toolCallId,
-                            toolName: event.name || "unknown",
+                            toolName,
                             input: event?.data?.input ?? {},
-                            at: toolStartedAt
+                            at: toolStartedAt,
+                            activeForm: TOOL_ACTIVE_FORMS[toolName] || "正在执行...",
                         })}\n\n`
                     );
+
+                    // update_todo: 从 tool input 中提取任务计划并发射 todo_updated
+                    if (toolName === "update_todo") {
+                        try {
+                            let parsed = event?.data?.input;
+                            // 循环解包：先 parse JSON 字符串，再剥离 {input: ...} 包装层
+                            // LangChain 可能多层包裹，且可能含 tool_call_id 等额外字段
+                            for (let i = 0; i < 5; i++) {
+                                if (typeof parsed === "string") {
+                                    try { parsed = JSON.parse(parsed); } catch { break; }
+                                } else if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "input" in parsed) {
+                                    parsed = parsed.input;
+                                } else {
+                                    break;
+                                }
+                            }
+                            if (typeof parsed === "string") {
+                                try { parsed = JSON.parse(parsed); } catch { /* ignore */ }
+                            }
+                            const todos = Array.isArray(parsed?.todos) ? parsed.todos : [];
+                            console.log(`[agent][todo_updated] count=${todos.length}`);
+                            res.write(
+                                `data: ${JSON.stringify({ type: "todo_updated", todos, at: toolStartedAt })}\n\n`
+                            );
+                        } catch (e) {
+                            console.log(`[agent][todo_updated] parse error:`, e.message);
+                        }
+                    }
 
                     // 如果是 ask_user_question，延迟到 tool func 同步部分执行后发射提问事件
                     // LangChain 的 on_tool_start 在 tool.func 执行前触发，直接 consumePendingQuestion() 会拿到 null
@@ -512,7 +559,7 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
             // 非联网模式：使用 Agent 编排（排除 web_search），支持 get_system_time / get_db_message_count 等工具
             emitThought(res, "正在调用模型生成回答");
 
-            const agentExecutor = await getAgentExecutor(false, temperature, systemPrompt);
+            const agentExecutor = await getAgentExecutor(false, temperature, systemPrompt, planMode);
             console.log(`[agent] model=${resolveModelName(false)} baseURL=${process.env.OPENAI_BASE_URL}`);
             const eventStream = await agentExecutor.streamEvents(
                 {
@@ -528,22 +575,54 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                     console.log('[agent] agent event stream aborted by client disconnect');
                     break;
                 }
-                console.log(`[agent][event] type=${event.event} name=${event.name || "-"}`);
+                if (event.event !== "on_chat_model_stream") {
+                    console.log(`[agent][event] type=${event.event} name=${event.name || "-"}`);
+                }
                 if (event.event === "on_tool_start") {
                     const toolCallId = event.run_id || crypto.randomUUID();
                     const toolStartedAt = new Date().toISOString();
+                    const toolName = event.name || "unknown";
                     console.log(
-                        `[agent][tool_start] id=${toolCallId} name=${event.name || "unknown"}`
+                        `[agent][tool_start] id=${toolCallId} name=${toolName}`
                     );
                     res.write(
                         `data: ${JSON.stringify({
                             type: "tool_start",
                             toolCallId,
-                            toolName: event.name || "unknown",
+                            toolName,
                             input: event?.data?.input ?? {},
-                            at: toolStartedAt
+                            at: toolStartedAt,
+                            activeForm: TOOL_ACTIVE_FORMS[toolName] || "正在执行...",
                         })}\n\n`
                     );
+
+                    // update_todo: 从 tool input 中提取任务计划并发射 todo_updated
+                    if (toolName === "update_todo") {
+                        try {
+                            let parsed = event?.data?.input;
+                            // 循环解包：先 parse JSON 字符串，再剥离 {input: ...} 包装层
+                            // LangChain 可能多层包裹，且可能含 tool_call_id 等额外字段
+                            for (let i = 0; i < 5; i++) {
+                                if (typeof parsed === "string") {
+                                    try { parsed = JSON.parse(parsed); } catch { break; }
+                                } else if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "input" in parsed) {
+                                    parsed = parsed.input;
+                                } else {
+                                    break;
+                                }
+                            }
+                            if (typeof parsed === "string") {
+                                try { parsed = JSON.parse(parsed); } catch { /* ignore */ }
+                            }
+                            const todos = Array.isArray(parsed?.todos) ? parsed.todos : [];
+                            console.log(`[agent][todo_updated] count=${todos.length}`);
+                            res.write(
+                                `data: ${JSON.stringify({ type: "todo_updated", todos, at: toolStartedAt })}\n\n`
+                            );
+                        } catch (e) {
+                            console.log(`[agent][todo_updated] parse error:`, e.message);
+                        }
+                    }
 
                     // 如果是 ask_user_question，延迟到 tool func 同步部分执行后发射提问事件
                     // LangChain 的 on_tool_start 在 tool.func 执行前触发，直接 consumePendingQuestion() 会拿到 null

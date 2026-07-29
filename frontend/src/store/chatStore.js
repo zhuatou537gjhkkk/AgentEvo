@@ -306,6 +306,7 @@ export const useChatStore = create(persist((set, get) => ({
     isTyping: false,
     selectedImage: null,
     enableWebSearch: false,
+    planMode: false,
     systemPrompt: DEFAULT_SYSTEM_PROMPT,
     temperature: DEFAULT_TEMPERATURE,
     sessionAgentSettings: {},
@@ -331,6 +332,15 @@ export const useChatStore = create(persist((set, get) => ({
                 : enabled;
 
             return { enableWebSearch: Boolean(nextValue) };
+        });
+    },
+    setPlanMode: (enabled) => {
+        set((state) => {
+            const nextValue = typeof enabled === 'function'
+                ? enabled(state.planMode)
+                : enabled;
+
+            return { planMode: Boolean(nextValue) };
         });
     },
     setSelectedImage: (payload) => {
@@ -1234,6 +1244,7 @@ export const useChatStore = create(persist((set, get) => ({
     sendMessage: async (content, options = {}) => {
         const effectiveEnableWebSearch = options.enableWebSearch ?? get().enableWebSearch;
         const enableWebSearch = Boolean(effectiveEnableWebSearch);
+        const planMode = Boolean(options.planMode ?? get().planMode);
         const state = useChatStore.getState();
         const sessionId = state.currentSessionId;
         const selectedImage = state.selectedImage;
@@ -1265,6 +1276,7 @@ export const useChatStore = create(persist((set, get) => ({
             content: '',
             toolLogs: [],
             thoughtLogs: [],
+            taskProgress: [],
             enableWebSearch: Boolean(enableWebSearch),
         };
 
@@ -1380,6 +1392,63 @@ export const useChatStore = create(persist((set, get) => ({
         // 生命周期跟随本次 sendMessage 闭包，流结束后自动 GC，无需手动清理
         const toolResultCache = new Map();
 
+        // ── 任务进度可视化：工具名→中文关键词模糊匹配 ─────────────────
+        const TOOL_TASK_KEYWORDS = {
+            web_search: ['搜索', '网络', '联网', '查找', '获取信息'],
+            search_knowledge_base: ['知识库', '文档', '检索', 'RAG'],
+            get_system_time: ['时间', '日期'],
+            ask_user_question: ['询问', '提问', '确认', '选择'],
+            update_todo: ['计划', '规划', '任务'],
+        };
+
+        /** 在 taskProgress 中找到匹配 toolName 的第一个 pending 项 */
+        const matchToolToTask = (toolName, progress) => {
+            if (!Array.isArray(progress) || progress.length === 0) return -1;
+            const keywords = TOOL_TASK_KEYWORDS[toolName];
+            if (keywords) {
+                const keywordIdx = progress.findIndex(
+                    (t) => t.status === 'pending' && keywords.some((kw) => t.content.includes(kw))
+                );
+                if (keywordIdx >= 0) return keywordIdx;
+            }
+            // 兜底：返回第一个 pending 项
+            return progress.findIndex((t) => t.status === 'pending');
+        };
+
+        /** 更新 tail message 上单条 task 的状态 */
+        const updateTaskStatus = (toolName, newStatus, activeForm) => {
+            set((state) => ({
+                messages: (() => {
+                    const nextMessages = [...state.messages];
+                    const tailIndex = nextMessages.length - 1;
+                    const tail = nextMessages[tailIndex];
+                    if (!tail || tail.role !== 'assistant') return state.messages;
+                    const progress = [...(tail.taskProgress || [])];
+                    if (progress.length === 0) return state.messages;
+                    const idx = matchToolToTask(toolName, progress);
+                    if (idx < 0) return state.messages;
+                    progress[idx] = { ...progress[idx], status: newStatus };
+                    if (activeForm) progress[idx] = { ...progress[idx], activeForm };
+                    nextMessages[tailIndex] = { ...tail, taskProgress: progress };
+                    return nextMessages;
+                })(),
+            }));
+        };
+
+        /** 写入 taskProgress 到 tail message */
+        const syncTaskProgress = (progress) => {
+            set((state) => ({
+                messages: (() => {
+                    const nextMessages = [...state.messages];
+                    const tailIndex = nextMessages.length - 1;
+                    const tail = nextMessages[tailIndex];
+                    if (!tail || tail.role !== 'assistant') return state.messages;
+                    nextMessages[tailIndex] = { ...tail, taskProgress: progress || [] };
+                    return nextMessages;
+                })(),
+            }));
+        };
+
         const syncToolLogs = () => {
             const entries = toolStateMachine.getAll();
             const logs = entries.map((entry) => ({
@@ -1474,6 +1543,7 @@ export const useChatStore = create(persist((set, get) => ({
                         }
                     }
                     syncToolLogs();
+                    updateTaskStatus(toolData.toolName || '', 'in_progress', toolData.activeForm || '');
                 } else if (toolData?.type === 'tool_end') {
                     if (toolCallId) {
                         const toolEndedAt = toolData.at ? new Date(toolData.at).getTime() : undefined;
@@ -1491,6 +1561,7 @@ export const useChatStore = create(persist((set, get) => ({
                         }
                     }
                     syncToolLogs();
+                    updateTaskStatus(toolData.toolName || '', 'completed');
                 } else if (toolData?.type === 'tool_error') {
                     if (toolCallId) {
                         const toolEndedAt = toolData.at ? new Date(toolData.at).getTime() : undefined;
@@ -1508,6 +1579,7 @@ export const useChatStore = create(persist((set, get) => ({
                         }
                     }
                     syncToolLogs();
+                    updateTaskStatus(toolData.toolName || '', 'error');
                 } else if (toolData?.type === 'ask_user_question') {
                     // Agent 向用户提问
                     const questionId = toolData?.questionId;
@@ -1553,6 +1625,18 @@ export const useChatStore = create(persist((set, get) => ({
                             })(),
                         }));
 
+                    }
+                } else if (toolData?.type === 'todo_updated') {
+                    // Agent 更新任务计划
+                    const todos = Array.isArray(toolData?.todos) ? toolData.todos : [];
+                    if (todos.length > 0) {
+                        const progress = todos.map((t) => ({
+                            id: t.id || `task-${Math.random().toString(36).slice(2, 8)}`,
+                            content: t.content || '',
+                            activeForm: '',
+                            status: t.status || 'pending',
+                        }));
+                        syncTaskProgress(progress);
                     }
                 } else if (toolData?.type === 'thought' && toolData?.text) {
                     // 思考日志保持原有处理方式
@@ -1628,6 +1712,20 @@ export const useChatStore = create(persist((set, get) => ({
                 cancelChunkFrame();
                 flushPendingAssistantChunk();
 
+                // 流结束时将剩余 pending 的任务全部标记为 completed
+                const doneMsgs = get().messages;
+                for (let i = doneMsgs.length - 1; i >= 0; i -= 1) {
+                    if (doneMsgs[i].role === 'assistant') {
+                        const tp = doneMsgs[i].taskProgress || [];
+                        if (tp.length > 0 && tp.some((t) => t.status === 'pending')) {
+                            syncTaskProgress(tp.map((t) =>
+                                t.status === 'pending' ? { ...t, status: 'completed' } : t
+                            ));
+                        }
+                        break;
+                    }
+                }
+
                 const finalAssistantContent = (() => {
                     for (let i = latest.messages.length - 1; i >= 0; i -= 1) {
                         if (latest.messages[i].role === 'assistant') {
@@ -1642,15 +1740,17 @@ export const useChatStore = create(persist((set, get) => ({
                     playVoice(finalAssistantContent, { messageId: assistantMessageId });
                 }
 
-                // 在 fetchMessagesBySession 覆盖之前，捕获本地 toolLogs/thoughtLogs
-                // 后端不存储这些字段，刷新历史会丢失工具卡片
+                // 在 fetchMessagesBySession 覆盖之前，捕获本地 toolLogs/thoughtLogs/taskProgress
+                // 后端不存储这些字段，刷新历史会丢失工具卡片和任务进度
                 const localMsgs = get().messages;
                 let localToolLogs = [];
                 let localThoughtLogs = [];
+                let localTaskProgress = [];
                 for (let i = localMsgs.length - 1; i >= 0; i -= 1) {
                     if (localMsgs[i].role === 'assistant') {
                         localToolLogs = localMsgs[i].toolLogs || [];
                         localThoughtLogs = localMsgs[i].thoughtLogs || [];
+                        localTaskProgress = localMsgs[i].taskProgress || [];
                         break;
                     }
                 }
@@ -1671,14 +1771,15 @@ export const useChatStore = create(persist((set, get) => ({
                         }
 
                         if (Array.isArray(history) && history.length > 0) {
-                            // 合并本地 toolLogs/thoughtLogs 到刷新后的最后一条 assistant 消息
-                            if (localToolLogs.length > 0 || localThoughtLogs.length > 0) {
+                            // 合并本地 toolLogs/thoughtLogs/taskProgress 到刷新后的最后一条 assistant 消息
+                            if (localToolLogs.length > 0 || localThoughtLogs.length > 0 || localTaskProgress.length > 0) {
                                 for (let i = history.length - 1; i >= 0; i -= 1) {
                                     if (history[i].role === 'assistant') {
                                         history[i] = {
                                             ...history[i],
                                             toolLogs: localToolLogs,
                                             thoughtLogs: localThoughtLogs,
+                                            taskProgress: localTaskProgress,
                                         };
                                         break;
                                     }
@@ -1748,6 +1849,7 @@ export const useChatStore = create(persist((set, get) => ({
             {
                 signal: controller.signal,
                 enableWebSearch,
+                planMode,
                 systemPrompt,
                 temperature,
                 imageId: selectedImageId,
