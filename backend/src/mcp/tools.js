@@ -1,6 +1,95 @@
+import crypto from "crypto";
 import { DynamicTool } from "@langchain/core/tools";
 import { getMessageStats } from "../db/index.js";
 import { queryKnowledgeBase } from "../rag/index.js";
+
+// ── User Question Broker ──────────────────────────────────────
+// 管理 Agent 向用户提问的 Promise/deferred 注册表。
+// 工具 func 创建 deferred → chat.js 发射 SSE 事件 → REST 端点 resolve deferred → Agent 继续执行。
+
+const pendingQuestions = new Map(); // questionId → { resolve, reject, timer, question, questionType, options }
+
+/**
+ * 注册一个待回答的问题。
+ * 由 ask_user_question 工具的 func 调用。
+ * @returns {{ questionId: string, promise: Promise<string> }}
+ */
+export function registerPendingQuestion(question, questionType, options = []) {
+    const questionId = crypto.randomUUID();
+    let timer = null;
+
+    const promise = new Promise((resolve, reject) => {
+        timer = setTimeout(() => {
+            pendingQuestions.delete(questionId);
+            resolve(JSON.stringify({ status: "timeout", answer: null }));
+        }, 120_000); // 2 分钟超时
+
+        pendingQuestions.set(questionId, { resolve, reject, timer, question, questionType, options });
+    });
+
+    return { questionId, promise };
+}
+
+/**
+ * 获取并消费最近一个未发射的问题（供 chat.js SSE 事件循环使用）。
+ * 返回 null 表示没有待发射的问题。
+ * 工具调用是串行的，所以最近未发射的一定对应当前工具调用。
+ */
+export function consumePendingQuestion() {
+    // 遍历找第一个未发射的（通常只有一个）
+    for (const [questionId, entry] of pendingQuestions) {
+        if (!entry.emitted) {
+            entry.emitted = true;
+            return {
+                questionId,
+                question: entry.question,
+                questionType: entry.questionType,
+                options: entry.options,
+            };
+        }
+    }
+    return null;
+}
+
+/**
+ * 用户回答了问题。由 REST 端点 POST /chat/answer 调用。
+ * @returns {boolean} 是否成功 resolve
+ */
+export function resolveUserQuestion(questionId, answer) {
+    const deferred = pendingQuestions.get(questionId);
+    if (!deferred) {
+        return false;
+    }
+    clearTimeout(deferred.timer);
+    pendingQuestions.delete(questionId);
+    deferred.resolve(JSON.stringify({ status: "answered", answer }));
+    return true;
+}
+
+/**
+ * 清理指定 questionId（流异常结束时调用）。
+ */
+export function cancelUserQuestion(questionId) {
+    const deferred = pendingQuestions.get(questionId);
+    if (!deferred) {
+        return false;
+    }
+    clearTimeout(deferred.timer);
+    pendingQuestions.delete(questionId);
+    deferred.resolve(JSON.stringify({ status: "cancelled", answer: null }));
+    return true;
+}
+
+/**
+ * 清理所有未完成的提问（流结束时批量调用）。
+ */
+export function cancelAllPendingQuestions() {
+    for (const [questionId, deferred] of pendingQuestions) {
+        clearTimeout(deferred.timer);
+        deferred.resolve(JSON.stringify({ status: "cancelled", answer: null }));
+    }
+    pendingQuestions.clear();
+}
 
 const BOCHA_CACHE_TTL_MS = 5 * 60 * 1000;
 const bochaResponseCache = new Map();
@@ -570,9 +659,45 @@ const bochaSearchTool = new DynamicTool({
     }
 });
 
+const askUserQuestionTool = new DynamicTool({
+    name: "ask_user_question",
+    description: `当需要用户做出选择、补充信息或确认操作时调用此工具。
+输入为严格的 JSON 字符串，包含以下字段：
+- question (string): 向用户展示的问题文本
+- questionType (string): 问题类型。single_choice=单选(自动提交)、multi_choice=多选(批量提交)、text_input=文本输入
+- options (string[]): 选项列表(仅 single_choice/multi_choice 需要)
+
+示例输入:
+{"question":"请选择你需要的文件","questionType":"single_choice","options":["报告A.pdf","报表B.xlsx","数据C.csv"]}
+{"question":"请补充你的需求细节","questionType":"text_input","options":[]}`,
+    func: async (input) => {
+        let parsed;
+        try {
+            parsed = typeof input === "string" ? JSON.parse(input) : input;
+        } catch {
+            // 如果 LLM 没有传 JSON，退化为 text_input
+            parsed = { question: String(input), questionType: "text_input", options: [] };
+        }
+
+        const question = String(parsed.question || "请补充信息");
+        const questionType = ["single_choice", "multi_choice", "text_input"].includes(parsed.questionType)
+            ? parsed.questionType
+            : "text_input";
+        const options = Array.isArray(parsed.options) ? parsed.options : [];
+
+        const { questionId, promise } = registerPendingQuestion(question, questionType, options);
+
+        console.log(`[agent][ask_user] id=${questionId} type=${questionType} question="${question.slice(0, 80)}"`);
+
+        const result = await promise;
+        return result;
+    }
+});
+
 export const agentTools = [
     getSystemTimeTool,
     getDbMessageCountTool,
     searchKnowledgeBaseTool,
-    bochaSearchTool
+    bochaSearchTool,
+    askUserQuestionTool
 ];

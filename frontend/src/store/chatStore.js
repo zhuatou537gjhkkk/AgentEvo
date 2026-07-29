@@ -14,8 +14,9 @@ import {
     setAuthToken,
     createSessionBranch,
     deleteMessagePair,
+    sendUserAnswer,
 } from '../api/chat';
-import { createToolExecutionStateMachine } from '../utils/toolExecutionStateMachine';
+import { createToolExecutionStateMachine, ToolStatus } from '../utils/toolExecutionStateMachine';
 
 // 模块级 Map：存储活跃 FSM 及其 syncToolLogs，用于 stop 时立即取消工具
 // 不能放 Zustand state（非序列化对象会被 persist 中间件丢弃）
@@ -1048,6 +1049,80 @@ export const useChatStore = create(persist((set, get) => ({
             enableWebSearch: true,
         });
     },
+    submitUserAnswer: async (questionId, answer) => {
+        // 更新本地 questionLogs，标记为已提交
+        const activeStreamToken = get().activeStreamToken;
+
+        set((state) => ({
+            messages: (() => {
+                const nextMessages = [...state.messages];
+                const tailIndex = nextMessages.length - 1;
+                const tail = nextMessages[tailIndex];
+
+                if (!tail || tail.role !== 'assistant') {
+                    return state.messages;
+                }
+
+                const currentQuestionLogs = Array.isArray(tail.questionLogs)
+                    ? [...tail.questionLogs]
+                    : [];
+
+                const updatedLogs = currentQuestionLogs.map((q) => {
+                    if (q.questionId === questionId) {
+                        return { ...q, isSubmitted: true, submittedAnswer: answer };
+                    }
+                    return q;
+                });
+
+                nextMessages[tailIndex] = {
+                    ...tail,
+                    questionLogs: updatedLogs,
+                };
+
+                return nextMessages;
+            })(),
+        }));
+
+        // 调用后端 REST 端点 resolve deferred Promise → Agent 恢复执行
+        try {
+            const result = await sendUserAnswer(questionId, answer);
+            if (!result?.ok) {
+                console.warn(`[submitUserAnswer] question ${questionId} already resolved: ${result?.status}`);
+            }
+        } catch (err) {
+            console.error(`[submitUserAnswer] failed for ${questionId}:`, err);
+            // 回滚提交状态
+            set((state) => ({
+                messages: (() => {
+                    const nextMessages = [...state.messages];
+                    const tailIndex = nextMessages.length - 1;
+                    const tail = nextMessages[tailIndex];
+
+                    if (!tail || tail.role !== 'assistant') {
+                        return state.messages;
+                    }
+
+                    const currentQuestionLogs = Array.isArray(tail.questionLogs)
+                        ? [...tail.questionLogs]
+                        : [];
+
+                    const revertedLogs = currentQuestionLogs.map((q) => {
+                        if (q.questionId === questionId) {
+                            return { ...q, isSubmitted: false, submittedAnswer: null };
+                        }
+                        return q;
+                    });
+
+                    nextMessages[tailIndex] = {
+                        ...tail,
+                        questionLogs: revertedLogs,
+                    };
+
+                    return nextMessages;
+                })(),
+            }));
+        }
+    },
     createBranchFromMessage: async (messageId) => {
         if (get().isTyping) {
             return;
@@ -1382,6 +1457,11 @@ export const useChatStore = create(persist((set, get) => ({
                         toolStateMachine.create(toolCallId, toolData.toolName || 'unknown', toolData.input, toolStartedAt);
                         toolStateMachine.start(toolCallId);
 
+                        // ask_user_question: 进入等待用户输入状态
+                        if (toolData.toolName === 'ask_user_question') {
+                            toolStateMachine.waitUser(toolCallId);
+                        }
+
                         // 检查是否有先到达的缓存结果，自动配对
                         const cached = toolResultCache.get(toolCallId);
                         if (cached) {
@@ -1428,6 +1508,52 @@ export const useChatStore = create(persist((set, get) => ({
                         }
                     }
                     syncToolLogs();
+                } else if (toolData?.type === 'ask_user_question') {
+                    // Agent 向用户提问
+                    const questionId = toolData?.questionId;
+                    const questionType = toolData?.questionType || 'text_input';
+                    const question = toolData?.question || '';
+                    const options = Array.isArray(toolData?.options) ? toolData.options : [];
+
+                    if (questionId) {
+                        // 添加 questionLogs 到 assistant 消息
+                        set((state) => ({
+                            messages: (() => {
+                                const nextMessages = [...state.messages];
+                                const tailIndex = nextMessages.length - 1;
+                                const tail = nextMessages[tailIndex];
+
+                                if (!tail || tail.role !== 'assistant') {
+                                    return state.messages;
+                                }
+
+                                const currentQuestionLogs = Array.isArray(tail.questionLogs)
+                                    ? [...tail.questionLogs]
+                                    : [];
+
+                                // 防重复：同一 questionId 不重复添加
+                                if (!currentQuestionLogs.some((q) => q.questionId === questionId)) {
+                                    currentQuestionLogs.push({
+                                        questionId,
+                                        question,
+                                        questionType,
+                                        options,
+                                        status: 'pending',
+                                        isSubmitted: false,
+                                        submittedAnswer: null,
+                                    });
+                                }
+
+                                nextMessages[tailIndex] = {
+                                    ...tail,
+                                    questionLogs: currentQuestionLogs,
+                                };
+
+                                return nextMessages;
+                            })(),
+                        }));
+
+                    }
                 } else if (toolData?.type === 'thought' && toolData?.text) {
                     // 思考日志保持原有处理方式
                     set((state) => ({

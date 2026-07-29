@@ -276,6 +276,20 @@ export async function createSessionBranch(sessionId, options = {}) {
     return response.json();
 }
 
+export async function sendUserAnswer(questionId, answer) {
+    const response = await request('/chat/answer', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ questionId, answer }),
+    }, {
+        retryCount: 0,
+    });
+
+    return response.json();
+}
+
 export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, onDone, onError, options = {}) {
     const {
         signal,
@@ -347,7 +361,7 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
                     return;
                 }
 
-                if (eventType === 'tool_start' || eventType === 'tool_end' || eventType === 'tool_error' || eventType === 'thought' || eventType === 'metrics') {
+                if (eventType === 'tool_start' || eventType === 'tool_end' || eventType === 'tool_error' || eventType === 'thought' || eventType === 'metrics' || eventType === 'ask_user_question') {
                     onToolEvent(parsed);
                 }
             } catch {

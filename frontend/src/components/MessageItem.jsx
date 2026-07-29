@@ -2,6 +2,7 @@ import { memo, useEffect, useState } from 'react';
 import { useChatStore } from '../store/chatStore';
 import { playVoice, stopVoice } from '../store/chatStore';
 import ToolCallCard, { ToolGroupCard } from './ToolCallCard';
+import UserQuestionCard from './UserQuestionCard';
 import { groupToolsByInterval } from '../utils/toolExecutionStateMachine';
 
 function parseStructuredWebSearchContent(content) {
@@ -304,11 +305,13 @@ function MessageItem({ message }) {
     };
 
     const renderToolLogs = () => {
-        if (toolLogs.length === 0) {
+        // ask_user_question 由 UserQuestionCard 渲染，不在工具卡片区重复显示
+        const visibleToolLogs = toolLogs.filter((log) => log.name !== 'ask_user_question');
+        if (visibleToolLogs.length === 0) {
             return null;
         }
 
-        const groups = groupToolsByInterval(toolLogs);
+        const groups = groupToolsByInterval(visibleToolLogs);
 
         return (
             <div className="mb-2 rounded-lg border border-[var(--panel-border)] bg-[var(--panel-soft)] divide-y divide-[var(--panel-border)] overflow-hidden">
@@ -330,6 +333,25 @@ function MessageItem({ message }) {
                         />
                     );
                 })}
+            </div>
+        );
+    };
+
+    const questionLogs = Array.isArray(message.questionLogs) ? message.questionLogs : [];
+
+    const renderQuestionLogs = () => {
+        if (questionLogs.length === 0) {
+            return null;
+        }
+
+        return (
+            <div className="mb-2 space-y-1.5">
+                {questionLogs.map((qLog) => (
+                    <UserQuestionCard
+                        key={qLog.questionId}
+                        questionLog={qLog}
+                    />
+                ))}
             </div>
         );
     };
@@ -545,6 +567,7 @@ function MessageItem({ message }) {
                         <div className="break-words pr-7 [&_ol]:list-decimal [&_ol]:pl-6 [&_p]:whitespace-pre-wrap [&_ul]:list-disc [&_ul]:pl-6">
                             {renderThoughtLogs()}
                             {renderToolLogs()}
+                            {renderQuestionLogs()}
                             {renderAssistantContent()}
                             {message?.metrics && (
                                 <div className="mt-2 inline-flex flex-wrap items-center gap-2 rounded-md border border-[var(--panel-border)] bg-[var(--panel-bg)] px-2 py-1 text-[11px] text-[var(--text-muted)]">
@@ -619,11 +642,15 @@ export default memo(
         const nextLogs = nextProps.message?.toolLogs || [];
         const prevThoughtLogs = prevProps.message?.thoughtLogs || [];
         const nextThoughtLogs = nextProps.message?.thoughtLogs || [];
+        const prevQuestionLogs = prevProps.message?.questionLogs || [];
+        const nextQuestionLogs = nextProps.message?.questionLogs || [];
 
         const prevLastLog = prevLogs[prevLogs.length - 1];
         const nextLastLog = nextLogs[nextLogs.length - 1];
         const prevLastThought = prevThoughtLogs[prevThoughtLogs.length - 1];
         const nextLastThought = nextThoughtLogs[nextThoughtLogs.length - 1];
+        const prevLastQuestion = prevQuestionLogs[prevQuestionLogs.length - 1];
+        const nextLastQuestion = nextQuestionLogs[nextQuestionLogs.length - 1];
 
         return (
             prevProps.message?.id === nextProps.message?.id &&
@@ -634,6 +661,7 @@ export default memo(
             prevProps.message?.metrics?.model === nextProps.message?.metrics?.model &&
             prevLogs.length === nextLogs.length &&
             prevThoughtLogs.length === nextThoughtLogs.length &&
+            prevQuestionLogs.length === nextQuestionLogs.length &&
             prevLastLog?.id === nextLastLog?.id &&
             prevLastLog?.name === nextLastLog?.name &&
             prevLastLog?.status === nextLastLog?.status &&
@@ -641,7 +669,11 @@ export default memo(
             prevLastLog?.retryCount === nextLastLog?.retryCount &&
             prevLastLog?.endedAt === nextLastLog?.endedAt &&
             prevLastThought?.text === nextLastThought?.text &&
-            prevLastThought?.status === nextLastThought?.status
+            prevLastThought?.status === nextLastThought?.status &&
+            prevLastQuestion?.questionId === nextLastQuestion?.questionId &&
+            prevLastQuestion?.isSubmitted === nextLastQuestion?.isSubmitted &&
+            prevLastQuestion?.submittedAnswer === nextLastQuestion?.submittedAnswer &&
+            prevLastQuestion?.status === nextLastQuestion?.status
         );
     }
 );

@@ -8,6 +8,7 @@ const TOOL_ICONS = {
   search_knowledge_base: { icon: '📚', label: '知识库搜索' },
   get_system_time: { icon: '🕐', label: '系统时间' },
   get_db_message_count: { icon: '🗄', label: '数据库统计' },
+  ask_user_question: { icon: '❓', label: '向用户提问' },
 };
 
 function resolveToolMeta(name) {
@@ -53,6 +54,13 @@ const STATUS_CONFIG = {
     text: 'text-slate-400',
     label: '已取消',
   },
+  [ToolStatus.WAITING_USER]: {
+    border: 'border-l-amber-400',
+    bg: 'bg-amber-500/5',
+    text: 'text-amber-300',
+    label: '等待回答',
+    pulse: true,
+  },
 };
 
 // ── 工具组聚合状态配置 ────────────────────────────────────
@@ -84,6 +92,13 @@ const GROUP_STATUS_CONFIG = {
     text: 'text-slate-400',
     label: '等待中',
     pulse: false,
+  },
+  [ToolStatus.WAITING_USER]: {
+    border: 'border-l-amber-400',
+    bg: 'bg-amber-500/5',
+    text: 'text-amber-300',
+    label: '等待用户回答',
+    pulse: true,
   },
 };
 

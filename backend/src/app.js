@@ -25,6 +25,7 @@ import {
     removeMessagePair,
 } from "./db/index.js";
 import { chatWithStream } from "./services/chat.js";
+import { resolveUserQuestion } from "./mcp/tools.js";
 import {
     uploadMiddleware,
     processAndStoreDocument,
@@ -1029,6 +1030,28 @@ app.post("/chat", requireAuth, async (req, res) => {
             sendSseMetrics(res, metrics);
         },
     });
+});
+
+app.post("/chat/answer", requireAuth, async (req, res) => {
+    const { questionId, answer } = req.body || {};
+
+    if (!questionId || answer == null) {
+        return res.status(400).json({ ok: false, message: "questionId and answer are required" });
+    }
+
+    const resolved = resolveUserQuestion(questionId, String(answer));
+
+    if (!resolved) {
+        return res.status(404).json({
+            ok: false,
+            status: "already_answered",
+            message: "问题已超时或已被回答",
+        });
+    }
+
+    console.log(`[chat][answer] questionId=${questionId} answered`);
+
+    return res.json({ ok: true, status: "accepted" });
 });
 
 app.listen(PORT, () => {

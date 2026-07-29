@@ -4,7 +4,7 @@ import { HumanMessage, AIMessage, SystemMessage } from "@langchain/core/messages
 import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
 import { createToolCallingAgent, AgentExecutor } from "@langchain/classic/agents";
 import { saveMessage, getHistoryMessages } from "../db/index.js";
-import { agentTools } from "../mcp/tools.js";
+import { agentTools, consumePendingQuestion, cancelAllPendingQuestions } from "../mcp/tools.js";
 
 const WEB_SEARCH_TOOL_NAME = "web_search";
 const FORCED_WEB_SEARCH_MAX_CHARS = 8000;
@@ -254,6 +254,8 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
     let clientDisconnected = false;
     const onClientClose = () => {
         clientDisconnected = true;
+        // 清理所有未完成的用户提问
+        cancelAllPendingQuestions();
         if (!abortController.signal.aborted) {
             console.log('[agent] client disconnected, aborting upstream stream');
             abortController.abort();
@@ -426,6 +428,32 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                             at: toolStartedAt
                         })}\n\n`
                     );
+
+                    // 如果是 ask_user_question，延迟到 tool func 同步部分执行后发射提问事件
+                    // LangChain 的 on_tool_start 在 tool.func 执行前触发，直接 consumePendingQuestion() 会拿到 null
+                    if (event.name === "ask_user_question") {
+                        const toolStartedAtCapture = toolStartedAt;
+                        setImmediate(() => {
+                            const pending = consumePendingQuestion();
+                            if (pending) {
+                                console.log(
+                                    `[agent][ask_user_question] id=${pending.questionId} type=${pending.questionType}`
+                                );
+                                res.write(
+                                    `data: ${JSON.stringify({
+                                        type: "ask_user_question",
+                                        questionId: pending.questionId,
+                                        question: pending.question,
+                                        questionType: pending.questionType,
+                                        options: pending.options,
+                                        at: toolStartedAtCapture,
+                                    })}\n\n`
+                                );
+                            } else {
+                                console.log(`[agent][ask_user_question] consumePendingQuestion returned null!`);
+                            }
+                        });
+                    }
                     continue;
                 }
 
@@ -516,6 +544,32 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                             at: toolStartedAt
                         })}\n\n`
                     );
+
+                    // 如果是 ask_user_question，延迟到 tool func 同步部分执行后发射提问事件
+                    // LangChain 的 on_tool_start 在 tool.func 执行前触发，直接 consumePendingQuestion() 会拿到 null
+                    if (event.name === "ask_user_question") {
+                        const toolStartedAtCapture = toolStartedAt;
+                        setImmediate(() => {
+                            const pending = consumePendingQuestion();
+                            if (pending) {
+                                console.log(
+                                    `[agent][ask_user_question] id=${pending.questionId} type=${pending.questionType}`
+                                );
+                                res.write(
+                                    `data: ${JSON.stringify({
+                                        type: "ask_user_question",
+                                        questionId: pending.questionId,
+                                        question: pending.question,
+                                        questionType: pending.questionType,
+                                        options: pending.options,
+                                        at: toolStartedAtCapture,
+                                    })}\n\n`
+                                );
+                            } else {
+                                console.log(`[agent][ask_user_question] consumePendingQuestion returned null!`);
+                            }
+                        });
+                    }
                     continue;
                 }
 
@@ -593,6 +647,8 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
         cleanupDisconnect();
     } catch (error) {
         console.error(`[agent][fatal] message="${error.message}" stack="${error.stack}"`);
+        // 清理所有未完成的用户提问
+        cancelAllPendingQuestions();
         if (!clientDisconnected) {
             emitThought(res, "生成过程发生错误", "error");
             res.write(

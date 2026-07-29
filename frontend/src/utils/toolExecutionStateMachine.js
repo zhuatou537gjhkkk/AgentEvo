@@ -2,21 +2,25 @@
  * 工具执行状态机 (Tool Execution FSM)
  *
  * 状态定义:
- *   PENDING    — 已入队，等待执行
- *   EXECUTING  — 正在执行
- *   SUCCESS    — 执行成功 (终态)
- *   ERROR      — 执行失败
- *   TIMEOUT    — 执行超时
- *   CANCELLED  — 被用户取消 (终态)
+ *   PENDING       — 已入队，等待执行
+ *   EXECUTING     — 正在执行
+ *   WAITING_USER  — 等待用户回答 (ask_user_question 专用)
+ *   SUCCESS       — 执行成功 (终态)
+ *   ERROR         — 执行失败
+ *   TIMEOUT       — 执行超时
+ *   CANCELLED     — 被用户取消 (终态)
  *
  * 状态转移:
- *   PENDING    ──(start)──→ EXECUTING
- *   EXECUTING  ──(end)────→ SUCCESS
- *   EXECUTING  ──(error)──→ ERROR
- *   EXECUTING  ──(timeout)─→ TIMEOUT
- *   EXECUTING  ──(cancel)──→ CANCELLED
- *   ERROR      ──(retry)──→ EXECUTING   (retryCount++)
- *   TIMEOUT    ──(retry)──→ EXECUTING   (retryCount++)
+ *   PENDING       ──(start)──────→ EXECUTING
+ *   EXECUTING     ──(end)────────→ SUCCESS
+ *   EXECUTING     ──(wait_user)──→ WAITING_USER
+ *   WAITING_USER  ──(end)────────→ SUCCESS
+ *   WAITING_USER  ──(cancel)─────→ CANCELLED
+ *   EXECUTING     ──(error)──────→ ERROR
+ *   EXECUTING     ──(timeout)────→ TIMEOUT
+ *   EXECUTING     ──(cancel)─────→ CANCELLED
+ *   ERROR         ──(retry)──────→ EXECUTING   (retryCount++)
+ *   TIMEOUT       ──(retry)──────→ EXECUTING   (retryCount++)
  *
  * 禁止的转移 (守卫):
  *   - 只有 EXECUTING 才能进入终态
@@ -28,6 +32,7 @@
 export const ToolStatus = {
   PENDING: 'pending',
   EXECUTING: 'executing',
+  WAITING_USER: 'waiting_user',
   SUCCESS: 'success',
   ERROR: 'error',
   TIMEOUT: 'timeout',
@@ -44,6 +49,7 @@ const TERMINAL_STATES = new Set([
 const Event = {
   START: 'start',
   END: 'end',
+  WAIT_USER: 'wait_user',
   ERROR: 'error',
   TIMEOUT: 'timeout',
   CANCEL: 'cancel',
@@ -61,8 +67,13 @@ const TRANSITION_TABLE = {
   },
   [ToolStatus.EXECUTING]: {
     [Event.END]: ToolStatus.SUCCESS,
+    [Event.WAIT_USER]: ToolStatus.WAITING_USER,
     [Event.ERROR]: ToolStatus.ERROR,
     [Event.TIMEOUT]: ToolStatus.TIMEOUT,
+    [Event.CANCEL]: ToolStatus.CANCELLED,
+  },
+  [ToolStatus.WAITING_USER]: {
+    [Event.END]: ToolStatus.SUCCESS,
     [Event.CANCEL]: ToolStatus.CANCELLED,
   },
   [ToolStatus.ERROR]: {
@@ -321,6 +332,11 @@ export function createToolExecutionStateMachine(config = {}) {
       return transition(id, Event.CANCEL);
     },
 
+    /** EXECUTING -> WAITING_USER (ask_user_question 等待用户回答) */
+    waitUser(id) {
+      return transition(id, Event.WAIT_USER);
+    },
+
     /** ERROR/TIMEOUT -> EXECUTING */
     retry(id) {
       return transition(id, Event.RETRY);
@@ -333,7 +349,8 @@ export function createToolExecutionStateMachine(config = {}) {
       for (const [id, entry] of entries) {
         if (
           entry.status === ToolStatus.PENDING ||
-          entry.status === ToolStatus.EXECUTING
+          entry.status === ToolStatus.EXECUTING ||
+          entry.status === ToolStatus.WAITING_USER
         ) {
           const result = this.cancel(id);
 
@@ -368,6 +385,8 @@ export function createToolExecutionStateMachine(config = {}) {
       let executing = 0;
       let pending = 0;
 
+      let waitingUser = 0;
+
       for (const entry of entries.values()) {
         total += 1;
 
@@ -377,6 +396,9 @@ export function createToolExecutionStateMachine(config = {}) {
             break;
           case ToolStatus.EXECUTING:
             executing += 1;
+            break;
+          case ToolStatus.WAITING_USER:
+            waitingUser += 1;
             break;
           case ToolStatus.SUCCESS:
             success += 1;
@@ -393,7 +415,7 @@ export function createToolExecutionStateMachine(config = {}) {
         }
       }
 
-      return { total, success, error, timeout, cancelled, executing, pending };
+      return { total, success, error, timeout, cancelled, executing, pending, waitingUser };
     },
 
     /** 销毁实例，清理所有定时器 */
@@ -525,17 +547,20 @@ export function getGroupAggregateStatus(group) {
   }
 
   let hasExecuting = false;
+  let hasWaitingUser = false;
   let hasError = false;
   let allSuccess = true;
 
   for (const entry of group) {
     const s = entry.status || ToolStatus.PENDING;
     if (s === ToolStatus.EXECUTING) hasExecuting = true;
+    if (s === ToolStatus.WAITING_USER) hasWaitingUser = true;
     if (s === ToolStatus.ERROR || s === ToolStatus.TIMEOUT) hasError = true;
     if (s !== ToolStatus.SUCCESS) allSuccess = false;
   }
 
   if (hasExecuting) return { status: ToolStatus.EXECUTING, hasExecuting: true, hasError };
+  if (hasWaitingUser) return { status: ToolStatus.WAITING_USER, hasExecuting: false, hasError };
   if (hasError) return { status: ToolStatus.ERROR, hasExecuting: false, hasError: true };
   if (allSuccess) return { status: ToolStatus.SUCCESS, hasExecuting: false, hasError: false };
   return { status: ToolStatus.PENDING, hasExecuting: false, hasError: false };
