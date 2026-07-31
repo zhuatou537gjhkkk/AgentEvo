@@ -25,6 +25,7 @@ import {
     removeMessagePair,
 } from "./db/index.js";
 import { chatWithStream } from "./services/chat.js";
+import { chatWithGraph } from "./services/chatGraph.js";
 import { resolveUserQuestion } from "./mcp/tools.js";
 import {
     uploadMiddleware,
@@ -946,6 +947,10 @@ app.post("/chat", requireAuth, async (req, res) => {
         return;
     }
 
+    // Phase 2: LangGraph 多 Agent 管道（feature flag）— 提前定义，所有路径共用
+    const _useLangGraph = process.env.USE_LANGGRAPH === 'true';
+    const chatImpl = _useLangGraph ? chatWithGraph : chatWithStream;
+
     if (isKnowledgeIntent(message) && !resolvedImage) {
         const shouldUseLargeContext = mentionsActiveLargeFile(message, activeLargeFile);
 
@@ -953,15 +958,32 @@ app.post("/chat", requireAuth, async (req, res) => {
             saveMessage(req.user.id, sessionId, "user", message);
 
             const contextPayload = buildLargeFileContext(activeLargeFile, message);
-            const longContextPrompt = `你是一个智能助手。请仅根据给定文档片段回答问题，不得编造文档中不存在的信息；若片段不足以支持结论，请明确说明“证据不足，需补充片段”。\n\n文档名：${activeLargeFile.fileName}\n片段总数：${contextPayload.totalSegments}\n本轮命中片段：${contextPayload.selectedCount}\n\n参考片段：\n${contextPayload.contextText}\n\n用户问题：${message}`;
+            const longContextPrompt = `你是一个智能助手。请仅根据给定文档片段回答问题，不得编造文档中不存在的信息；若片段不足以支持结论，请明确说明"证据不足，需补充片段"。\n\n文档名：${activeLargeFile.fileName}\n片段总数：${contextPayload.totalSegments}\n本轮命中片段：${contextPayload.selectedCount}\n\n参考片段：\n${contextPayload.contextText}\n\n用户问题：${message}`;
             console.log(
                 `[chat][large_file] source=${activeLargeFile.fileName} segments=${contextPayload.selectedCount}/${contextPayload.totalSegments} chars=${contextPayload.selectedChars} model=${LONG_CONTEXT_MODEL}`
             );
 
-            await chatWithStream(req.user.id, sessionId, longContextPrompt, resolvedImage, systemPrompt, temperature, res, {
+            await chatImpl(req.user.id, sessionId, longContextPrompt, resolvedImage, systemPrompt, temperature, res, {
                 enableWebSearch: false,
                 skipUserMessageSave: true,
                 forceModel: LONG_CONTEXT_MODEL,
+                planMode,
+                onComplete: (metrics) => {
+                    if (metrics?.messageId) {
+                        saveMessageMetric(metrics.messageId, metrics);
+                    }
+                    sendSseMetrics(res, metrics);
+                },
+            });
+            return;
+        }
+
+        // LangGraph 路径：跳过预检索，让 Graph Router → knowledge_agent 自行调用 search_knowledge_base
+        if (_useLangGraph) {
+            saveMessage(req.user.id, sessionId, "user", message);
+            await chatImpl(req.user.id, sessionId, message, resolvedImage, systemPrompt, temperature, res, {
+                enableWebSearch: false,
+                skipUserMessageSave: true,
                 planMode,
                 onComplete: (metrics) => {
                     if (metrics?.messageId) {
@@ -991,7 +1013,7 @@ app.post("/chat", requireAuth, async (req, res) => {
 
             const enhancedPrompt = `你是一个智能助手。请严格根据以下检索到的参考资料，回答用户的问题。如果资料不包含相关答案，请告知用户。\n\n参考资料：\n${context}\n\n用户问题：${message}`;
 
-            await chatWithStream(req.user.id, sessionId, enhancedPrompt, resolvedImage, systemPrompt, temperature, res, {
+            await chatImpl(req.user.id, sessionId, enhancedPrompt, resolvedImage, systemPrompt, temperature, res, {
                 enableWebSearch: false,
                 skipUserMessageSave: true,
                 planMode,
@@ -1025,7 +1047,8 @@ app.post("/chat", requireAuth, async (req, res) => {
         return;
     }
 
-    await chatWithStream(req.user.id, sessionId, message, resolvedImage, systemPrompt, temperature, res, {
+    // 通用聊天路径
+    await chatImpl(req.user.id, sessionId, message, resolvedImage, systemPrompt, temperature, res, {
         enableWebSearch,
         planMode,
         onComplete: (metrics) => {

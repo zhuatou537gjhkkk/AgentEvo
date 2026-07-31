@@ -363,7 +363,7 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
                     return;
                 }
 
-                if (eventType === 'tool_start' || eventType === 'tool_end' || eventType === 'tool_error' || eventType === 'thought' || eventType === 'metrics' || eventType === 'ask_user_question' || eventType === 'todo_updated') {
+                if (eventType === 'tool_start' || eventType === 'tool_end' || eventType === 'tool_error' || eventType === 'thought' || eventType === 'metrics' || eventType === 'ask_user_question' || eventType === 'todo_updated' || eventType === 'agent_start' || eventType === 'agent_end' || eventType === 'agent_handoff') {
                     onToolEvent(parsed);
                 }
             } catch {

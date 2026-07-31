@@ -376,7 +376,13 @@ const bochaSearchTool = new DynamicTool({
                 try {
                     const cached = bochaResponseCache.get(cacheKey);
                     if (cached && Date.now() - cached.cachedAt <= BOCHA_CACHE_TTL_MS) {
+                        console.log(`[Tool][cache] HIT — "${query}" (freshness=${preferredFreshness}, age=${Date.now() - cached.cachedAt}ms)`);
                         return cached.rows;
+                    }
+                    if (cached) {
+                        console.log(`[Tool][cache] EXPIRED — "${query}" (age=${Date.now() - cached.cachedAt}ms), re-fetching`);
+                    } else {
+                        console.log(`[Tool][cache] MISS — "${query}", fetching from API`);
                     }
 
                     let response = await fetch("https://api.bochaai.com/v1/web-search", {

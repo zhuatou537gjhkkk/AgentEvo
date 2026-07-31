@@ -1401,18 +1401,23 @@ export const useChatStore = create(persist((set, get) => ({
             update_todo: ['计划', '规划', '任务'],
         };
 
-        /** 在 taskProgress 中找到匹配 toolName 的第一个 pending 项 */
+        /** 在 taskProgress 中找到匹配 toolName 的第一个活跃项（pending 或 in_progress）
+         *
+         *  BUG-P2-01 修复：原先只匹配 status==='pending'，但 tool_start 已将步骤
+         *  改为 in_progress，导致 tool_end 回来时关键词匹配失败，误将其他 pending
+         *  步骤标记为 completed。现在同时匹配 pending 和 in_progress 两个活跃态。
+         */
         const matchToolToTask = (toolName, progress) => {
             if (!Array.isArray(progress) || progress.length === 0) return -1;
             const keywords = TOOL_TASK_KEYWORDS[toolName];
             if (keywords) {
                 const keywordIdx = progress.findIndex(
-                    (t) => t.status === 'pending' && keywords.some((kw) => t.content.includes(kw))
+                    (t) => (t.status === 'pending' || t.status === 'in_progress') && keywords.some((kw) => t.content.includes(kw))
                 );
                 if (keywordIdx >= 0) return keywordIdx;
             }
-            // 兜底：返回第一个 pending 项
-            return progress.findIndex((t) => t.status === 'pending');
+            // 兜底：返回第一个活跃项
+            return progress.findIndex((t) => t.status === 'pending' || t.status === 'in_progress');
         };
 
         /** 更新 tail message 上单条 task 的状态 */
@@ -1435,15 +1440,41 @@ export const useChatStore = create(persist((set, get) => ({
             }));
         };
 
-        /** 写入 taskProgress 到 tail message */
-        const syncTaskProgress = (progress) => {
+        /** 合并写入 taskProgress 到 tail message
+         *
+         *  BUG-P2-01 修复：原先直接用 incoming 覆盖整个数组，但 Agent 调用
+         *  update_todo 时可能只传部分步骤，导致其他步骤被删除。改为按 id 合并：
+         *  已有步骤只更新 status，新步骤追加，未提及的步骤保留。
+         */
+        const syncTaskProgress = (incoming) => {
             set((state) => ({
                 messages: (() => {
                     const nextMessages = [...state.messages];
                     const tailIndex = nextMessages.length - 1;
                     const tail = nextMessages[tailIndex];
                     if (!tail || tail.role !== 'assistant') return state.messages;
-                    nextMessages[tailIndex] = { ...tail, taskProgress: progress || [] };
+
+                    const existing = tail.taskProgress || [];
+                    let merged;
+                    if (!Array.isArray(incoming) || incoming.length === 0) {
+                        merged = existing;
+                    } else {
+                        // 更新已有步骤的状态（按 id 匹配），保留 incoming 中不存在的步骤
+                        merged = existing.map((existingStep) => {
+                            const match = incoming.find((s) => s.id === existingStep.id);
+                            return match
+                                ? { ...existingStep, status: match.status || existingStep.status }
+                                : existingStep;
+                        });
+                        // 追加 incoming 中有但 existing 中没有的新步骤
+                        for (const step of incoming) {
+                            if (!existing.some((e) => e.id === step.id)) {
+                                merged.push(step);
+                            }
+                        }
+                    }
+
+                    nextMessages[tailIndex] = { ...tail, taskProgress: merged };
                     return nextMessages;
                 })(),
             }));
@@ -1461,6 +1492,8 @@ export const useChatStore = create(persist((set, get) => ({
                 retryCount: entry.retryCount,
                 startedAt: entry.startedAt,
                 endedAt: entry.endedAt,
+                agentName: entry.agentName || 'core',       // Phase 2: Agent 身份标识
+                agentType: entry.agentType || 'react',       // Phase 2: Agent 类型标识
             }));
 
             set((state) => ({
@@ -1526,6 +1559,15 @@ export const useChatStore = create(persist((set, get) => ({
                         toolStateMachine.create(toolCallId, toolData.toolName || 'unknown', toolData.input, toolStartedAt);
                         toolStateMachine.start(toolCallId);
 
+                        // Phase 2: 存储 Agent 身份到 FSM entry
+                        if (toolData.agentName || toolData.agentType) {
+                            const stored = toolStateMachine.get(toolCallId);
+                            if (stored) {
+                                stored.agentName = toolData.agentName;
+                                stored.agentType = toolData.agentType || 'react';
+                            }
+                        }
+
                         // ask_user_question: 进入等待用户输入状态
                         if (toolData.toolName === 'ask_user_question') {
                             toolStateMachine.waitUser(toolCallId);
@@ -1543,7 +1585,11 @@ export const useChatStore = create(persist((set, get) => ({
                         }
                     }
                     syncToolLogs();
-                    updateTaskStatus(toolData.toolName || '', 'in_progress', toolData.activeForm || '');
+                    // update_todo 是元工具（修改计划自身），不参与事件兜底匹配
+                    // 它的进度通过 todo_updated SSE → syncTaskProgress 处理
+                    if (toolData.toolName !== 'update_todo') {
+                        updateTaskStatus(toolData.toolName || '', 'in_progress', toolData.activeForm || '');
+                    }
                 } else if (toolData?.type === 'tool_end') {
                     if (toolCallId) {
                         const toolEndedAt = toolData.at ? new Date(toolData.at).getTime() : undefined;
@@ -1561,7 +1607,9 @@ export const useChatStore = create(persist((set, get) => ({
                         }
                     }
                     syncToolLogs();
-                    updateTaskStatus(toolData.toolName || '', 'completed');
+                    if (toolData.toolName !== 'update_todo') {
+                        updateTaskStatus(toolData.toolName || '', 'completed');
+                    }
                 } else if (toolData?.type === 'tool_error') {
                     if (toolCallId) {
                         const toolEndedAt = toolData.at ? new Date(toolData.at).getTime() : undefined;
@@ -1579,7 +1627,9 @@ export const useChatStore = create(persist((set, get) => ({
                         }
                     }
                     syncToolLogs();
-                    updateTaskStatus(toolData.toolName || '', 'error');
+                    if (toolData.toolName !== 'update_todo') {
+                        updateTaskStatus(toolData.toolName || '', 'error');
+                    }
                 } else if (toolData?.type === 'ask_user_question') {
                     // Agent 向用户提问
                     const questionId = toolData?.questionId;
@@ -1685,6 +1735,39 @@ export const useChatStore = create(persist((set, get) => ({
                                     total_tokens: Number(toolData?.metrics?.total_tokens) || 0,
                                     model: String(toolData?.metrics?.model || ''),
                                 },
+                            };
+
+                            return nextMessages;
+                        })(),
+                    }));
+                } else if (toolData?.type === 'agent_start' || toolData?.type === 'agent_end' || toolData?.type === 'agent_handoff') {
+                    // Phase 2: 多 Agent 生命周期事件 → 写入 thoughtLogs
+                    const agentText = toolData?.type === 'agent_start'
+                        ? `Agent ${toolData.agentName || toolData.agentType || ''} 开始工作`
+                        : toolData?.type === 'agent_end'
+                            ? `Agent ${toolData.agentName || toolData.agentType || ''} 完成`
+                            : `${toolData.from || '?'} → ${toolData.to || '?'}`;
+
+                    set((state) => ({
+                        messages: (() => {
+                            const nextMessages = [...state.messages];
+                            const tailIndex = nextMessages.length - 1;
+                            const tail = nextMessages[tailIndex];
+
+                            if (!tail || tail.role !== 'assistant') {
+                                return state.messages;
+                            }
+
+                            const currentThoughtLogs = Array.isArray(tail.thoughtLogs) ? [...tail.thoughtLogs] : [];
+                            currentThoughtLogs.push({
+                                text: agentText,
+                                status: toolData?.type === 'agent_end' ? 'done' : 'running',
+                                at: toolData.at || new Date().toISOString(),
+                            });
+
+                            nextMessages[tailIndex] = {
+                                ...tail,
+                                thoughtLogs: currentThoughtLogs,
                             };
 
                             return nextMessages;

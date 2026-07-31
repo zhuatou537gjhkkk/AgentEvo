@@ -15,6 +15,16 @@ function resolveToolMeta(name) {
   return TOOL_ICONS[name] || { icon: '🔧', label: name };
 }
 
+// Phase 2: Agent 类型标签
+const AGENT_LABELS = {
+  searchAgent: '搜索Agent',
+  knowledgeAgent: '知识库Agent',
+  codeAgent: '代码Agent',
+  generalAgent: '通用Agent',
+  router: '路由',
+  synthesizer: '综合',
+};
+
 // ── 状态配置 ───────────────────────────────────────────────
 const STATUS_CONFIG = {
   [ToolStatus.PENDING]: {
@@ -221,6 +231,13 @@ function ToolCallCard({ log, isTyping }) {
         <span className={config.text}>
           {meta.icon} {meta.label}
         </span>
+
+        {/* Phase 2: Agent 身份徽章 — 仅非默认 react 类型时显示 */}
+        {log.agentType && log.agentType !== 'react' && (
+          <span className="rounded bg-purple-500/10 px-1.5 py-0.5 text-[10px] text-purple-400 border border-purple-500/20">
+            {AGENT_LABELS[log.agentType] || log.agentName || log.agentType}
+          </span>
+        )}
 
         {/* 耗时 */}
         {duration && (
