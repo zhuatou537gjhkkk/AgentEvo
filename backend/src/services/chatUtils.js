@@ -10,6 +10,7 @@ import { HumanMessage, AIMessage, SystemMessage } from "@langchain/core/messages
 import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
 import { createToolCallingAgent, AgentExecutor } from "@langchain/classic/agents";
 import { agentTools } from "../mcp/tools.js";
+import { toolRegistry } from "../mcp/registry.js";
 
 // ═══════════════════════════════════════════════════════
 // 常量
@@ -206,9 +207,10 @@ export function buildPrompt(enableWebSearch, userSystemPrompt, planMode = false)
 // ═══════════════════════════════════════════════════════
 
 export async function getAgentExecutor(enableWebSearch, temperature, systemPrompt, planMode = false) {
+    const allTools = toolRegistry.getAllTools();
     const tools = enableWebSearch
-        ? agentTools
-        : agentTools.filter((tool) => tool.name !== WEB_SEARCH_TOOL_NAME);
+        ? allTools
+        : allTools.filter((tool) => tool.name !== WEB_SEARCH_TOOL_NAME);
 
     const llm = new ChatOpenAI({
         modelName: resolveModelName(false),

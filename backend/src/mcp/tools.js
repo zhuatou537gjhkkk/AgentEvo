@@ -2,6 +2,7 @@ import crypto from "crypto";
 import { DynamicTool } from "@langchain/core/tools";
 import { getMessageStats } from "../db/index.js";
 import { queryKnowledgeBase } from "../rag/index.js";
+import { toolRegistry } from "./registry.js";
 
 // ── User Question Broker ──────────────────────────────────────
 // 管理 Agent 向用户提问的 Promise/deferred 注册表。
@@ -728,3 +729,8 @@ export const agentTools = [
     updateTodoTool,
     askUserQuestionTool
 ];
+
+// ── Phase 3: 自动注册到 ToolRegistry ──
+// 本地工具注册后，chatGraph.js 和 chatUtils.js 可通过 toolRegistry 统一获取。
+// agentTools 导出继续保留，确保向后兼容（TOOL_REGISTRY_ENABLED=false 时使用）。
+toolRegistry.registerLocalTools(agentTools);

@@ -317,6 +317,7 @@ export const useChatStore = create(persist((set, get) => ({
     voiceName: '',
     speakingMessageId: null,
     themeMode: DEFAULT_THEME_MODE,
+    mcpServers: [],
     isExporting: false,
     sessionDrafts: {},
     messageSearchKeyword: '',
@@ -435,6 +436,31 @@ export const useChatStore = create(persist((set, get) => ({
     setThemeMode: (mode) => {
         const nextMode = ['light', 'dark', 'system'].includes(mode) ? mode : DEFAULT_THEME_MODE;
         set({ themeMode: nextMode });
+    },
+    // ── Phase 3: MCP Server 管理 ──
+    addMcpServer: (server) => {
+        set((state) => ({
+            mcpServers: [...state.mcpServers, { ...server, connected: false }],
+        }));
+    },
+    removeMcpServer: (name) => {
+        set((state) => ({
+            mcpServers: state.mcpServers.filter((s) => s.name !== name),
+        }));
+    },
+    toggleMcpServer: (name) => {
+        set((state) => ({
+            mcpServers: state.mcpServers.map((s) =>
+                s.name === name ? { ...s, enabled: !s.enabled } : s
+            ),
+        }));
+    },
+    updateMcpServerStatus: (name, connected) => {
+        set((state) => ({
+            mcpServers: state.mcpServers.map((s) =>
+                s.name === name ? { ...s, connected } : s
+            ),
+        }));
     },
     setMessageSearchKeyword: (keyword) => {
         set({ messageSearchKeyword: String(keyword || '') });
@@ -1952,5 +1978,6 @@ export const useChatStore = create(persist((set, get) => ({
         voiceVolume: state.voiceVolume,
         voiceName: state.voiceName,
         themeMode: state.themeMode,
+        mcpServers: state.mcpServers,
     }),
 }));

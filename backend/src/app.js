@@ -27,6 +27,7 @@ import {
 import { chatWithStream } from "./services/chat.js";
 import { chatWithGraph } from "./services/chatGraph.js";
 import { resolveUserQuestion } from "./mcp/tools.js";
+import { toolRegistry } from "./mcp/registry.js";
 import {
     uploadMiddleware,
     processAndStoreDocument,
@@ -982,7 +983,7 @@ app.post("/chat", requireAuth, async (req, res) => {
         if (_useLangGraph) {
             saveMessage(req.user.id, sessionId, "user", message);
             await chatImpl(req.user.id, sessionId, message, resolvedImage, systemPrompt, temperature, res, {
-                enableWebSearch: false,
+                enableWebSearch,
                 skipUserMessageSave: true,
                 planMode,
                 onComplete: (metrics) => {
@@ -1014,7 +1015,7 @@ app.post("/chat", requireAuth, async (req, res) => {
             const enhancedPrompt = `你是一个智能助手。请严格根据以下检索到的参考资料，回答用户的问题。如果资料不包含相关答案，请告知用户。\n\n参考资料：\n${context}\n\n用户问题：${message}`;
 
             await chatImpl(req.user.id, sessionId, enhancedPrompt, resolvedImage, systemPrompt, temperature, res, {
-                enableWebSearch: false,
+                enableWebSearch,
                 skipUserMessageSave: true,
                 planMode,
                 onComplete: (metrics) => {
@@ -1082,6 +1083,184 @@ app.post("/chat/answer", requireAuth, async (req, res) => {
     return res.json({ ok: true, status: "accepted" });
 });
 
-app.listen(PORT, () => {
+// ═══════════════════════════════════════════════════════
+// MCP Server 管理 API (Phase 3)
+// ═══════════════════════════════════════════════════════
+
+// 列出所有已注册的 MCP Server
+app.get("/mcp/servers", requireAuth, (req, res) => {
+    const activeNames = toolRegistry.getMCPServerNames();
+    // 加载配置文件中的 server 列表
+    let configServers = [];
+    try {
+        const configPath = path.join(import.meta.dirname, "mcp", "servers.json");
+        const raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+        configServers = raw.servers || [];
+    } catch {
+        configServers = [];
+    }
+
+    // 动态注册的 MCP Server（不在 servers.json 里的）
+    const dynamicNames = activeNames.filter(
+        (n) => !configServers.some((s) => s.name === n)
+    );
+    const dynamicServers = dynamicNames.map((name) => ({
+        name,
+        type: "mcp",
+        enabled: true,
+        connected: true,
+    }));
+
+    const configWithStatus = configServers.map((s) => ({
+        ...s,
+        connected: s.type === "builtin" || activeNames.includes(s.name),
+    }));
+
+    return res.json({ servers: [...configWithStatus, ...dynamicServers] });
+});
+
+// 添加/连接 MCP Server
+app.post("/mcp/servers", requireAuth, async (req, res) => {
+    const { name, command, args = [] } = req.body || {};
+    if (!name || !command) {
+        return res.status(400).json({ error: "name and command are required" });
+    }
+
+    try {
+        await toolRegistry.registerMCPServer({ name, command, args });
+
+        // 持久化到 servers.json：重启后配置不丢失
+        const configPath = path.join(import.meta.dirname, "mcp", "servers.json");
+        try {
+            const raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+            const servers = raw.servers || [];
+            const existing = servers.find((s) => s.name === name);
+            if (existing) {
+                existing.command = command;
+                existing.args = args;
+                existing.enabled = true;
+            } else {
+                servers.push({ name, type: "mcp", enabled: true, command, args });
+            }
+            fs.writeFileSync(configPath, JSON.stringify({ servers }, null, 2), "utf-8");
+        } catch (e) {
+            console.warn(`[mcp] failed to persist server "${name}": ${e.message}`);
+        }
+
+        return res.json({ ok: true, name, toolCount: toolRegistry.getMCPServerTools(name).length });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// 断开/移除 MCP Server
+app.delete("/mcp/servers/:name", requireAuth, async (req, res) => {
+    const { name } = req.params;
+    await toolRegistry.removeMCPServer(name);
+
+    // 从 servers.json 中移除（builtin 类型的不可删除）
+    const configPath = path.join(import.meta.dirname, "mcp", "servers.json");
+    try {
+        const raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+        const servers = (raw.servers || []).filter(
+            (s) => s.name !== name || s.type === "builtin"
+        );
+        fs.writeFileSync(configPath, JSON.stringify({ servers }, null, 2), "utf-8");
+    } catch (e) {
+        console.warn(`[mcp] failed to remove server "${name}" from config: ${e.message}`);
+    }
+
+    return res.json({ ok: true });
+});
+
+// 列出某 MCP Server 的工具
+app.get("/mcp/servers/:name/tools", requireAuth, (req, res) => {
+    const { name } = req.params;
+    const tools = toolRegistry.getMCPServerTools(name);
+    return res.json({ name, tools });
+});
+
+// 重新连接 MCP Server（从 servers.json 读取配置）
+app.post("/mcp/servers/:name/connect", requireAuth, async (req, res) => {
+    const { name } = req.params;
+
+    // 从 servers.json 读取该 server 的配置
+    const configPath = path.join(import.meta.dirname, "mcp", "servers.json");
+    let serverConfig;
+    try {
+        const raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+        serverConfig = (raw.servers || []).find((s) => s.name === name);
+    } catch {
+        return res.status(500).json({ error: "无法读取配置文件" });
+    }
+
+    if (!serverConfig || !serverConfig.command) {
+        return res.status(404).json({ error: `Server "${name}" 不在配置文件中或缺少 command` });
+    }
+
+    try {
+        await toolRegistry.registerMCPServer({
+            name,
+            command: serverConfig.command,
+            args: serverConfig.args || [],
+        });
+
+        // 更新 enabled 标记
+        try {
+            const raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+            const servers = raw.servers || [];
+            const target = servers.find((s) => s.name === name);
+            if (target) target.enabled = true;
+            fs.writeFileSync(configPath, JSON.stringify({ servers }, null, 2), "utf-8");
+        } catch { /* 非关键 */ }
+
+        return res.json({ ok: true, name, toolCount: toolRegistry.getMCPServerTools(name).length });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// 断开 MCP Server（保留配置，标记 enabled: false 禁止自动重连）
+app.post("/mcp/servers/:name/disconnect", requireAuth, async (req, res) => {
+    const { name } = req.params;
+
+    await toolRegistry.removeMCPServer(name);
+
+    // 标记 enabled: false，下次启动不自动重连
+    const configPath = path.join(import.meta.dirname, "mcp", "servers.json");
+    try {
+        const raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+        const servers = raw.servers || [];
+        const target = servers.find((s) => s.name === name);
+        if (target) target.enabled = false;
+        fs.writeFileSync(configPath, JSON.stringify({ servers }, null, 2), "utf-8");
+    } catch { /* 非关键 */ }
+
+    return res.json({ ok: true });
+});
+
+app.listen(PORT, async () => {
     console.log(`Backend running at http://localhost:${PORT}`);
+
+    // 启动时自动重连已持久化的 MCP Server
+    let persistedServers = [];
+    try {
+        const configPath = path.join(import.meta.dirname, "mcp", "servers.json");
+        const raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+        persistedServers = (raw.servers || []).filter(
+            (s) => s.type === "mcp" && s.enabled !== false && s.command
+        );
+    } catch { /* config file missing or invalid, skip */ }
+
+    for (const server of persistedServers) {
+        try {
+            await toolRegistry.registerMCPServer({
+                name: server.name,
+                command: server.command,
+                args: server.args || [],
+            });
+        } catch (err) {
+            console.warn(`[mcp] auto-connect "${server.name}" failed: ${err.message}`);
+        }
+    }
 });

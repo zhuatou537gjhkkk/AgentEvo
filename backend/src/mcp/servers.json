@@ -1,0 +1,42 @@
+{
+  "servers": [
+    {
+      "name": "local-builtin",
+      "type": "builtin",
+      "enabled": true,
+      "description": "AI-Chat 内置工具（系统时间、数据库统计、联网搜索、知识库检索、任务计划、用户提问）"
+    },
+    {
+      "name": "filesystem-example",
+      "type": "mcp",
+      "enabled": false,
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "."
+      ],
+      "description": "MCP 文件系统工具（示例，需安装 npx）"
+    },
+    {
+      "name": "ai-chat-local",
+      "type": "mcp",
+      "enabled": true,
+      "command": "node",
+      "args": [
+        "src/mcp/run-server.js"
+      ]
+    },
+    {
+      "name": "filesystem",
+      "type": "mcp",
+      "enabled": true,
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "d:/AI-Chat"
+      ]
+    }
+  ]
+}

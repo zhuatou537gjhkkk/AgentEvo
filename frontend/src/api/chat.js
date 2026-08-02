@@ -741,3 +741,47 @@ export async function uploadImage(file, options = {}) {
 
     throw new Error('Image upload failed');
 }
+
+// ═══════════════════════════════════════════════════════
+// MCP Server 管理 API (Phase 3)
+// ═══════════════════════════════════════════════════════
+
+export async function fetchMcpServers() {
+    const res = await request('/mcp/servers');
+    return res.json();
+}
+
+export async function addMcpServer(name, command, args = []) {
+    const res = await request('/mcp/servers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, command, args }),
+    });
+    return res.json();
+}
+
+export async function removeMcpServer(name) {
+    const res = await request(`/mcp/servers/${encodeURIComponent(name)}`, {
+        method: 'DELETE',
+    });
+    return res.json();
+}
+
+export async function fetchMcpServerTools(name) {
+    const res = await request(`/mcp/servers/${encodeURIComponent(name)}/tools`);
+    return res.json();
+}
+
+export async function connectMcpServer(name) {
+    const res = await request(`/mcp/servers/${encodeURIComponent(name)}/connect`, {
+        method: 'POST',
+    });
+    return res.json();
+}
+
+export async function disconnectMcpServer(name) {
+    const res = await request(`/mcp/servers/${encodeURIComponent(name)}/disconnect`, {
+        method: 'POST',
+    });
+    return res.json();
+}

@@ -13,6 +13,7 @@ import { HumanMessage, AIMessage, SystemMessage, ToolMessage } from "@langchain/
 import { StateGraph, START, END, Annotation, addMessages, MemorySaver, Send } from "@langchain/langgraph";
 import { saveMessage, getHistoryMessages } from "../db/index.js";
 import { agentTools, consumePendingQuestion, cancelAllPendingQuestions } from "../mcp/tools.js";
+import { toolRegistry } from "../mcp/registry.js";
 import {
     WEB_SEARCH_TOOL_NAME,
     FORCED_WEB_SEARCH_MAX_CHARS,
@@ -653,7 +654,7 @@ async function searchAgentNode(state, config) {
 
     if (sse) sse.agentStart(agentType);
 
-    const webSearchTool = agentTools.find(t => t.name === WEB_SEARCH_TOOL_NAME);
+    const webSearchTool = toolRegistry.getTool(WEB_SEARCH_TOOL_NAME);
     if (!webSearchTool) {
         console.log(`[graph][search] web_search tool not found`);
         if (sse) sse.agentEnd(agentType);
@@ -754,14 +755,14 @@ async function knowledgeAgentNode(state, config) {
     // Plan 模式：确保首个步骤为 in_progress
     let plan = emitPlanProgress(sse, state.plan, 'agent_start');
 
-    const kbTool = agentTools.find(t => t.name === "search_knowledge_base");
+    const kbTool = toolRegistry.getTool("search_knowledge_base");
     if (!kbTool) {
         console.log(`[graph][knowledge] search_knowledge_base tool not found`);
         if (sse) sse.agentEnd(agentType);
         return { knowledgeResults: "(知识库工具不可用)", currentAgent: "knowledge" };
     }
 
-    const updateTodoTool = agentTools.find(t => t.name === "update_todo");
+    const updateTodoTool = toolRegistry.getTool("update_todo");
     const toolsForAgent = updateTodoTool
         ? [kbTool, updateTodoTool]
         : [kbTool];
