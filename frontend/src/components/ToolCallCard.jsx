@@ -23,6 +23,7 @@ const AGENT_LABELS = {
   generalAgent: '通用Agent',
   router: '路由',
   synthesizer: '综合',
+  toolExecutor: '工具执行',
 };
 
 // ── 状态配置 ───────────────────────────────────────────────
