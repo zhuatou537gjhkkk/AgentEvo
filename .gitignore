@@ -21,6 +21,7 @@ pnpm-debug.log*
 
 # Claude Code
 .claude/
+.agents/
 CLAUDE.md
 
 # Build artifacts

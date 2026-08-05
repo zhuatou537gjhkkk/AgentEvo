@@ -9,7 +9,7 @@ import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, AIMessage, SystemMessage } from "@langchain/core/messages";
 import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
 import { createToolCallingAgent, AgentExecutor } from "@langchain/classic/agents";
-import { agentTools } from "../mcp/tools.js";
+import { agentTools, setMemoryToolContext } from "../mcp/tools.js";
 import { toolRegistry } from "../mcp/registry.js";
 
 // ═══════════════════════════════════════════════════════
@@ -41,18 +41,48 @@ export const PLAN_MODE_INSTRUCTION =
 // ═══════════════════════════════════════════════════════
 
 export function estimateTokens(text) {
-    const source = String(text || "");
-    if (!source.trim()) {
-        return 0;
+    if (!text) return 0;
+    const str = String(text);
+    // CJK 字符 ≈ 1 token/字
+    const cjkCount = (str.match(/[一-鿿㐀-䶿豈-﫿]/g) || []).length;
+    // 非 CJK 按空白分词，1 词 ≈ 1.3 token
+    const nonCjk = str.replace(/[一-鿿㐀-䶿豈-﫿]/g, " ");
+    const wordCount = nonCjk.split(/\s+/).filter(Boolean).length;
+    const estimate = Math.ceil(cjkCount + wordCount * 1.3);
+    return estimate > 0 ? estimate : 0;
+}
+
+/**
+ * 从 AIMessageChunk/AIMessage 中提取真实 LLM API 返回的 token usage。
+ * @param {object} chunk — LangChain AIMessageChunk 或 AIMessage
+ * @returns {{ prompt_tokens: number, completion_tokens: number, total_tokens: number } | null}
+ */
+export function extractUsageFromChunk(chunk) {
+    const um = chunk?.usage_metadata;
+    if (um && typeof um.input_tokens === 'number') {
+        return {
+            prompt_tokens: um.input_tokens,
+            completion_tokens: um.output_tokens,
+            total_tokens: um.total_tokens,
+        };
     }
-    return Math.max(1, Math.ceil(source.length / 4));
+    return null;
 }
 
 // ═══════════════════════════════════════════════════════
 // LLM 配置
 // ═══════════════════════════════════════════════════════
 
-export function buildChatOpenAIConfig() {
+export function buildChatOpenAIConfig(hasImage = false) {
+    if (hasImage && process.env.VISION_BASE_URL) {
+        return {
+            apiKey: process.env.VISION_API_KEY || process.env.OPENAI_API_KEY,
+            configuration: {
+                baseURL: process.env.VISION_BASE_URL,
+            },
+            timeout: 120000,
+        };
+    }
     return {
         apiKey: process.env.OPENAI_API_KEY,
         configuration: {
@@ -249,11 +279,15 @@ export async function streamDirectChat({
     abortController,
 }) {
     const hasImage = Boolean(image);
+    const modelName = resolveModelName(hasImage, forceModel);
+    const config = buildChatOpenAIConfig(hasImage);
+    console.log(`[agent] streamDirectChat model=${modelName} baseURL=${config.configuration?.baseURL} hasImage=${hasImage}`);
+
     const llm = new ChatOpenAI({
-        modelName: resolveModelName(hasImage, forceModel),
+        modelName,
         temperature,
         streaming: true,
-        ...buildChatOpenAIConfig(),
+        ...config,
     });
 
     const messages = [
@@ -263,20 +297,33 @@ export async function streamDirectChat({
     ];
 
     let fullText = "";
-    const stream = await llm.stream(messages);
+    let usage = null;
 
-    for await (const chunk of stream) {
-        if (abortController?.signal.aborted) {
-            console.log('[agent] streamDirectChat aborted by client disconnect');
-            break;
+    try {
+        const stream = await llm.stream(messages);
+
+        for await (const chunk of stream) {
+            if (abortController?.signal.aborted) {
+                console.log('[agent] streamDirectChat aborted by client disconnect');
+                break;
+            }
+            // 从最后一个 chunk 提取真实 API token usage
+            const chunkUsage = extractUsageFromChunk(chunk);
+            if (chunkUsage) usage = chunkUsage;
+
+            const text = normalizeChunkContent(chunk?.content);
+            if (!text) {
+                continue;
+            }
+            fullText += text;
+            res.write(`data: ${JSON.stringify({ type: "text", text })}\n\n`);
         }
-        const text = normalizeChunkContent(chunk?.content);
-        if (!text) {
-            continue;
-        }
-        fullText += text;
-        res.write(`data: ${JSON.stringify({ type: "text", text })}\n\n`);
+    } catch (err) {
+        console.error(`[agent] streamDirectChat failed: model=${modelName} baseURL=${config.configuration?.baseURL} error="${err.message}"`);
+        const errorText = `[图片识别请求失败: ${err.message}]`;
+        res.write(`data: ${JSON.stringify({ type: "text", text: errorText })}\n\n`);
+        fullText = errorText;
     }
 
-    return fullText;
+    return { fullText, usage };
 }

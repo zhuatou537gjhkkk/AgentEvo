@@ -71,6 +71,8 @@ export default function ChatInput() {
     const setEnableWebSearch = useChatStore((state) => state.setEnableWebSearch);
     const planMode = useChatStore((state) => state.planMode);
     const setPlanMode = useChatStore((state) => state.setPlanMode);
+    const enableMemory = useChatStore((state) => state.enableMemory);
+    const setEnableMemory = useChatStore((state) => state.setEnableMemory);
     const selectedImage = useChatStore((state) => state.selectedImage);
     const setSelectedImage = useChatStore((state) => state.setSelectedImage);
     const clearSelectedImage = useChatStore((state) => state.clearSelectedImage);
@@ -169,7 +171,7 @@ export default function ChatInput() {
 
         setValue('');
         clearCurrentDraft();
-        await sendMessage(text || '请帮我描述这张图片。', { enableWebSearch });
+        await sendMessage(text || '请帮我描述这张图片。', { enableWebSearch, enableMemory, planMode });
     };
 
     const handleKeyDown = async (event) => {
@@ -453,6 +455,18 @@ export default function ChatInput() {
                             title="先列出计划再执行"
                         >
                             🗓 Plan: {planMode ? '开' : '关'}
+                        </button>
+
+                        <button
+                            type="button"
+                            onClick={() => setEnableMemory(!enableMemory)}
+                            className={`h-9 rounded-lg border px-3 text-xs font-semibold transition outline-none ${enableMemory
+                                ? 'border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-700 dark:bg-amber-900/30 dark:text-amber-100'
+                                : 'border-[var(--panel-border)] bg-[var(--panel-soft)] text-[var(--text-muted)]'
+                                }`}
+                            title="是否启用长期记忆（跨会话信息提取与召回）"
+                        >
+                            🧠 记忆: {enableMemory ? '开' : '关'}
                         </button>
                     </div>
 

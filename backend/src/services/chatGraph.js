@@ -9,11 +9,14 @@
 
 import crypto from "crypto";
 import { ChatOpenAI } from "@langchain/openai";
-import { HumanMessage, AIMessage, SystemMessage, ToolMessage } from "@langchain/core/messages";
+import { HumanMessage, AIMessage, AIMessageChunk, SystemMessage, ToolMessage } from "@langchain/core/messages";
 import { StateGraph, START, END, Annotation, addMessages, MemorySaver, Send } from "@langchain/langgraph";
 import { saveMessage, getHistoryMessages } from "../db/index.js";
-import { agentTools, consumePendingQuestion, cancelAllPendingQuestions } from "../mcp/tools.js";
+import { agentTools, consumePendingQuestion, cancelAllPendingQuestions, setMemoryToolContext } from "../mcp/tools.js";
 import { toolRegistry } from "../mcp/registry.js";
+import { MemoryService } from "./memory.js";
+import { createChatContextBuilder } from "./contextBuilder.js";
+import { TraceCollector } from "../trace/collector.js";
 import {
     WEB_SEARCH_TOOL_NAME,
     FORCED_WEB_SEARCH_MAX_CHARS,
@@ -24,6 +27,7 @@ import {
     resolveModelName,
     buildChatOpenAIConfig,
     estimateTokens,
+    extractUsageFromChunk,
     emitThought,
     toLangChainMessage,
     isCreativeTask,
@@ -84,6 +88,7 @@ const AgentState = Annotation.Root({
     // 配置
     enableWebSearch: Annotation({ default: () => false }),
     planMode: Annotation({ default: () => false }),
+    enableMemory: Annotation({ default: () => true }),
     systemPrompt: Annotation({ default: () => "你是一个有用的 AI 助手。" }),
     temperature: Annotation({ default: () => 0.7 }),
     modelName: Annotation({ default: () => "deepseek-v4-flash" }),
@@ -92,6 +97,9 @@ const AgentState = Annotation.Root({
     intent: Annotation({ default: () => "general" }),
     intents: Annotation({ default: () => ["general"] }),
     primarySource: Annotation({ default: () => null }),
+
+    // Phase 4: 上下文工程 — GSSC 管道构建的优化上下文
+    optimizedContext: Annotation({ default: () => "" }),
 
     // Agent 追踪（自定义 reducer 支持并行节点并发写入）
     currentAgent: Annotation({
@@ -161,6 +169,19 @@ const AgentState = Annotation.Root({
         reducer: (_, update) => update,
     }),
 
+    // tokenUsage: 累加所有 LLM 调用的真实 API token usage（并行节点 sum reducer）
+    tokenUsage: Annotation({
+        default: () => ({ prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }),
+        reducer: (current, update) => {
+            if (!update) return current;
+            return {
+                prompt_tokens: (current?.prompt_tokens || 0) + (update.prompt_tokens || 0),
+                completion_tokens: (current?.completion_tokens || 0) + (update.completion_tokens || 0),
+                total_tokens: (current?.total_tokens || 0) + (update.total_tokens || 0),
+            };
+        },
+    }),
+
     // SSE 上下文（通过闭包注入，不存到 checkpoint）
     sseEnabled: Annotation({ default: () => true }),
 });
@@ -169,7 +190,15 @@ const AgentState = Annotation.Root({
 // SSE 事件发射器（闭包捕获 res）
 // ═══════════════════════════════════════════════════════
 
-function createSSEEmitter(res) {
+function createSSEEmitter(res, traceCollector = null, traceId = null) {
+    /** @type {string|null} — current agent span ID */
+    let currentAgentSpanId = null;
+    /** @type {Map<string, string>} — toolCallId → toolSpanId */
+    const toolSpanMap = new Map();
+
+    /** 检查 trace 是否仍然存活（未因 abort/disconnect 被 finishTrace 清理） */
+    const _traceAlive = () => traceCollector && traceId && traceCollector.getTrace(traceId);
+
     return {
         agentStart(agentType) {
             const meta = AGENT_META[agentType] || {};
@@ -179,7 +208,12 @@ function createSSEEmitter(res) {
                 agentType: meta.type || agentType,
                 at: new Date().toISOString(),
             };
-            res.write(`data: ${JSON.stringify(payload)}\n\n`);
+            try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch (_) { /* response ended */ }
+            // Phase 5: start agent span
+            if (_traceAlive()) {
+                currentAgentSpanId = traceCollector.startSpan(traceId, payload.agentName, "agent",
+                    currentAgentSpanId || traceId);
+            }
         },
         agentEnd(agentType) {
             const meta = AGENT_META[agentType] || {};
@@ -189,7 +223,12 @@ function createSSEEmitter(res) {
                 agentType: meta.type || agentType,
                 at: new Date().toISOString(),
             };
-            res.write(`data: ${JSON.stringify(payload)}\n\n`);
+            try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch (_) { /* response ended */ }
+            // Phase 5: end agent span
+            if (_traceAlive() && currentAgentSpanId) {
+                traceCollector.endSpan(traceId, currentAgentSpanId);
+                currentAgentSpanId = null;
+            }
         },
         agentHandoff(fromType, toType) {
             const fromMeta = AGENT_META[fromType] || {};
@@ -202,7 +241,7 @@ function createSSEEmitter(res) {
                 toType: toMeta.type || toType,
                 at: new Date().toISOString(),
             };
-            res.write(`data: ${JSON.stringify(payload)}\n\n`);
+            try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch (_) { /* response ended */ }
         },
         toolStart(toolCallId, toolName, input, agentType) {
             const meta = AGENT_META[agentType] || {};
@@ -216,7 +255,13 @@ function createSSEEmitter(res) {
                 agentName: meta.name || agentType || "core",
                 agentType: meta.type || agentType || "react",
             };
-            res.write(`data: ${JSON.stringify(payload)}\n\n`);
+            try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch (_) { /* response ended */ }
+            // Phase 5: start tool span
+            if (_traceAlive()) {
+                const parentId = currentAgentSpanId || traceId;
+                const toolSpanId = traceCollector.startSpan(traceId, toolName, "tool", parentId, { input });
+                if (toolSpanId) toolSpanMap.set(toolCallId, toolSpanId);
+            }
         },
         toolEnd(toolCallId, toolName, output, agentType) {
             const meta = AGENT_META[agentType] || {};
@@ -229,7 +274,15 @@ function createSSEEmitter(res) {
                 agentName: meta.name || agentType || "core",
                 agentType: meta.type || agentType || "react",
             };
-            res.write(`data: ${JSON.stringify(payload)}\n\n`);
+            try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch (_) { /* response ended */ }
+            // Phase 5: end tool span
+            if (_traceAlive()) {
+                const toolSpanId = toolSpanMap.get(toolCallId);
+                if (toolSpanId) {
+                    traceCollector.endSpan(traceId, toolSpanId, { output: typeof output === "string" ? output.slice(0, 200) : "" });
+                    toolSpanMap.delete(toolCallId);
+                }
+            }
         },
         toolError(toolCallId, toolName, error, agentType) {
             const meta = AGENT_META[agentType] || {};
@@ -242,17 +295,27 @@ function createSSEEmitter(res) {
                 agentName: meta.name || agentType || "core",
                 agentType: meta.type || agentType || "react",
             };
-            res.write(`data: ${JSON.stringify(payload)}\n\n`);
+            try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch (_) { /* response ended */ }
+            // Phase 5: end tool span with error
+            if (_traceAlive()) {
+                const toolSpanId = toolSpanMap.get(toolCallId);
+                if (toolSpanId) {
+                    traceCollector.endSpan(traceId, toolSpanId, { error: String(error) });
+                    toolSpanMap.delete(toolCallId);
+                }
+            }
         },
         textChunk(text) {
-            res.write(`data: ${JSON.stringify({ type: "text", text })}\n\n`);
+            try { res.write(`data: ${JSON.stringify({ type: "text", text })}\n\n`); } catch (_) { /* response ended */ }
         },
         todoUpdated(todos) {
-            res.write(`data: ${JSON.stringify({
-                type: "todo_updated",
-                todos,
-                at: new Date().toISOString(),
-            })}\n\n`);
+            try {
+                res.write(`data: ${JSON.stringify({
+                    type: "todo_updated",
+                    todos,
+                    at: new Date().toISOString(),
+                })}\n\n`);
+            } catch (_) { /* response ended */ }
         },
     };
 }
@@ -326,7 +389,7 @@ async function executeToolCalls(toolCalls, agentType, sse, toolsMap) {
 // ═══════════════════════════════════════════════════════
 
 function initializeNode(state) {
-    console.log(`[graph][init] userInput length=${state.userInput.length} enableWebSearch=${state.enableWebSearch}`);
+    console.log(`[graph][init] userInput length=${state.userInput.length} enableWebSearch=${state.enableWebSearch} enableMemory=${state.enableMemory}`);
     return { currentAgent: "router" };
 }
 
@@ -334,8 +397,9 @@ function initializeNode(state) {
 // 节点 2: RouterNode — LLM 意图分类
 // ═══════════════════════════════════════════════════════
 
-async function routerNode(state) {
+async function routerNode(state, config) {
     console.log(`[graph][router] classifying intent for: "${state.userInput.slice(0, 80)}..."`);
+    const signal = config?.configurable?.abortSignal;
 
     const llm = new ChatOpenAI({
         modelName: state.modelName,
@@ -359,13 +423,17 @@ async function routerNode(state) {
         ? `\n\n注意：计划模式已开启。请在 analysis 中列出执行步骤，并始终返回 JSON 格式。`
         : "";
 
+    const webSearchHint = state.enableWebSearch
+        ? `\n\n⚠️ 联网搜索当前**已开启**。用户的问题适合通过搜索引擎获取更准确/更新信息时，请优先使用 "search" 而非 "general"。只有纯闲聊、问候、创意写作才用 "general"。`
+        : `\n\n⚠️ 联网搜索当前**未开启**。"search" 意图不可用，请用 "general" 替代。`;
+
     const prompt = `你是一个智能路由助手。分析用户的问题，判断需要哪些专业智能体来处理。可以同时选择多个。
 
 固定分类：
-- "general": 普通对话、问候、闲聊、简单问答、创意写作
-- "search": 需要搜索最新网络信息（新闻、实时数据、近期事件、不确定的事实）
+- "general": 普通对话、问候、闲聊、创意写作（纯主观/创造性任务，不需要外部信息）
+- "search": 需要搜索最新网络信息或获取事实性知识（新闻、实时数据、技术概念解释、近期事件）
 - "knowledge": 需要从已上传的文档/知识库中检索信息（用户提到了文档、资料、文件等）
-- "code": 需要编写、分析或调试代码
+- "code": 需要编写、分析或调试代码${webSearchHint}
 
 当前系统额外可用的工具类别（实时注册中心提供）：
 ${knownCategoryHint || "(暂无额外工具类别)"}
@@ -378,11 +446,16 @@ ${categoryLines}${planHint}
 请严格返回 JSON 格式，不要包含其他文字：
 {"intents": ["general"], "primarySource": null, "analysis": "一句话理由"}
 
-intents 规则：
-- 大多数问题只需要一个意图，如 ["search"] 或 ["code"] 或 ["general"]
-- 当用户同时提出多个不相关的需求时，返回多个，如 ["search", "code"]（搜资料+写代码）
-- "general" 通常不与其他意图组合
-- 如果用户的问题涉及上述"额外工具类别"中的操作（如读写文件），请使用对应的类别名（如 "filesystem"）`;
+	intents 规则：
+	- ⚠️ 仔细扫描用户问题中的**多意图信号词**：如"顺便"、"同时"、"还有"、"另外"、"也帮我"、"另外查一下"、"再加上"等，出现这些词时应返回多个意图，不要只选一个
+	- 多意图常见组合示例：
+	  * "介绍XX，顺便在知识库里找找" → ["search", "knowledge"]（介绍话题需要搜索 + 知识库检索）
+	  * "查一下AA，另外帮我写个BB的代码" → ["search", "code"]
+	  * "读写文件XX并分析内容" → ["filesystem", "general"]
+	  * "分析这段代码，看看网上有没有更好的写法" → ["code", "search"]
+	- 单意图示例：纯问知识 → ["general"]；纯搜实时信息 → ["search"]；纯查文档 → ["knowledge"]；纯写代码 → ["code"]
+	- "general" 通常不与其他意图组合，除非用户明确要求"闲聊的同时做某事"
+	- 如果用户的问题涉及上述"额外工具类别"中的操作（如读写文件），请使用对应的类别名（如 "filesystem"）`;
 
 
     let intent = "general";
@@ -390,8 +463,10 @@ intents 规则：
     let primarySource = null;
     let analysis = "";
 
+    let routerUsage = null;
     try {
-        const response = await llm.invoke([new SystemMessage(prompt)]);
+        const response = await llm.invoke([new SystemMessage(prompt)], { signal });
+        routerUsage = extractUsageFromChunk(response);
         const text = normalizeChunkContent(response.content || "");
 
         const jsonMatch = text.match(/\{[\s\S]*\}/);
@@ -452,6 +527,7 @@ intents 规则：
         primarySource,
         currentAgent: "router",
         messages: [new AIMessage({ content: `[Router] 分类结果: ${filteredIntents.join(", ")} — ${analysis}` })],
+        tokenUsage: routerUsage,
     };
 }
 
@@ -596,6 +672,7 @@ function emitPlanProgress(sse, plan, phase) {
 
 async function plannerNode(state, config) {
     const sse = config?.configurable?.sse;
+    const signal = config?.configurable?.abortSignal;
 
     // 非 Plan 模式 → 跳过
     if (!state.planMode) {
@@ -603,9 +680,10 @@ async function plannerNode(state, config) {
         return { currentAgent: "router" };
     }
 
-    // general 意图 → 跳过（简单对话不需要分解）
-    if (state.intent === "general") {
-        console.log(`[graph][planner] skipped (intent=general)`);
+    // general 意图（纯 general，无其他混合意图）→ 跳过（简单对话不需要分解）
+    const allIntents = state.intents || [state.intent || "general"];
+    if (state.intent === "general" && allIntents.length === 1) {
+        console.log(`[graph][planner] skipped (intent=general, no mixed intents)`);
         return { currentAgent: "router" };
     }
 
@@ -629,7 +707,7 @@ async function plannerNode(state, config) {
 ${toolListText || "(暂无可用工具)"}
 
 用户问题：${state.userInput}
-用户意图类型：${state.intent}
+用户意图类型：${[...new Set(state.intents || [state.intent || "general"])].join("、")}
 
 每个 subTask 包含以下字段：
 - id: 字符串ID（从"1"递增）
@@ -656,9 +734,11 @@ ${toolListText || "(暂无可用工具)"}
 
 只返回 JSON 数组，不要包含其他文字。`;
 
+    let plannerUsage = null;
     let subTasks = [];
     try {
-        const response = await llm.invoke([new HumanMessage(prompt)]);
+        const response = await llm.invoke([new HumanMessage(prompt)], { signal });
+        plannerUsage = extractUsageFromChunk(response);
         const raw = normalizeChunkContent(response.content);
         const jsonMatch = raw.match(/\[[\s\S]*\]/);
         if (jsonMatch) {
@@ -719,6 +799,7 @@ ${toolListText || "(暂无可用工具)"}
         plan,
         planResults: {},
         currentAgent: "router",
+        tokenUsage: plannerUsage,
     };
 }
 
@@ -767,7 +848,18 @@ async function generalChatNode(state, config) {
     console.log(`[graph][general] generating direct response`);
 
     const sse = config?.configurable?.sse;
+    const signal = config?.configurable?.abortSignal;
     if (sse) sse.agentStart("general");
+
+    // Phase 4: 获取 system 类别工具（memory, get_system_time, update_todo 等），
+    // 让 general_chat 节点也能调用这些通用工具。
+    // 排除 ai-chat-local/* MCP 自连重复项（与本地工具同名，避免 LLM 混淆）
+    // 当 enableMemory=false 时，排除 memory 工具
+    const rawSystemTools = toolRegistry.getToolsByCategory?.("system") || [];
+    const systemTools = rawSystemTools.filter(t =>
+        !t.name.includes("/") && (state.enableMemory !== false || t.name !== "memory")
+    );
+    const hasTools = systemTools.length > 0;
 
     const llm = new ChatOpenAI({
         modelName: state.modelName,
@@ -777,24 +869,158 @@ async function generalChatNode(state, config) {
     });
 
     const messages = [
-        new SystemMessage(`${state.systemPrompt}\n当前时间：${state.currentDate}`),
+        new SystemMessage(`${state.systemPrompt}\n当前时间：${state.currentDate}
+${hasTools ? `\n你可以使用以下系统工具：memory（记忆管理）、get_system_time（时间查询）等。
+使用规则：
+- 用户要求执行具体操作时，直接执行，不要先搜索或验证。
+- 例如用户说"添加记忆"，直接用 memory action="add" 添加。` : ""}`),
         ...state.chatHistory,
         new HumanMessage(state.userInput),
     ];
 
     let fullText = "";
-    try {
-        const stream = await llm.stream(messages);
-        for await (const chunk of stream) {
-            const text = normalizeChunkContent(chunk?.content);
-            if (!text) continue;
-            fullText += text;
-            if (sse) sse.textChunk(text);
+    const nodeUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+    const addUsage = (u) => {
+        if (u && u.total_tokens > 0) {
+            nodeUsage.prompt_tokens += u.prompt_tokens || 0;
+            nodeUsage.completion_tokens += u.completion_tokens || 0;
+            nodeUsage.total_tokens += u.total_tokens || 0;
         }
-    } catch (err) {
-        console.log(`[graph][general] stream error: ${err.message}`);
-        fullText = `回答生成失败: ${err.message}`;
-        if (sse) sse.textChunk(fullText);
+    };
+
+    // 如果有可用工具，使用 ReAct 循环（最多 5 轮）
+    if (hasTools) {
+        try {
+            const tooledLlm = llm.bindTools(systemTools);
+            const MAX_TOOL_ROUNDS = 5;
+            let round = 0;
+            const conversation = [...messages];
+
+            while (round < MAX_TOOL_ROUNDS) {
+                round++;
+                const isFirstRound = round === 1;
+
+                // 首轮使用流式 → 文本逐字推送到前端；后续轮用 invoke（更快）
+                let response;
+                if (isFirstRound) {
+                    const stream = await tooledLlm.stream(conversation, { signal });
+                    for await (const chunk of stream) {
+                        response = response ? response.concat(chunk) : chunk;
+                        const text = normalizeChunkContent(chunk?.content);
+                        if (text && sse) sse.textChunk(text);
+                    }
+                } else {
+                    response = await tooledLlm.invoke(conversation, { signal });
+                }
+                addUsage(extractUsageFromChunk(response));
+
+                const toolCalls = response?.tool_calls || response?.additional_kwargs?.tool_calls || [];
+
+                if (toolCalls.length === 0) {
+                    // 本轮无工具调用 → LLM 返回了最终文本回复
+                    const text = normalizeChunkContent(response?.content);
+                    if (text) {
+                        fullText = text;
+                        if (!isFirstRound && sse) sse.textChunk(text); // 非流式轮次需要一次性推送
+                    }
+                    conversation.push(response);
+                    break;
+                }
+
+                console.log(`[graph][general] round ${round}: ${toolCalls.length} tool call(s)`);
+                for (const tc of toolCalls) {
+                    console.log(`[graph][general]   tc.name=${tc.name} tc.args=${JSON.stringify(tc.args)} id=${tc.id}`);
+                }
+
+                // 执行工具调用
+                conversation.push(response);
+                for (const tc of toolCalls) {
+                    const toolName = tc.name || tc.function?.name;
+                    // tc.args 可能是 {input: "实际JSON"} 或直接的参数对象
+                    const rawArgs = tc.args || (tc.function?.arguments
+                        ? (typeof tc.function.arguments === "string"
+                            ? JSON.parse(tc.function.arguments)
+                            : tc.function.arguments)
+                        : {});
+                    // LangChain DynamicTool 把参数包在 input 字段里:
+                    //   tc.args = { input: '{"action":"add",...}' }
+                    // 需要取出 input 值作为 tool.invoke() 的实际参数
+                    const toolInputStr = rawArgs?.input != null
+                        ? (typeof rawArgs.input === "string" ? rawArgs.input : JSON.stringify(rawArgs.input))
+                        : JSON.stringify(rawArgs);
+                    const tool = systemTools.find(t => t.name === toolName);
+                    if (tool) {
+                        const toolCallId = tc.id || crypto.randomUUID();
+                        sse?.toolStart(toolCallId, toolName, toolInputStr, "general");
+                        try {
+                            const result = await tool.invoke(toolInputStr);
+                            const resultStr = typeof result === "string" ? result : JSON.stringify(result);
+                            sse?.toolEnd(toolCallId, toolName, resultStr, "general");
+                            conversation.push(new ToolMessage({ content: resultStr, tool_call_id: tc.id || toolCallId, name: toolName }));
+                        } catch (err) {
+                            sse?.toolError(toolCallId, toolName, err.message, "general");
+                            conversation.push(new ToolMessage({ content: `Error: ${err.message}`, tool_call_id: tc.id || toolCallId, name: toolName }));
+                        }
+                    }
+                }
+
+                // 最后一轮：流式输出最终回复
+                if (round >= MAX_TOOL_ROUNDS) {
+                    try {
+                        const stream = await llm.stream(conversation, { signal });
+                        let finalResponse;
+                        for await (const chunk of stream) {
+                            finalResponse = finalResponse ? finalResponse.concat(chunk) : chunk;
+                            const text = normalizeChunkContent(chunk?.content);
+                            if (!text) continue;
+                            fullText += text;
+                            if (sse) sse.textChunk(text);
+                        }
+                        addUsage(extractUsageFromChunk(finalResponse));
+                    } catch (err) {
+                        console.log(`[graph][general] final stream error: ${err.message}`);
+                        if (!fullText) fullText = `操作完成但回复生成失败: ${err.message}`;
+                        if (sse) sse.textChunk(fullText);
+                    }
+                }
+            }
+        } catch (err) {
+            console.log(`[graph][general] tool loop error: ${err.message}`);
+            // Fallback: 直接流式
+            try {
+                const stream = await llm.stream(messages, { signal });
+                let fallbackResponse;
+                for await (const chunk of stream) {
+                    fallbackResponse = fallbackResponse ? fallbackResponse.concat(chunk) : chunk;
+                    const text = normalizeChunkContent(chunk?.content);
+                    if (!text) continue;
+                    fullText += text;
+                    if (sse) sse.textChunk(text);
+                }
+                addUsage(extractUsageFromChunk(fallbackResponse));
+            } catch (err2) {
+                fullText = `回答生成失败: ${err2.message}`;
+                if (sse) sse.textChunk(fullText);
+            }
+        }
+    } else {
+        // 无工具：原有直接流式逻辑
+        try {
+            const stream = await llm.stream(messages, { signal });
+            let noToolsResponse;
+            for await (const chunk of stream) {
+                noToolsResponse = noToolsResponse ? noToolsResponse.concat(chunk) : chunk;
+                const text = normalizeChunkContent(chunk?.content);
+                if (!text) continue;
+                fullText += text;
+                if (sse) sse.textChunk(text);
+            }
+            addUsage(extractUsageFromChunk(noToolsResponse));
+        } catch (err) {
+            console.log(`[graph][general] stream error: ${err.message}`);
+            fullText = `回答生成失败: ${err.message}`;
+            if (sse) sse.textChunk(fullText);
+        }
     }
 
     if (sse) sse.agentEnd("general");
@@ -802,6 +1028,7 @@ async function generalChatNode(state, config) {
     return {
         messages: [new AIMessage({ content: fullText })],
         currentAgent: "general",
+        tokenUsage: nodeUsage.total_tokens > 0 ? nodeUsage : null,
     };
 }
 
@@ -814,6 +1041,7 @@ async function searchAgentNode(state, config) {
     console.log(`[graph][search] starting (mode=${solo ? 'solo' : 'parallel'})`);
 
     const sse = config?.configurable?.sse;
+    const signal = config?.configurable?.abortSignal;
     const agentType = "search";
 
     if (sse) sse.agentStart(agentType);
@@ -867,14 +1095,18 @@ async function searchAgentNode(state, config) {
         ];
 
         let fullText = "";
+        let searchUsage = null;
         try {
-            const stream = await llm.stream(messages);
+            const stream = await llm.stream(messages, { signal });
+            let response;
             for await (const chunk of stream) {
+                response = response ? response.concat(chunk) : chunk;
                 const text = normalizeChunkContent(chunk?.content);
                 if (!text) continue;
                 fullText += text;
                 if (sse) sse.textChunk(text);
             }
+            searchUsage = extractUsageFromChunk(response);
         } catch (err) {
             console.log(`[graph][search] stream error: ${err.message}`);
             fullText = searchResults;
@@ -889,6 +1121,7 @@ async function searchAgentNode(state, config) {
             searchResults,
             plan,
             currentAgent: "search",
+            tokenUsage: searchUsage,
         };
     }
 
@@ -912,6 +1145,7 @@ async function knowledgeAgentNode(state, config) {
     console.log(`[graph][knowledge] starting (mode=${solo ? 'solo' : 'parallel'})`);
 
     const sse = config?.configurable?.sse;
+    const signal = config?.configurable?.abortSignal;
     const agentType = "knowledge";
 
     if (sse) sse.agentStart(agentType);
@@ -956,9 +1190,18 @@ async function knowledgeAgentNode(state, config) {
     ];
 
     let knowledgeResults = "";
+    let knowledgeUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+    const kaAddUsage = (u) => {
+        if (u && u.total_tokens > 0) {
+            knowledgeUsage.prompt_tokens += u.prompt_tokens || 0;
+            knowledgeUsage.completion_tokens += u.completion_tokens || 0;
+            knowledgeUsage.total_tokens += u.total_tokens || 0;
+        }
+    };
 
     try {
-        const firstResponse = await llmWithTools.invoke(messages);
+        const firstResponse = await llmWithTools.invoke(messages, { signal });
+        kaAddUsage(extractUsageFromChunk(firstResponse));
         const toolCalls = firstResponse.tool_calls || firstResponse.additional_kwargs?.tool_calls || [];
 
         if (toolCalls.length > 0) {
@@ -988,13 +1231,16 @@ async function knowledgeAgentNode(state, config) {
 
                 let fullText = "";
                 try {
-                    const stream = await summaryLlm.stream(summaryMessages);
+                    const stream = await summaryLlm.stream(summaryMessages, { signal });
+                    let summaryResponse;
                     for await (const chunk of stream) {
+                        summaryResponse = summaryResponse ? summaryResponse.concat(chunk) : chunk;
                         const text = normalizeChunkContent(chunk?.content);
                         if (!text) continue;
                         fullText += text;
                         if (sse) sse.textChunk(text);
                     }
+                    kaAddUsage(extractUsageFromChunk(summaryResponse));
                 } catch (err) {
                     console.log(`[graph][knowledge] summary stream error: ${err.message}`);
                     fullText = knowledgeResults;
@@ -1009,6 +1255,7 @@ async function knowledgeAgentNode(state, config) {
                     knowledgeResults,
                     plan,
                     currentAgent: "knowledge",
+                    tokenUsage: knowledgeUsage.total_tokens > 0 ? knowledgeUsage : null,
                 };
             }
         } else {
@@ -1029,6 +1276,7 @@ async function knowledgeAgentNode(state, config) {
         knowledgeResults,
         plan,
         currentAgent: "knowledge",
+        tokenUsage: knowledgeUsage.total_tokens > 0 ? knowledgeUsage : null,
     };
 }
 
@@ -1041,6 +1289,7 @@ async function codeAgentNode(state, config) {
     console.log(`[graph][code] starting (mode=${solo ? 'solo' : 'parallel'})`);
 
     const sse = config?.configurable?.sse;
+    const signal = config?.configurable?.abortSignal;
     const agentType = "code";
 
     if (sse) sse.agentStart(agentType);
@@ -1074,14 +1323,18 @@ async function codeAgentNode(state, config) {
     // ── Solo 模式：LLM stream 直出，Synthesizer 透传 ──
     if (solo) {
         let fullText = "";
+        let soloUsage = null;
         try {
-            const stream = await llm.stream(messages);
+            const stream = await llm.stream(messages, { signal });
+            let response;
             for await (const chunk of stream) {
+                response = response ? response.concat(chunk) : chunk;
                 const text = normalizeChunkContent(chunk?.content);
                 if (!text) continue;
                 fullText += text;
                 if (sse) sse.textChunk(text);
             }
+            soloUsage = extractUsageFromChunk(response);
         } catch (err) {
             console.log(`[graph][code] stream error: ${err.message}`);
             fullText = `代码生成失败: ${err.message}`;
@@ -1096,14 +1349,17 @@ async function codeAgentNode(state, config) {
             codeResults: fullText,
             plan,
             currentAgent: "code",
+            tokenUsage: soloUsage,
         };
     }
 
     // ── Parallel 模式：invoke 生成代码，存结果给 Synthesizer 融合 ──
     let codeResults = "";
+    let parallelUsage = null;
     try {
-        const response = await llm.invoke(messages);
+        const response = await llm.invoke(messages, { signal });
         codeResults = normalizeChunkContent(response.content || "");
+        parallelUsage = extractUsageFromChunk(response);
     } catch (err) {
         console.log(`[graph][code] generation error: ${err.message}`);
         codeResults = `代码生成失败: ${err.message}`;
@@ -1118,6 +1374,7 @@ async function codeAgentNode(state, config) {
         codeResults,
         plan,
         currentAgent: "code",
+        tokenUsage: parallelUsage,
     };
 }
 
@@ -1141,6 +1398,7 @@ function completePlan(plan, sse) {
 
 async function synthesizerNode(state, config) {
     const sse = config?.configurable?.sse;
+    const signal = config?.configurable?.abortSignal;
     const agentType = "synthesizer";
     const intents = state.intents || [state.intent || "general"];
     const subTasks = state.subTasks || [];
@@ -1168,6 +1426,18 @@ async function synthesizerNode(state, config) {
     // ── Phase 4: 构建融合上下文 ──
     const sources = [];
     let contextBlock = "";
+    const errorResults = []; // 收集错误/不可用的结果来源
+
+    // 辅助函数：检测错误/不可用结果
+    const isErrorResult = (text) => {
+        if (!text || !text.trim()) return true;
+        const s = text.trim();
+        return /^\(.*工具不可用\)$/.test(s) ||
+            /^知识库检索出错:/.test(s) ||
+            /^联网搜索出错:/.test(s) ||
+            /^工具调用失败:/.test(s) ||
+            /^Error:/i.test(s);
+    };
 
     // Phase 4: 从 planResults 收集 subTask 执行结果
     const planResults = state.planResults || {};
@@ -1178,6 +1448,10 @@ async function synthesizerNode(state, config) {
         for (const st of completedSubTasks) {
             const result = planResults[st.id] || "";
             if (!result) continue;
+            if (isErrorResult(result)) {
+                errorResults.push(`${st.content.slice(0, 30)}(${st.toolName || "未知工具"})`);
+                continue;
+            }
             const label = st.toolName
                 ? `步骤${st.id}: ${st.content.slice(0, 50)} (${st.toolName})`
                 : `步骤${st.id}: ${st.content.slice(0, 50)}`;
@@ -1189,16 +1463,28 @@ async function synthesizerNode(state, config) {
     // 旧字段 fallback（无 subTask 的 Parallel 模式）
     if (completedSubTasks.length === 0) {
         if (state.searchResults) {
-            sources.push("搜索");
-            contextBlock += `\n\n[搜索结果]\n${state.searchResults.slice(0, 4000)}`;
+            if (isErrorResult(state.searchResults)) {
+                errorResults.push("搜索");
+            } else {
+                sources.push("搜索");
+                contextBlock += `\n\n[搜索结果]\n${state.searchResults.slice(0, 4000)}`;
+            }
         }
         if (state.knowledgeResults) {
-            sources.push("知识库");
-            contextBlock += `\n\n[知识库结果]\n${state.knowledgeResults.slice(0, 4000)}`;
+            if (isErrorResult(state.knowledgeResults)) {
+                errorResults.push("知识库");
+            } else {
+                sources.push("知识库");
+                contextBlock += `\n\n[知识库结果]\n${state.knowledgeResults.slice(0, 4000)}`;
+            }
         }
         if (state.codeResults) {
-            sources.push("代码");
-            contextBlock += `\n\n[代码生成结果]\n${state.codeResults.slice(0, 4000)}`;
+            if (isErrorResult(state.codeResults)) {
+                errorResults.push("代码");
+            } else {
+                sources.push("代码");
+                contextBlock += `\n\n[代码生成结果]\n${state.codeResults.slice(0, 4000)}`;
+            }
         }
     }
 
@@ -1213,9 +1499,13 @@ async function synthesizerNode(state, config) {
 
     // Blocked 提示
     let blockedNote = "";
-    if (blockedSubTasks.length > 0) {
-        blockedNote = `\n\n注意：以下步骤因工具不可用被跳过：${
-            blockedSubTasks.map(s => `${s.content}(${s.blockedReason || "未知原因"})`).join("、")
+    const blockedItems = [
+        ...blockedSubTasks.map(s => `${s.content}(${s.blockedReason || "未知原因"})`),
+        ...errorResults.map(e => `${e}(结果异常或不可用)`),
+    ];
+    if (blockedItems.length > 0) {
+        blockedNote = `\n\n注意：以下步骤/来源因工具不可用或结果异常被跳过：${
+            blockedItems.join("、")
         }。请基于已有信息回答，或告知用户原因。`;
     }
 
@@ -1253,9 +1543,14 @@ async function synthesizerNode(state, config) {
     ];
 
     let fullText = "";
+    let synthUsage = null;
     try {
-        const stream = await llm.stream(messages);
+        const stream = await llm.stream(messages, { signal });
         for await (const chunk of stream) {
+            // 从最后一个 chunk 提取真实 API token usage
+            const chunkUsage = extractUsageFromChunk(chunk);
+            if (chunkUsage) synthUsage = chunkUsage;
+
             const text = normalizeChunkContent(chunk?.content);
             if (!text) continue;
             fullText += text;
@@ -1280,6 +1575,7 @@ async function synthesizerNode(state, config) {
         messages: [new AIMessage({ content: fullText })],
         plan,
         currentAgent: "synthesizer",
+        tokenUsage: synthUsage,
     };
 }
 
@@ -1598,14 +1894,32 @@ export async function chatWithGraph(userId, session_id, userMessage, image, syst
         userMessageForStorage,
         forceModel = null,
         planMode = false,
+        enableMemory = true,
         onComplete,
     } = options;
     const normalizedUserMessage = String(userMessage || "");
     const temperature = normalizeTemperature(temperatureInput);
-    const systemPrompt = resolveSystemPrompt(systemPromptInput);
+    let systemPrompt = resolveSystemPrompt(systemPromptInput);
     const hasImage = Boolean(image);
     const startedAt = Date.now();
     const modelName = resolveModelName(hasImage, forceModel);
+
+    // 动态注入模型身份：防止模型幻觉（如 deepseek 训练数据含 Claude 样本，会自称 Claude）
+    systemPrompt += `\n\n[系统信息] 你是 AI-Chat 平台的智能助手，底层由 ${modelName} 模型驱动。如果用户询问你的身份或模型，请如实告知以上信息，不要声称自己是 Claude、GPT 或其他特定模型。`;
+
+    // Phase 4: 设置 memory_tool 的当前用户上下文
+    if (enableMemory) {
+        setMemoryToolContext(userId, session_id);
+    }
+
+    // Phase 5: Trace 采集
+    const traceCollector = new TraceCollector();
+    const traceId = traceCollector.startTrace(userId, session_id, "chat", {
+        input: normalizedUserMessage.slice(0, 200),
+        enableWebSearch,
+        planMode,
+        hasImage,
+    });
 
     const abortController = new AbortController();
     let clientDisconnected = false;
@@ -1649,7 +1963,7 @@ export async function chatWithGraph(userId, session_id, userMessage, image, syst
         if (shouldBypassTools) {
             emitThought(res, hasImage ? "识别到图片输入，切换视觉理解模式" : "识别为直接回答任务，准备生成结果");
             const directSystemInstruction = buildDirectAnswerSystemInstruction(enableWebSearch, systemPrompt);
-            fullText = await streamDirectChat({
+            const { fullText: directText, usage: directUsage } = await streamDirectChat({
                 userMessage: normalizedUserMessage,
                 image,
                 formattedHistory,
@@ -1659,20 +1973,36 @@ export async function chatWithGraph(userId, session_id, userMessage, image, syst
                 forceModel,
                 abortController,
             });
+            fullText = directText;
 
             const assistantMessageId = saveMessage(userId, session_id, "assistant", fullText);
-            const promptTokens = estimateTokens(
-                `${directSystemInstruction}\n${formattedHistory.map((item) => normalizeChunkContent(item?.content)).join("\n")}\n${normalizedUserMessage}`
-            );
-            const completionTokens = estimateTokens(fullText);
-            onComplete?.({
-                messageId: assistantMessageId,
-                latency_ms: Date.now() - startedAt,
-                prompt_tokens: promptTokens,
-                completion_tokens: completionTokens,
-                total_tokens: promptTokens + completionTokens,
-                model: modelName,
-            });
+            // Phase 5: finish trace (direct answer path)
+            traceCollector.finishTrace(traceId, modelName, { messageId: assistantMessageId });
+            // 优先使用真实 API usage，fallback 到 CJK-aware 估算
+            const dMetrics = directUsage && directUsage.total_tokens > 0
+                ? {
+                    messageId: assistantMessageId,
+                    latency_ms: Date.now() - startedAt,
+                    prompt_tokens: directUsage.prompt_tokens,
+                    completion_tokens: directUsage.completion_tokens,
+                    total_tokens: directUsage.total_tokens,
+                    model: modelName,
+                    trace_id: traceId,
+                  }
+                : {
+                    messageId: assistantMessageId,
+                    latency_ms: Date.now() - startedAt,
+                    prompt_tokens: estimateTokens(
+                        `${directSystemInstruction}\n${formattedHistory.map((item) => normalizeChunkContent(item?.content)).join("\n")}\n${normalizedUserMessage}`
+                    ),
+                    completion_tokens: estimateTokens(fullText),
+                    total_tokens: estimateTokens(
+                        `${directSystemInstruction}\n${formattedHistory.map((item) => normalizeChunkContent(item?.content)).join("\n")}\n${normalizedUserMessage}`
+                    ) + estimateTokens(fullText),
+                    model: modelName,
+                    trace_id: traceId,
+                  };
+            onComplete?.(dMetrics);
             emitThought(res, "回答生成完成", "done");
             res.write("data: [DONE]\n\n");
             res.end();
@@ -1681,8 +2011,19 @@ export async function chatWithGraph(userId, session_id, userMessage, image, syst
         }
 
         // 构建 LangGraph
-        const sse = createSSEEmitter(res);
+        const sse = createSSEEmitter(res, traceCollector, traceId);
         const graph = buildAgentGraph();
+
+        // ── Phase 4: 上下文工程 — 构建 token 感知的优化上下文 ──
+        const memory = enableMemory ? new MemoryService(userId) : null;
+        const contextBuilder = createChatContextBuilder(memory);
+        const rawHistory = history.map(m => ({ role: m.role, content: m.content, timestamp: m.created_at }));
+        const optimizedContext = await contextBuilder.build(
+            inputForAgent,
+            rawHistory,
+            systemPrompt,
+            { modelName }
+        );
 
         const initialState = {
             messages: [
@@ -1694,6 +2035,7 @@ export async function chatWithGraph(userId, session_id, userMessage, image, syst
             currentDate: new Date().toLocaleString(),
             enableWebSearch,
             planMode,
+            enableMemory,
             systemPrompt,
             temperature,
             modelName,
@@ -1704,12 +2046,15 @@ export async function chatWithGraph(userId, session_id, userMessage, image, syst
             subTasks: [],
             planResults: {},
             currentSubTask: null,
+            // Phase 4: 上下文工程
+            optimizedContext,
         };
 
         const config = {
             configurable: {
                 thread_id: `session-${session_id}-${Date.now()}`,
                 sse, // SSE emitter 通过 config 传入节点
+                abortSignal: abortController.signal, // 允许节点感知客户端断连
             },
         };
 
@@ -1743,18 +2088,51 @@ export async function chatWithGraph(userId, session_id, userMessage, image, syst
         }
 
         const assistantMessageId = saveMessage(userId, session_id, "assistant", fullText);
-        const promptTokens = estimateTokens(
-            `${systemPrompt}\n${formattedHistory.map((item) => normalizeChunkContent(item?.content)).join("\n")}\n${inputForAgent}`
-        );
-        const completionTokens = estimateTokens(fullText);
-        onComplete?.({
-            messageId: assistantMessageId,
-            latency_ms: Date.now() - startedAt,
-            prompt_tokens: promptTokens,
-            completion_tokens: completionTokens,
-            total_tokens: promptTokens + completionTokens,
-            model: modelName,
-        });
+        // Phase 5: finish trace (graph path)
+        traceCollector.finishTrace(traceId, modelName, { messageId: assistantMessageId });
+        // 优先使用 State 中累加的真实 API token usage，fallback 到 CJK-aware 估算
+        const accUsage = checkpointState?.values?.tokenUsage;
+        const gMetrics = (accUsage && accUsage.total_tokens > 0)
+            ? {
+                messageId: assistantMessageId,
+                latency_ms: Date.now() - startedAt,
+                prompt_tokens: accUsage.prompt_tokens,
+                completion_tokens: accUsage.completion_tokens,
+                total_tokens: accUsage.total_tokens,
+                model: modelName,
+                trace_id: traceId,
+              }
+            : {
+                messageId: assistantMessageId,
+                latency_ms: Date.now() - startedAt,
+                prompt_tokens: estimateTokens(
+                    `${systemPrompt}\n${formattedHistory.map((item) => normalizeChunkContent(item?.content)).join("\n")}\n${inputForAgent}`
+                ),
+                completion_tokens: estimateTokens(fullText),
+                total_tokens: estimateTokens(
+                    `${systemPrompt}\n${formattedHistory.map((item) => normalizeChunkContent(item?.content)).join("\n")}\n${inputForAgent}`
+                ) + estimateTokens(fullText),
+                model: modelName,
+                trace_id: traceId,
+              };
+        onComplete?.(gMetrics);
+
+        // ── Phase 4: 自动记忆巩固 ──
+        // 会话结束后，自动将高重要性 working 记忆提升为 episodic
+        if (enableMemory) {
+            try {
+                const memory = new MemoryService(userId);
+                // 先用简单规则提取对话中的关键信息
+                memory.extractFromConversation(normalizedUserMessage, session_id);
+                // 然后执行记忆巩固
+                const result = memory.consolidate("working", "episodic", 0.7);
+                if (result.consolidated > 0) {
+                    console.log(`[memory] auto-consolidated ${result.consolidated}/${result.total} memories for user ${userId}`);
+                }
+            } catch (memErr) {
+                console.warn(`[memory] auto-consolidation failed:`, memErr.message);
+            }
+        }
 
         if (!clientDisconnected) {
             emitThought(res, "回答生成完成", "done");
