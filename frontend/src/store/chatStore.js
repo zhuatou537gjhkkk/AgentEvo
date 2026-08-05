@@ -307,6 +307,7 @@ export const useChatStore = create(persist((set, get) => ({
     selectedImage: null,
     enableWebSearch: false,
     planMode: false,
+    enableMemory: true,
     systemPrompt: DEFAULT_SYSTEM_PROMPT,
     temperature: DEFAULT_TEMPERATURE,
     sessionAgentSettings: {},
@@ -318,7 +319,76 @@ export const useChatStore = create(persist((set, get) => ({
     speakingMessageId: null,
     themeMode: DEFAULT_THEME_MODE,
     mcpServers: [],
+    // Phase 4: 记忆系统
+    memories: [],
+    memoryStats: null,
+    isMemoryLoading: false,
     isExporting: false,
+    // Phase 5: 评估系统
+    isEvalDashboardOpen: false,
+    evalReportData: null,
+    evalRunState: null,
+    messageFeedback: {},
+    // Phase 5: 评估 actions
+    toggleEvalDashboard: () => set((s) => ({ isEvalDashboardOpen: !s.isEvalDashboardOpen })),
+    fetchEvalReport: async (runId = null) => {
+        try {
+            const { fetchEvalReport } = await import("../api/eval.js");
+            const data = await fetchEvalReport(runId);
+            set({ evalReportData: data });
+        } catch (err) {
+            console.error("[store] fetchEvalReport failed:", err);
+        }
+    },
+    runEvalSuite: async (categories) => {
+        set({ evalRunState: { running: true } });
+        try {
+            const { runEvalSuite } = await import("../api/eval.js");
+            const report = await runEvalSuite({ categories });
+            set({ evalRunState: { running: false, lastReport: report } });
+            return report;
+        } catch (err) {
+            console.error("[store] runEvalSuite failed:", err);
+            set({ evalRunState: { running: false, error: err.message } });
+            throw err;
+        }
+    },
+    submitMessageFeedback: async (messageId, rating) => {
+        // 记录旧值用于 rollback
+        const prevRating = get().messageFeedback[messageId]?.rating || null;
+
+        if (rating === null || rating === undefined) {
+            // 取消反馈
+            set((s) => {
+                const next = { ...s.messageFeedback };
+                delete next[messageId];
+                return { messageFeedback: next };
+            });
+        } else {
+            // Optimistic update
+            set((s) => ({
+                messageFeedback: { ...s.messageFeedback, [messageId]: { rating } },
+            }));
+        }
+        try {
+            const { submitFeedback } = await import("../api/eval.js");
+            await submitFeedback(messageId, rating);
+        } catch (err) {
+            console.error("[store] submitFeedback failed:", err);
+            // Rollback
+            if (prevRating) {
+                set((s) => ({
+                    messageFeedback: { ...s.messageFeedback, [messageId]: { rating: prevRating } },
+                }));
+            } else {
+                set((s) => {
+                    const next = { ...s.messageFeedback };
+                    delete next[messageId];
+                    return { messageFeedback: next };
+                });
+            }
+        }
+    },
     sessionDrafts: {},
     messageSearchKeyword: '',
     authToken: readStoredAuthToken(),
@@ -342,6 +412,15 @@ export const useChatStore = create(persist((set, get) => ({
                 : enabled;
 
             return { planMode: Boolean(nextValue) };
+        });
+    },
+    setEnableMemory: (enabled) => {
+        set((state) => {
+            const nextValue = typeof enabled === 'function'
+                ? enabled(state.enableMemory)
+                : enabled;
+
+            return { enableMemory: Boolean(nextValue) };
         });
     },
     setSelectedImage: (payload) => {
@@ -461,6 +540,56 @@ export const useChatStore = create(persist((set, get) => ({
                 s.name === name ? { ...s, connected } : s
             ),
         }));
+    },
+    // ── Phase 4: 记忆系统管理 ──
+    fetchMemories: async (query = '', memoryType = '', limit = 50) => {
+        set({ isMemoryLoading: true });
+        try {
+            const { fetchMemories } = await import('../api/chat.js');
+            const data = await fetchMemories(query, memoryType, limit);
+            set({ memories: data.memories || [], isMemoryLoading: false });
+        } catch (err) {
+            console.error('[store] fetchMemories failed:', err);
+            set({ isMemoryLoading: false });
+        }
+    },
+    fetchMemoryStats: async () => {
+        try {
+            const { fetchMemoryStats } = await import('../api/chat.js');
+            const stats = await fetchMemoryStats();
+            set({ memoryStats: stats });
+        } catch (err) {
+            console.error('[store] fetchMemoryStats failed:', err);
+        }
+    },
+    deleteMemory: async (memoryId) => {
+        try {
+            const { deleteMemory } = await import('../api/chat.js');
+            await deleteMemory(memoryId);
+            set((state) => ({
+                memories: state.memories.filter((m) => m.id !== memoryId),
+            }));
+        } catch (err) {
+            console.error('[store] deleteMemory failed:', err);
+        }
+    },
+    clearMemories: async () => {
+        try {
+            const { clearAllMemories } = await import('../api/chat.js');
+            await clearAllMemories();
+            set({ memories: [], memoryStats: null });
+        } catch (err) {
+            console.error('[store] clearMemories failed:', err);
+        }
+    },
+    consolidateMemories: async (fromType, toType, threshold) => {
+        try {
+            const { consolidateMemories } = await import('../api/chat.js');
+            return await consolidateMemories(fromType, toType, threshold);
+        } catch (err) {
+            console.error('[store] consolidateMemories failed:', err);
+            return null;
+        }
     },
     setMessageSearchKeyword: (keyword) => {
         set({ messageSearchKeyword: String(keyword || '') });
@@ -1271,6 +1400,7 @@ export const useChatStore = create(persist((set, get) => ({
         const effectiveEnableWebSearch = options.enableWebSearch ?? get().enableWebSearch;
         const enableWebSearch = Boolean(effectiveEnableWebSearch);
         const planMode = Boolean(options.planMode ?? get().planMode);
+        const enableMemory = options.enableMemory ?? get().enableMemory ?? true;
         const state = useChatStore.getState();
         const sessionId = state.currentSessionId;
         const selectedImage = state.selectedImage;
@@ -1959,6 +2089,7 @@ export const useChatStore = create(persist((set, get) => ({
                 signal: controller.signal,
                 enableWebSearch,
                 planMode,
+                enableMemory,
                 systemPrompt,
                 temperature,
                 imageId: selectedImageId,
@@ -1973,6 +2104,7 @@ export const useChatStore = create(persist((set, get) => ({
         sessionAgentSettings: state.sessionAgentSettings,
         sessionDrafts: state.sessionDrafts,
         enableWebSearch: state.enableWebSearch,
+        enableMemory: state.enableMemory,
         isVoiceEnabled: state.isVoiceEnabled,
         voiceRate: state.voiceRate,
         voiceVolume: state.voiceVolume,

@@ -92,7 +92,7 @@ function createRequestController(externalSignal, timeoutMs) {
     };
 }
 
-async function request(path, options = {}, config = {}) {
+export async function request(path, options = {}, config = {}) {
     const {
         timeoutMs = DEFAULT_TIMEOUT_MS,
         retryCount = DEFAULT_RETRY_COUNT,
@@ -295,6 +295,7 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
         signal,
         enableWebSearch = false,
         planMode = false,
+        enableMemory = true,
         systemPrompt = '你是一个有用的 AI 助手。',
         temperature = 0.7,
         image = null,
@@ -316,6 +317,7 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
                     image_id: imageId,
                     enable_web_search: enableWebSearch,
                     plan_mode: planMode,
+                    enable_memory: enableMemory,
                     systemPrompt,
                     temperature,
                 }),
@@ -782,6 +784,51 @@ export async function connectMcpServer(name) {
 export async function disconnectMcpServer(name) {
     const res = await request(`/mcp/servers/${encodeURIComponent(name)}/disconnect`, {
         method: 'POST',
+    });
+    return res.json();
+}
+
+// ═══════════════════════════════════════════════════════
+// 记忆系统管理 API (Phase 4)
+// ═══════════════════════════════════════════════════════
+
+export async function fetchMemories(query = '', memoryType = '', limit = 50) {
+    const params = new URLSearchParams();
+    if (query) params.set('query', query);
+    if (memoryType) params.set('memory_type', memoryType);
+    params.set('limit', String(limit));
+    const res = await request(`/memory?${params.toString()}`);
+    return res.json();
+}
+
+export async function fetchMemoryStats() {
+    const res = await request('/memory/stats');
+    return res.json();
+}
+
+export async function deleteMemory(memoryId) {
+    const res = await request(`/memory/${encodeURIComponent(memoryId)}`, {
+        method: 'DELETE',
+    });
+    return res.json();
+}
+
+export async function clearAllMemories() {
+    const res = await request('/memory', {
+        method: 'DELETE',
+    });
+    return res.json();
+}
+
+export async function consolidateMemories(fromType = 'working', toType = 'episodic', threshold = 0.7) {
+    const res = await request('/memory/consolidate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            from_type: fromType,
+            to_type: toType,
+            importance_threshold: threshold,
+        }),
     });
     return res.json();
 }

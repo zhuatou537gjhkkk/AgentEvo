@@ -23,8 +23,11 @@ import {
     getSessionById,
     getRecentObservability,
     removeMessagePair,
+    saveFeedback,
+    getFeedbackByMessage,
+    deleteFeedback,
 } from "./db/index.js";
-import { chatWithStream } from "./services/chat.js";
+import { chatWithStream, estimateTokens } from "./services/chat.js";
 import { chatWithGraph } from "./services/chatGraph.js";
 import { resolveUserQuestion } from "./mcp/tools.js";
 import { toolRegistry } from "./mcp/registry.js";
@@ -36,6 +39,8 @@ import {
     activeLargeFile
 } from "./rag/index.js";
 import { saveUploadedImage, getUploadedImageDataUrl } from "./images/store.js";
+import { MemoryService } from "./services/memory.js";
+import evalRoutes from "./eval/evalRoutes.js";
 import {
     hashPassword,
     verifyPassword,
@@ -597,6 +602,51 @@ app.get("/observability/recent", requireAuth, (req, res) => {
     });
 });
 
+// ── Phase 5: 评估系统路由 ──
+app.use("/eval", requireAuth, evalRoutes);
+
+// Phase 5: 用户反馈（支持切换取消）
+app.post("/chat/feedback", requireAuth, (req, res) => {
+    const { message_id, rating, comment } = req.body || {};
+    const messageId = Number(message_id);
+
+    // rating 为 null 表示取消反馈
+    if (rating === null || rating === undefined) {
+        if (!messageId) {
+            return res.status(400).json({ ok: false, message: "message_id is required" });
+        }
+        try {
+            deleteFeedback(req.user.id, messageId);
+            return res.json({ ok: true, rating: null });
+        } catch (err) {
+            console.error(`[feedback] delete failed:`, err.message);
+            return res.status(500).json({ ok: false, message: err.message });
+        }
+    }
+
+    if (!["thumbs_up", "thumbs_down"].includes(rating)) {
+        return res.status(400).json({
+            ok: false,
+            message: "message_id (number) and rating (thumbs_up|thumbs_down) are required",
+        });
+    }
+
+    try {
+        // 检查是否已存在同 rating 的反馈 → 切换取消
+        const existing = getFeedbackByMessage(req.user.id, messageId);
+        if (existing && existing.rating === rating) {
+            deleteFeedback(req.user.id, messageId);
+            return res.json({ ok: true, rating: null });
+        }
+
+        saveFeedback(req.user.id, messageId, rating, comment || null);
+        res.json({ ok: true, rating });
+    } catch (err) {
+        console.error(`[feedback] save failed:`, err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
 app.post("/test-db", requireAuth, (req, res) => {
     const { session_id, role, content } = req.body || {};
     const sessionId = Number(session_id);
@@ -895,12 +945,14 @@ app.post("/chat", requireAuth, async (req, res) => {
         image_id,
         enable_web_search,
         plan_mode,
+        enable_memory,
         systemPrompt,
         temperature
     } = req.body || {};
     const sessionId = Number(session_id);
     const enableWebSearch = enable_web_search === true;
     const planMode = plan_mode === true;
+    const enableMemory = enable_memory !== false; // 默认 true，向后兼容
     const resolvedImage = image || getUploadedImageDataUrl(image_id);
 
     if (image_id && !resolvedImage) {
@@ -935,8 +987,8 @@ app.post("/chat", requireAuth, async (req, res) => {
         const metrics = {
             latency_ms: 0,
             prompt_tokens: 0,
-            completion_tokens: Math.max(1, Math.ceil(String(answer).length / 4)),
-            total_tokens: Math.max(1, Math.ceil(String(answer).length / 4)),
+            completion_tokens: estimateTokens(answer) || 1,
+            total_tokens: estimateTokens(answer) || 1,
             model: "local-stats",
         };
         saveMessageMetric(assistantMessageId, metrics);
@@ -969,6 +1021,7 @@ app.post("/chat", requireAuth, async (req, res) => {
                 skipUserMessageSave: true,
                 forceModel: LONG_CONTEXT_MODEL,
                 planMode,
+                enableMemory,
                 onComplete: (metrics) => {
                     if (metrics?.messageId) {
                         saveMessageMetric(metrics.messageId, metrics);
@@ -986,6 +1039,7 @@ app.post("/chat", requireAuth, async (req, res) => {
                 enableWebSearch,
                 skipUserMessageSave: true,
                 planMode,
+                enableMemory,
                 onComplete: (metrics) => {
                     if (metrics?.messageId) {
                         saveMessageMetric(metrics.messageId, metrics);
@@ -1018,6 +1072,7 @@ app.post("/chat", requireAuth, async (req, res) => {
                 enableWebSearch,
                 skipUserMessageSave: true,
                 planMode,
+                enableMemory,
                 onComplete: (metrics) => {
                     if (metrics?.messageId) {
                         saveMessageMetric(metrics.messageId, metrics);
@@ -1036,8 +1091,8 @@ app.post("/chat", requireAuth, async (req, res) => {
         const metrics = {
             latency_ms: 0,
             prompt_tokens: 0,
-            completion_tokens: Math.max(1, Math.ceil(String(answer).length / 4)),
-            total_tokens: Math.max(1, Math.ceil(String(answer).length / 4)),
+            completion_tokens: estimateTokens(answer) || 1,
+            total_tokens: estimateTokens(answer) || 1,
             model: "local-rag",
         };
         saveMessageMetric(assistantMessageId, metrics);
@@ -1052,6 +1107,7 @@ app.post("/chat", requireAuth, async (req, res) => {
     await chatImpl(req.user.id, sessionId, message, resolvedImage, systemPrompt, temperature, res, {
         enableWebSearch,
         planMode,
+        enableMemory,
         onComplete: (metrics) => {
             if (metrics?.messageId) {
                 saveMessageMetric(metrics.messageId, metrics);
@@ -1237,6 +1293,79 @@ app.post("/mcp/servers/:name/disconnect", requireAuth, async (req, res) => {
     } catch { /* 非关键 */ }
 
     return res.json({ ok: true });
+});
+
+// ═══════════════════════════════════════════════════════
+// 记忆系统管理 API (Phase 4)
+// ═══════════════════════════════════════════════════════
+
+// 获取当前用户的记忆列表
+app.get("/memory", requireAuth, (req, res) => {
+    const memory = new MemoryService(req.user.id);
+    const { limit = 50, memory_type } = req.query;
+
+    try {
+        const memoryTypes = memory_type ? [memory_type] : null;
+
+        if (req.query.query || memoryTypes) {
+            // 搜索模式（有查询词时按关键词搜索；仅类型筛选时传空查询走过滤）
+            const results = memory.search(req.query.query || '', memoryTypes, Number(limit), 0.1);
+            return res.json({ memories: results, count: results.length });
+        }
+
+        // 列表模式（无筛选条件）
+        const items = memory.summary(Number(limit));
+        return res.json({ memories: items, count: items.length });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// 获取记忆统计
+app.get("/memory/stats", requireAuth, (req, res) => {
+    const memory = new MemoryService(req.user.id);
+    try {
+        return res.json(memory.stats());
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// 删除单条记忆
+app.delete("/memory/:id", requireAuth, (req, res) => {
+    const memory = new MemoryService(req.user.id);
+    try {
+        const deleted = memory.remove(Number(req.params.id));
+        if (!deleted) {
+            return res.status(404).json({ error: "记忆不存在" });
+        }
+        return res.json({ ok: true });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// 清空所有记忆
+app.delete("/memory", requireAuth, (req, res) => {
+    const memory = new MemoryService(req.user.id);
+    try {
+        const deleted = memory.forget("all");
+        return res.json({ ok: true, deleted });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// 手动触发记忆巩固
+app.post("/memory/consolidate", requireAuth, (req, res) => {
+    const memory = new MemoryService(req.user.id);
+    const { from_type = "working", to_type = "episodic", importance_threshold = 0.7 } = req.body || {};
+    try {
+        const result = memory.consolidate(from_type, to_type, importance_threshold);
+        return res.json({ ok: true, ...result });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
 });
 
 app.listen(PORT, async () => {

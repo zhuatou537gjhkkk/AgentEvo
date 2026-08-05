@@ -315,6 +315,26 @@ class ToolRegistry {
     }
 
     /**
+     * 获取指定类别的所有工具（DynamicTool 数组）。
+     * @param {string} categoryName
+     * @returns {Array}
+     */
+    getToolsByCategory(categoryName) {
+        const allLocal = this.getAllTools();
+        if (categoryName === "system") {
+            // system 类别：非 search/knowledge 的本地工具
+            return allLocal.filter(t =>
+                !["web_search", "search_knowledge_base"].includes(t.name)
+            );
+        }
+        // MCP Server 类别
+        if (this._mcpWrappers.has(categoryName)) {
+            return this._mcpWrappers.get(categoryName).tools;
+        }
+        return [];
+    }
+
+    /**
      * 检查是否存在指定类别的工具。
      * @param {string} categoryName
      * @returns {boolean}

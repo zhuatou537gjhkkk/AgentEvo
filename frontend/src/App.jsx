@@ -3,6 +3,7 @@ import ChatInput from './components/ChatInput';
 import ChatList from './components/ChatList';
 import SettingsModal from './components/SettingsModal';
 import Sidebar from './components/Sidebar';
+import EvalDashboard from './components/EvalDashboard';
 import { useChatStore } from './store/chatStore';
 
 export default function App() {
@@ -138,6 +139,7 @@ export default function App() {
     return (
         <div className="flex h-screen overflow-hidden bg-[var(--app-bg)] text-[var(--text-main)] transition-colors">
             <SettingsModal />
+            <EvalDashboard />
             <Sidebar className="hidden md:flex" />
 
             {sidebarOpen && (

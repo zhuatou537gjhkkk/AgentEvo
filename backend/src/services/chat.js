@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import { saveMessage, getHistoryMessages } from "../db/index.js";
-import { agentTools, consumePendingQuestion, cancelAllPendingQuestions } from "../mcp/tools.js";
+import { agentTools, consumePendingQuestion, cancelAllPendingQuestions, setMemoryToolContext } from "../mcp/tools.js";
+import { TraceCollector } from "../trace/collector.js";
 import {
     WEB_SEARCH_TOOL_NAME,
     FORCED_WEB_SEARCH_MAX_CHARS,
@@ -10,6 +11,7 @@ import {
     resolveSystemPrompt,
     resolveModelName,
     estimateTokens,
+    extractUsageFromChunk,
     emitThought,
     toLangChainMessage,
     isCreativeTask,
@@ -27,14 +29,22 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
         userMessageForStorage,
         forceModel = null,
         planMode = false,
+        enableMemory = true,
         onComplete,
     } = options;
     const normalizedUserMessage = String(userMessage || "");
+    // Phase 4: 设置 memory_tool 的当前用户上下文
+    if (enableMemory) {
+        setMemoryToolContext(userId, session_id);
+    }
     const temperature = normalizeTemperature(temperatureInput);
-    const systemPrompt = resolveSystemPrompt(systemPromptInput);
+    let systemPrompt = resolveSystemPrompt(systemPromptInput);
     const hasImage = Boolean(image);
     const startedAt = Date.now();
     const modelName = resolveModelName(hasImage, forceModel);
+
+    // 动态注入模型身份：防止模型幻觉（如 deepseek 训练数据含 Claude 样本，会自称 Claude）
+    systemPrompt += `\n\n[系统信息] 你是 AI-Chat 平台的智能助手，底层由 ${modelName} 模型驱动。如果用户询问你的身份或模型，请如实告知以上信息，不要声称自己是 Claude、GPT 或其他特定模型。`;
 
     const abortController = new AbortController();
     let clientDisconnected = false;
@@ -72,13 +82,25 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
     let inputForAgent = normalizedUserMessage;
     const shouldBypassTools = isCreativeTask(normalizedUserMessage, systemPrompt) || hasImage || Boolean(forceModel);
 
+    // Phase 5: Trace 采集 — 创建 TraceCollector，追踪完整请求路径
+    const traceCollector = new TraceCollector();
+    const traceId = traceCollector.startTrace(userId, session_id, "chat", {
+        input: normalizedUserMessage.slice(0, 200),
+        enableWebSearch,
+        planMode,
+        hasImage,
+    });
+    let rootAgentSpanId = null;
+    /** @type {Map<string, string>} — toolCallId → spanId */
+    const toolSpanMap = new Map();
+
     try {
         emitThought(res, "正在分析你的问题");
 
         if (shouldBypassTools) {
             emitThought(res, hasImage ? "识别到图片输入，切换视觉理解模式" : "识别为直接回答任务，准备生成结果");
             const directSystemInstruction = buildDirectAnswerSystemInstruction(enableWebSearch, systemPrompt);
-            fullText = await streamDirectChat({
+            const { fullText: directText, usage: directUsage } = await streamDirectChat({
                 userMessage: normalizedUserMessage,
                 image,
                 formattedHistory,
@@ -88,20 +110,36 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                 forceModel,
                 abortController,
             });
+            fullText = directText;
 
             const assistantMessageId = saveMessage(userId, session_id, "assistant", fullText);
-            const promptTokens = estimateTokens(
-                `${directSystemInstruction}\n${formattedHistory.map((item) => normalizeChunkContent(item?.content)).join("\n")}\n${normalizedUserMessage}`
-            );
-            const completionTokens = estimateTokens(fullText);
-            onComplete?.({
-                messageId: assistantMessageId,
-                latency_ms: Date.now() - startedAt,
-                prompt_tokens: promptTokens,
-                completion_tokens: completionTokens,
-                total_tokens: promptTokens + completionTokens,
-                model: modelName,
-            });
+            // Phase 5: finish trace
+            traceCollector.finishTrace(traceId, modelName, { messageId: assistantMessageId });
+            // 优先使用真实 API usage，fallback 到 CJK-aware 估算
+            const metrics = directUsage && directUsage.total_tokens > 0
+                ? {
+                    messageId: assistantMessageId,
+                    latency_ms: Date.now() - startedAt,
+                    prompt_tokens: directUsage.prompt_tokens,
+                    completion_tokens: directUsage.completion_tokens,
+                    total_tokens: directUsage.total_tokens,
+                    model: modelName,
+                    trace_id: traceId,
+                  }
+                : {
+                    messageId: assistantMessageId,
+                    latency_ms: Date.now() - startedAt,
+                    prompt_tokens: estimateTokens(
+                        `${directSystemInstruction}\n${formattedHistory.map((item) => normalizeChunkContent(item?.content)).join("\n")}\n${normalizedUserMessage}`
+                    ),
+                    completion_tokens: estimateTokens(fullText),
+                    total_tokens: estimateTokens(
+                        `${directSystemInstruction}\n${formattedHistory.map((item) => normalizeChunkContent(item?.content)).join("\n")}\n${normalizedUserMessage}`
+                    ) + estimateTokens(fullText),
+                    model: modelName,
+                    trace_id: traceId,
+                  };
+            onComplete?.(metrics);
             emitThought(res, "回答生成完成", "done");
             res.write("data: [DONE]\n\n");
             res.end();
@@ -178,6 +216,8 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
             }
         }
 
+        let accumulatedUsage = null; // 跨多轮 tool-calling 累加 LLM API 真实 token usage
+
         if (enableWebSearch) {
             // 联网模式：使用 Agent 编排工具调用
             emitThought(res, "正在调用模型生成回答");
@@ -205,6 +245,10 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                     const toolCallId = event.run_id || crypto.randomUUID();
                     const toolStartedAt = new Date().toISOString();
                     const toolName = event.name || "unknown";
+                    // Phase 5: trace tool span
+                    const toolSpanId = traceCollector.startSpan(traceId, toolName, "tool",
+                        rootAgentSpanId || traceId, { input: event?.data?.input });
+                    if (toolSpanId) toolSpanMap.set(toolCallId, toolSpanId);
                     console.log(
                         `[agent][tool_start] id=${toolCallId} name=${toolName}`
                     );
@@ -279,6 +323,14 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                     const toolCallId = event.run_id || "";
                     const output = event?.data?.output ?? "";
                     const toolEndedAt = new Date().toISOString();
+                    // Phase 5: end tool span
+                    const toolSpanId = toolSpanMap.get(toolCallId);
+                    if (toolSpanId) {
+                        traceCollector.endSpan(traceId, toolSpanId, {
+                            output: typeof output === "string" ? output.slice(0, 200) : "",
+                        });
+                        toolSpanMap.delete(toolCallId);
+                    }
                     console.log(
                         `[agent][tool_end] id=${toolCallId} name=${event.name || "unknown"}`
                     );
@@ -298,6 +350,12 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                     const toolCallId = event.run_id || "";
                     const errorMessage = event?.data?.error?.message || event?.data?.error || "工具执行异常";
                     const toolEndedAt = new Date().toISOString();
+                    // Phase 5: end tool span with error
+                    const toolSpanId = toolSpanMap.get(toolCallId);
+                    if (toolSpanId) {
+                        traceCollector.endSpan(traceId, toolSpanId, { error: String(errorMessage) });
+                        toolSpanMap.delete(toolCallId);
+                    }
                     console.log(
                         `[agent][tool_error] id=${toolCallId} name=${event.name || "unknown"} error=${errorMessage}`
                     );
@@ -315,6 +373,18 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
 
                 if (event.event !== "on_chat_model_stream") {
                     continue;
+                }
+
+                // 从 LLM 流式响应的最后一个 chunk 提取真实 API token usage
+                const chunkUsage = extractUsageFromChunk(event?.data?.chunk);
+                if (chunkUsage) {
+                    accumulatedUsage = accumulatedUsage
+                        ? {
+                            prompt_tokens: accumulatedUsage.prompt_tokens + chunkUsage.prompt_tokens,
+                            completion_tokens: accumulatedUsage.completion_tokens + chunkUsage.completion_tokens,
+                            total_tokens: accumulatedUsage.total_tokens + chunkUsage.total_tokens,
+                          }
+                        : chunkUsage;
                 }
 
                 const text = normalizeChunkContent(event?.data?.chunk?.content);
@@ -353,6 +423,10 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                     const toolCallId = event.run_id || crypto.randomUUID();
                     const toolStartedAt = new Date().toISOString();
                     const toolName = event.name || "unknown";
+                    // Phase 5: trace tool span
+                    const toolSpanId = traceCollector.startSpan(traceId, toolName, "tool",
+                        rootAgentSpanId || traceId, { input: event?.data?.input });
+                    if (toolSpanId) toolSpanMap.set(toolCallId, toolSpanId);
                     console.log(
                         `[agent][tool_start] id=${toolCallId} name=${toolName}`
                     );
@@ -427,6 +501,14 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                     const toolCallId = event.run_id || "";
                     const output = event?.data?.output ?? "";
                     const toolEndedAt = new Date().toISOString();
+                    // Phase 5: end tool span
+                    const toolSpanId = toolSpanMap.get(toolCallId);
+                    if (toolSpanId) {
+                        traceCollector.endSpan(traceId, toolSpanId, {
+                            output: typeof output === "string" ? output.slice(0, 200) : "",
+                        });
+                        toolSpanMap.delete(toolCallId);
+                    }
                     console.log(
                         `[agent][tool_end] id=${toolCallId} name=${event.name || "unknown"}`
                     );
@@ -446,6 +528,12 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                     const toolCallId = event.run_id || "";
                     const errorMessage = event?.data?.error?.message || event?.data?.error || "工具执行异常";
                     const toolEndedAt = new Date().toISOString();
+                    // Phase 5: end tool span with error
+                    const toolSpanId = toolSpanMap.get(toolCallId);
+                    if (toolSpanId) {
+                        traceCollector.endSpan(traceId, toolSpanId, { error: String(errorMessage) });
+                        toolSpanMap.delete(toolCallId);
+                    }
                     console.log(
                         `[agent][tool_error] id=${toolCallId} name=${event.name || "unknown"} error=${errorMessage}`
                     );
@@ -465,6 +553,19 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                     continue;
                 }
 
+                // 从 LLM 流式响应的最后一个 chunk 提取真实 API token usage
+                const chunkUsage = extractUsageFromChunk(event?.data?.chunk);
+                if (chunkUsage) {
+                    // 累加（多轮 tool-calling 每轮 LLM 调用各有 usage）
+                    accumulatedUsage = accumulatedUsage
+                        ? {
+                            prompt_tokens: accumulatedUsage.prompt_tokens + chunkUsage.prompt_tokens,
+                            completion_tokens: accumulatedUsage.completion_tokens + chunkUsage.completion_tokens,
+                            total_tokens: accumulatedUsage.total_tokens + chunkUsage.total_tokens,
+                          }
+                        : chunkUsage;
+                }
+
                 const text = normalizeChunkContent(event?.data?.chunk?.content);
 
                 if (!text) {
@@ -477,18 +578,33 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
         }
 
         const assistantMessageId = saveMessage(userId, session_id, "assistant", fullText);
-        const promptTokens = estimateTokens(
-            `${systemPrompt}\n${formattedHistory.map((item) => normalizeChunkContent(item?.content)).join("\n")}\n${inputForAgent}`
-        );
-        const completionTokens = estimateTokens(fullText);
-        onComplete?.({
-            messageId: assistantMessageId,
-            latency_ms: Date.now() - startedAt,
-            prompt_tokens: promptTokens,
-            completion_tokens: completionTokens,
-            total_tokens: promptTokens + completionTokens,
-            model: modelName,
-        });
+        // Phase 5: finish trace
+        traceCollector.finishTrace(traceId, modelName, { messageId: assistantMessageId });
+        // 优先使用真实 API usage，fallback 到 CJK-aware 估算
+        const metrics = accumulatedUsage && accumulatedUsage.total_tokens > 0
+            ? {
+                messageId: assistantMessageId,
+                latency_ms: Date.now() - startedAt,
+                prompt_tokens: accumulatedUsage.prompt_tokens,
+                completion_tokens: accumulatedUsage.completion_tokens,
+                total_tokens: accumulatedUsage.total_tokens,
+                model: modelName,
+                trace_id: traceId,
+              }
+            : {
+                messageId: assistantMessageId,
+                latency_ms: Date.now() - startedAt,
+                prompt_tokens: estimateTokens(
+                    `${systemPrompt}\n${formattedHistory.map((item) => normalizeChunkContent(item?.content)).join("\n")}\n${inputForAgent}`
+                ),
+                completion_tokens: estimateTokens(fullText),
+                total_tokens: estimateTokens(
+                    `${systemPrompt}\n${formattedHistory.map((item) => normalizeChunkContent(item?.content)).join("\n")}\n${inputForAgent}`
+                ) + estimateTokens(fullText),
+                model: modelName,
+                trace_id: traceId,
+              };
+        onComplete?.(metrics);
         if (!clientDisconnected) {
             emitThought(res, "回答生成完成", "done");
             res.write("data: [DONE]\n\n");

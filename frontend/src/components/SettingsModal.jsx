@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useChatStore } from '../store/chatStore';
 import { addMcpServer as apiAddMcpServer, removeMcpServer as apiRemoveMcpServer, connectMcpServer as apiConnectMcpServer, disconnectMcpServer as apiDisconnectMcpServer, fetchMcpServers } from '../api/chat';
+import MemoryPanel from './MemoryPanel';
 
 export default function SettingsModal() {
     const isSettingsOpen = useChatStore((state) => state.isSettingsOpen);
@@ -352,6 +353,12 @@ export default function SettingsModal() {
                             )}
                         </div>
                     ))}
+                </div>
+
+                {/* ── Phase 4: 记忆管理 ── */}
+                <div className="mt-5 space-y-3 border-t border-[var(--panel-border)] pt-4">
+                    <span className="text-sm font-semibold text-[var(--text-main)]">🧠 记忆管理</span>
+                    <MemoryPanel />
                 </div>
 
                 <div className="mt-6 flex justify-between">

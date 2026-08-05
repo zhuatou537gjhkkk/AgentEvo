@@ -18,6 +18,7 @@ export default function Sidebar({ className = '', onAfterSelect }) {
     const deleteSession = useChatStore((state) => state.deleteSession);
     const toggleSessionPin = useChatStore((state) => state.toggleSessionPin);
     const toggleSettings = useChatStore((state) => state.toggleSettings);
+    const toggleEvalDashboard = useChatStore((state) => state.toggleEvalDashboard);
     const exportCurrentSessionMarkdown = useChatStore((state) => state.exportCurrentSessionMarkdown);
     const isExporting = useChatStore((state) => state.isExporting);
     const messageSearchKeyword = useChatStore((state) => state.messageSearchKeyword);
@@ -192,13 +193,20 @@ export default function Sidebar({ className = '', onAfterSelect }) {
                 </div>
 
                 <div className="border-t border-slate-800 p-3">
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="grid grid-cols-3 gap-2">
                         <button
                             type="button"
                             onClick={toggleSettings}
                             className="rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm font-medium text-slate-100 transition hover:bg-slate-700"
                         >
                             设置
+                        </button>
+                        <button
+                            type="button"
+                            onClick={toggleEvalDashboard}
+                            className="rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm font-medium text-slate-100 transition hover:bg-slate-700"
+                        >
+                            评估
                         </button>
                         <button
                             type="button"

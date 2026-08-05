@@ -3,6 +3,7 @@ import { useChatStore } from '../store/chatStore';
 import { playVoice, stopVoice } from '../store/chatStore';
 import ToolCallCard, { ToolGroupCard } from './ToolCallCard';
 import UserQuestionCard from './UserQuestionCard';
+import EvalFeedback from './EvalFeedback';
 import TaskProgressCard from './TaskProgressCard';
 import { groupToolsByInterval } from '../utils/toolExecutionStateMachine';
 
@@ -587,6 +588,11 @@ function MessageItem({ message }) {
                                 </div>
                             )}
                         </div>
+                    )}
+
+                    {/* Phase 5: 用户反馈按钮 */}
+                    {!isUser && message.id && (
+                        <EvalFeedback messageId={message.id} />
                     )}
 
                     <div className={`mt-2 flex items-center gap-2 text-xs ${isUser ? 'justify-end' : 'justify-start'}`}>

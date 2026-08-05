@@ -3,6 +3,7 @@ import { DynamicTool } from "@langchain/core/tools";
 import { getMessageStats } from "../db/index.js";
 import { queryKnowledgeBase } from "../rag/index.js";
 import { toolRegistry } from "./registry.js";
+import { MemoryService } from "../services/memory.js";
 
 // ── User Question Broker ──────────────────────────────────────
 // 管理 Agent 向用户提问的 Promise/deferred 注册表。
@@ -721,13 +722,114 @@ const askUserQuestionTool = new DynamicTool({
     }
 });
 
+// ── Phase 4: 记忆工具 ──
+
+/** 当前请求的 userId，由 chatGraph 在每次请求前设置 */
+let _memoryToolUserId = null;
+let _memoryToolSessionId = null;
+
+/**
+ * 设置 memory_tool 的当前用户上下文（每次请求前由 chatGraph 调用）
+ */
+export function setMemoryToolContext(userId, sessionId) {
+    _memoryToolUserId = userId;
+    _memoryToolSessionId = sessionId;
+}
+
+const memoryTool = new DynamicTool({
+    name: "memory",
+    description: `管理用户记忆。支持的操作（通过 action 参数指定）：
+- add: 添加记忆。参数: action="add", content="内容", memory_type="working|episodic|semantic", importance=0.5
+- search: 搜索记忆。参数: action="search", query="查询", memory_types=["working","episodic"], limit=10
+- consolidate: 记忆巩固（短期→长期）。参数: action="consolidate", from_type="working", to_type="episodic", importance_threshold=0.7
+- forget: 遗忘记忆。参数: action="forget", strategy="importance|time", memory_type="working", threshold=0.3
+- stats: 获取记忆统计。参数: action="stats"
+- summary: 获取记忆摘要。参数: action="summary", limit=20
+输入为 JSON 字符串。`,
+    func: async (input) => {
+        try {
+            let parsed;
+            try {
+                parsed = typeof input === "string" ? JSON.parse(input) : input;
+            } catch {
+                return JSON.stringify({ error: "无法解析输入，请提供有效的 JSON 格式" });
+            }
+
+            const action = String(parsed.action || "search");
+            const userId = Number(parsed.userId || parsed.user_id || _memoryToolUserId || 1);
+            const sessionId = parsed.sessionId || parsed.session_id || _memoryToolSessionId || null;
+            console.log(`[memory_tool] action=${action} userId=${userId} sessionId=${sessionId} _ctxUserId=${_memoryToolUserId}`);
+            const memory = new MemoryService(userId);
+
+            switch (action) {
+                case "add": {
+                    const content = String(parsed.content || "");
+                    if (!content.trim()) {
+                        return JSON.stringify({ error: "content 不能为空" });
+                    }
+                    const memoryType = String(parsed.memory_type || "working");
+                    const importance = Math.max(0, Math.min(1, Number(parsed.importance) || 0.5));
+                    const metadata = parsed.metadata || {};
+                    const id = memory.add(content, memoryType, importance, metadata, sessionId);
+                    console.log(`[memory_tool] add result: id=${id} userId=${userId} content="${content}" type=${memoryType}`);
+                    return JSON.stringify({ success: true, memory_id: id, action: "add" });
+                }
+                case "search": {
+                    const query = String(parsed.query || parsed.q || "");
+                    const memoryTypes = Array.isArray(parsed.memory_types)
+                        ? parsed.memory_types
+                        : (parsed.memory_type ? [parsed.memory_type] : null);
+                    const limit = Math.min(50, Math.max(1, Number(parsed.limit) || 10));
+                    const minImportance = Number(parsed.min_importance) || 0.1;
+                    const results = memory.search(query, memoryTypes, limit, minImportance);
+                    return JSON.stringify({ results, count: results.length, action: "search" });
+                }
+                case "consolidate": {
+                    const fromType = String(parsed.from_type || "working");
+                    const toType = String(parsed.to_type || "episodic");
+                    const threshold = Number(parsed.importance_threshold) || 0.7;
+                    const result = memory.consolidate(fromType, toType, threshold);
+                    return JSON.stringify({
+                        consolidated: result.consolidated,
+                        total: result.total,
+                        from_type: fromType,
+                        to_type: toType,
+                    });
+                }
+                case "forget": {
+                    const strategy = String(parsed.strategy || "importance");
+                    const memType = String(parsed.memory_type || "working");
+                    const threshold = Number(parsed.threshold) || 0.3;
+                    const deleted = memory.forget(strategy, memType, threshold);
+                    return JSON.stringify({ deleted, strategy, memory_type: memType });
+                }
+                case "stats": {
+                    return JSON.stringify(memory.stats());
+                }
+                case "summary": {
+                    const limit = Math.min(50, Math.max(1, Number(parsed.limit) || 20));
+                    const items = memory.summary(limit);
+                    return JSON.stringify({ items, count: items.length });
+                }
+                default:
+                    return JSON.stringify({
+                        error: `不支持的操作: ${action}。支持: add, search, consolidate, forget, stats, summary`,
+                    });
+            }
+        } catch (err) {
+            return JSON.stringify({ error: `记忆操作失败: ${err.message}` });
+        }
+    }
+});
+
 export const agentTools = [
     getSystemTimeTool,
     getDbMessageCountTool,
     searchKnowledgeBaseTool,
     bochaSearchTool,
     updateTodoTool,
-    askUserQuestionTool
+    askUserQuestionTool,
+    memoryTool
 ];
 
 // ── Phase 3: 自动注册到 ToolRegistry ──
