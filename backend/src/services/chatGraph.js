@@ -17,6 +17,8 @@ import { toolRegistry } from "../mcp/registry.js";
 import { MemoryService } from "./memory.js";
 import { createChatContextBuilder } from "./contextBuilder.js";
 import { TraceCollector } from "../trace/collector.js";
+import { agentConfig } from "./agentConfig.js";
+import { OnlineEvaluator } from "../eval/online.js";
 import {
     WEB_SEARCH_TOOL_NAME,
     FORCED_WEB_SEARCH_MAX_CHARS,
@@ -82,6 +84,7 @@ const AgentState = Annotation.Root({
 
     // 用户输入
     userInput: Annotation({ default: () => "" }),
+    searchQuery: Annotation({ default: () => "" }),  // Router 改写后的搜索查询词
     chatHistory: Annotation({ default: () => [] }),
     currentDate: Annotation({ default: () => "" }),
 
@@ -427,7 +430,8 @@ async function routerNode(state, config) {
         ? `\n\n⚠️ 联网搜索当前**已开启**。用户的问题适合通过搜索引擎获取更准确/更新信息时，请优先使用 "search" 而非 "general"。只有纯闲聊、问候、创意写作才用 "general"。`
         : `\n\n⚠️ 联网搜索当前**未开启**。"search" 意图不可用，请用 "general" 替代。`;
 
-    const prompt = `你是一个智能路由助手。分析用户的问题，判断需要哪些专业智能体来处理。可以同时选择多个。
+    const routerInstr = agentConfig.get("agent.router.instruction");
+    const prompt = `你是一个智能路由助手。分析用户的问题，判断需要哪些专业智能体来处理。可以同时选择多个。${routerInstr ? `\n\n[优化指令] ${routerInstr}` : ""}
 
 固定分类：
 - "general": 普通对话、问候、闲聊、创意写作（纯主观/创造性任务，不需要外部信息）
@@ -444,7 +448,7 @@ ${categoryLines}${planHint}
 用户问题：${state.userInput}
 
 请严格返回 JSON 格式，不要包含其他文字：
-{"intents": ["general"], "primarySource": null, "analysis": "一句话理由"}
+{"intents": ["general"], "primarySource": null, "analysis": "一句话理由", "searchQuery": null}
 
 	intents 规则：
 	- ⚠️ 仔细扫描用户问题中的**多意图信号词**：如"顺便"、"同时"、"还有"、"另外"、"也帮我"、"另外查一下"、"再加上"等，出现这些词时应返回多个意图，不要只选一个
@@ -455,13 +459,23 @@ ${categoryLines}${planHint}
 	  * "分析这段代码，看看网上有没有更好的写法" → ["code", "search"]
 	- 单意图示例：纯问知识 → ["general"]；纯搜实时信息 → ["search"]；纯查文档 → ["knowledge"]；纯写代码 → ["code"]
 	- "general" 通常不与其他意图组合，除非用户明确要求"闲聊的同时做某事"
-	- 如果用户的问题涉及上述"额外工具类别"中的操作（如读写文件），请使用对应的类别名（如 "filesystem"）`;
+	- 如果用户的问题涉及上述"额外工具类别"中的操作（如读写文件），请使用对应的类别名（如 "filesystem"）
+
+		searchQuery 规则（仅当 intents 包含 "search" 时填写，否则 null）：
+		- 将用户的聊天式提问改写为搜索引擎友好的关键词查询
+		- 去除无关寒暄词（"帮我查一下"、"你知道吗"、"请搜索"等冗余词），保留核心信息点
+		- 中英双语：如用户问中文问题但答案可能在英文资源中，生成中英双份查询，用 | 分隔
+		- 保持原意，不要脑补用户没问的信息
+		- 示例："最近AI有什么大新闻，我好久没关注了" → "AI 人工智能 最新进展 2026年8月 | artificial intelligence news August 2026"
+		- 示例："Python怎么读取CSV文件" → "Python read CSV tutorial | Python 读取CSV文件 教程"
+		- 示例："今天天气怎么样" → "天气预报 今天 | weather today"`;
 
 
     let intent = "general";
     let intents = ["general"];
     let primarySource = null;
     let analysis = "";
+    let searchQuery = null;
 
     let routerUsage = null;
     try {
@@ -484,6 +498,7 @@ ${categoryLines}${planHint}
             intent = intents[0] || "general";
             primarySource = parsed.primarySource || null;
             analysis = parsed.analysis || "";
+            searchQuery = parsed.searchQuery || null;
         }
     } catch (err) {
         console.log(`[graph][router] classification failed, defaulting to general: ${err.message}`);
@@ -525,6 +540,7 @@ ${categoryLines}${planHint}
         intent: primaryIntent,
         intents: filteredIntents,
         primarySource,
+        searchQuery,
         currentAgent: "router",
         messages: [new AIMessage({ content: `[Router] 分类结果: ${filteredIntents.join(", ")} — ${analysis}` })],
         tokenUsage: routerUsage,
@@ -728,7 +744,7 @@ ${toolListText || "(暂无可用工具)"}
 请严格返回 JSON 数组（toolInput 必须是简单字符串，不要用对象字面量）：
 [
   {"id":"1", "type":"tool", "content":"搜索相关信息", "toolName":"web_search", "toolInput":"最近的AI新闻", "dependsOn":[], "status":"pending"},
-  {"id":"2", "type":"tool", "content":"读取指定文件", "toolName":"filesystem/read_file", "toolInput":"d:/AI-Chat/CLAUDE.md", "dependsOn":[], "status":"pending"},
+  {"id":"2", "type":"tool", "content":"读取指定文件", "toolName":"filesystem/read_file", "toolInput":"d:/AgentEvo/CLAUDE.md", "dependsOn":[], "status":"pending"},
   {"id":"3", "type":"reasoning", "content":"综合对比分析并给出最终回答", "dependsOn":["1","2"], "status":"pending"}
 ]
 
@@ -853,7 +869,7 @@ async function generalChatNode(state, config) {
 
     // Phase 4: 获取 system 类别工具（memory, get_system_time, update_todo 等），
     // 让 general_chat 节点也能调用这些通用工具。
-    // 排除 ai-chat-local/* MCP 自连重复项（与本地工具同名，避免 LLM 混淆）
+    // 排除 agent-evo-local/* MCP 自连重复项（与本地工具同名，避免 LLM 混淆）
     // 当 enableMemory=false 时，排除 memory 工具
     const rawSystemTools = toolRegistry.getToolsByCategory?.("system") || [];
     const systemTools = rawSystemTools.filter(t =>
@@ -868,12 +884,13 @@ async function generalChatNode(state, config) {
         ...buildChatOpenAIConfig(),
     });
 
+    const generalInstr = agentConfig.get("agent.general.instruction");
     const messages = [
         new SystemMessage(`${state.systemPrompt}\n当前时间：${state.currentDate}
 ${hasTools ? `\n你可以使用以下系统工具：memory（记忆管理）、get_system_time（时间查询）等。
 使用规则：
 - 用户要求执行具体操作时，直接执行，不要先搜索或验证。
-- 例如用户说"添加记忆"，直接用 memory action="add" 添加。` : ""}`),
+- 例如用户说"添加记忆"，直接用 memory action="add" 添加。` : ""}${generalInstr ? `\n\n[优化指令] ${generalInstr}` : ""}`),
         ...state.chatHistory,
         new HumanMessage(state.userInput),
     ];
@@ -1057,12 +1074,16 @@ async function searchAgentNode(state, config) {
     let plan = emitPlanProgress(sse, state.plan, 'agent_start');
 
     // ── 执行 web_search（solo/parallel 都需要） ──
+    const query = state.searchQuery || state.userInput;
     const toolCallId = crypto.randomUUID();
-    sse.toolStart(toolCallId, WEB_SEARCH_TOOL_NAME, state.userInput, agentType);
+    if (state.searchQuery) {
+        console.log(`[graph][search] reformulated query: "${query}"`);
+    }
+    sse.toolStart(toolCallId, WEB_SEARCH_TOOL_NAME, query, agentType);
 
     let searchResults = "";
     try {
-        const toolResult = await webSearchTool.invoke(state.userInput);
+        const toolResult = await webSearchTool.invoke(query);
         searchResults = normalizeChunkContent(toolResult).slice(0, FORCED_WEB_SEARCH_MAX_CHARS);
         sse.toolEnd(toolCallId, WEB_SEARCH_TOOL_NAME, searchResults, agentType);
     } catch (err) {
@@ -1084,8 +1105,9 @@ async function searchAgentNode(state, config) {
         });
 
         // Solo 模式：进度由 emitPlanProgress 自动管理，不给 LLM update_todo 指令(LLM 没有 tool 会文字模拟)
+        const searchInstr = agentConfig.get("agent.search.instruction");
         const systemMsg = new SystemMessage(
-            `你是搜索专家。下面是一次 web_search 的检索结果。请基于这些结果为用户问题提供客观、结构化的总结回答。\n当前时间：${state.currentDate}\n\n重要：你必须在回答中引用搜索结果的来源信息。`
+            `你是搜索专家。下面是一次 web_search 的检索结果。请基于这些结果为用户问题提供客观、结构化的总结回答。\n当前时间：${state.currentDate}\n\n重要：你必须在回答中引用搜索结果的来源信息。${searchInstr ? `\n\n[优化指令] ${searchInstr}` : ""}`
         );
 
         const messages = [
@@ -1179,8 +1201,9 @@ async function knowledgeAgentNode(state, config) {
         ? "检索完成后，请基于检索结果生成一个完整的回答。"
         : "重要：只需要执行工具返回检索结果即可，不需要生成最终回答。最终回答由综合Agent负责。";
 
+    const knowledgeInstr = agentConfig.get("agent.knowledge.instruction");
     const systemMsg = new SystemMessage(
-        `你是知识库检索专家。使用 search_knowledge_base 工具从用户上传的文档中检索相关信息。\n当前时间：${state.currentDate}\n\n${soloHint}`
+        `你是知识库检索专家。使用 search_knowledge_base 工具从用户上传的文档中检索相关信息。\n当前时间：${state.currentDate}\n\n${soloHint}${knowledgeInstr ? `\n\n[优化指令] ${knowledgeInstr}` : ""}`
     );
 
     const messages = [
@@ -1310,8 +1333,9 @@ async function codeAgentNode(state, config) {
 
     // Solo 模式：进度由 emitPlanProgress 自动管理，不给 LLM update_todo 指令(LLM 没有 tool 会文字模拟)
     // Parallel 模式：也不需要，emitPlanProgress 在 tools_done 阶段统一处理
+    const codeInstr = agentConfig.get("agent.code.instruction");
     const systemMsg = new SystemMessage(
-        `${state.systemPrompt}\n\n你是代码助手。请帮助用户编写、分析、解释和调试代码。输出代码时使用 Markdown 代码块格式。\n当前时间：${state.currentDate}${parallelHint}`
+        `${state.systemPrompt}\n\n你是代码助手。请帮助用户编写、分析、解释和调试代码。输出代码时使用 Markdown 代码块格式。\n当前时间：${state.currentDate}${parallelHint}${codeInstr ? `\n\n[优化指令] ${codeInstr}` : ""}`
     );
 
     const messages = [
@@ -1532,8 +1556,9 @@ async function synthesizerNode(state, config) {
         ? `\n注意：以上结果来自 ${sources.join("、")} 等多个工具的执行结果。请将它们融合为一个连贯的回答，避免内容重复。`
         : "";
 
+    const synthInstr = agentConfig.get("agent.synthesizer.instruction");
     const systemMsg = new SystemMessage(
-        `${state.systemPrompt}\n当前时间：${state.currentDate}\n\n你是综合处理助手。根据以下工具执行结果，为用户问题生成完整、准确的回答。${contextBlock}${reasoningGuide}${blockedNote}${mergeHint}\n\n请用自然语言组织回答，确保信息准确、结构清晰。${state.searchResults || sources.includes("搜索") ? '需要引用搜索来源时请注明。' : ''}`
+        `${state.systemPrompt}\n当前时间：${state.currentDate}\n\n你是综合处理助手。根据以下工具执行结果，为用户问题生成完整、准确的回答。${contextBlock}${reasoningGuide}${blockedNote}${mergeHint}\n\n请用自然语言组织回答，确保信息准确、结构清晰。${state.searchResults || sources.includes("搜索") ? '需要引用搜索来源时请注明。' : ''}${synthInstr ? `\n\n[优化指令] ${synthInstr}` : ""}`
     );
 
     const messages = [
@@ -1905,7 +1930,7 @@ export async function chatWithGraph(userId, session_id, userMessage, image, syst
     const modelName = resolveModelName(hasImage, forceModel);
 
     // 动态注入模型身份：防止模型幻觉（如 deepseek 训练数据含 Claude 样本，会自称 Claude）
-    systemPrompt += `\n\n[系统信息] 你是 AI-Chat 平台的智能助手，底层由 ${modelName} 模型驱动。如果用户询问你的身份或模型，请如实告知以上信息，不要声称自己是 Claude、GPT 或其他特定模型。`;
+    systemPrompt += `\n\n[系统信息] 你是 AgentEvo 平台的智能助手，底层由 ${modelName} 模型驱动。如果用户询问你的身份或模型，请如实告知以上信息，不要声称自己是 Claude、GPT 或其他特定模型。`;
 
     // Phase 4: 设置 memory_tool 的当前用户上下文
     if (enableMemory) {
@@ -1977,7 +2002,16 @@ export async function chatWithGraph(userId, session_id, userMessage, image, syst
 
             const assistantMessageId = saveMessage(userId, session_id, "assistant", fullText);
             // Phase 5: finish trace (direct answer path)
+            const directTrace = traceCollector.getTrace(traceId);
             traceCollector.finishTrace(traceId, modelName, { messageId: assistantMessageId });
+
+            // Phase 6a G1: 在线评估（异步采样，不阻塞 SSE）
+            new OnlineEvaluator().maybeEvaluate({
+                userId, sessionId: session_id, messageId: assistantMessageId,
+                userInput: normalizedUserMessage, assistantText: fullText,
+                toolCallNames: [],
+            });
+
             // 优先使用真实 API usage，fallback 到 CJK-aware 估算
             const dMetrics = directUsage && directUsage.total_tokens > 0
                 ? {
@@ -2089,7 +2123,17 @@ export async function chatWithGraph(userId, session_id, userMessage, image, syst
 
         const assistantMessageId = saveMessage(userId, session_id, "assistant", fullText);
         // Phase 5: finish trace (graph path)
+        const graphTrace = traceCollector.getTrace(traceId);
+        const graphTraceToolCount = graphTrace?.toolCallCount || 0;
+        const graphTracePath = graphTrace?.agentTraversalPath || [];
         traceCollector.finishTrace(traceId, modelName, { messageId: assistantMessageId });
+
+        // Phase 6a G1: 在线评估（异步采样，不阻塞 SSE）
+        new OnlineEvaluator().maybeEvaluate({
+            userId, sessionId: session_id, messageId: assistantMessageId,
+            userInput: inputForAgent, assistantText: fullText,
+            toolCallNames: graphTracePath.filter(t => !["router","synthesizer"].includes(t)),
+        });
         // 优先使用 State 中累加的真实 API token usage，fallback 到 CJK-aware 估算
         const accUsage = checkpointState?.values?.tokenUsage;
         const gMetrics = (accUsage && accUsage.total_tokens > 0)

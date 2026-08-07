@@ -33,7 +33,7 @@ export async function connectToMCPServer(config) {
     });
 
     const client = new Client(
-        { name: "ai-chat", version: "1.0.0" },
+        { name: "agent-evo", version: "1.0.0" },
         {
             capabilities: {
                 tools: {},

@@ -361,6 +361,9 @@ export default function SettingsModal() {
                     <MemoryPanel />
                 </div>
 
+                {/* ── Phase 6a G4: Agent 调优 ── */}
+                <AgentTuningSection />
+
                 <div className="mt-6 flex justify-between">
                     <button
                         type="button"
@@ -378,6 +381,267 @@ export default function SettingsModal() {
                     </button>
                 </div>
             </div>
+        </div>
+    );
+}
+
+// ── Phase 6a G4: Agent 调优面板 ──
+
+function AgentTuningSection() {
+    const agentConfigs = useChatStore((s) => s.agentConfigs);
+    const agentConfigVersions = useChatStore((s) => s.agentConfigVersions);
+    const fetchAgentConfigs = useChatStore((s) => s.fetchAgentConfigs);
+    const updateAgentConfig = useChatStore((s) => s.updateAgentConfig);
+    const fetchAgentConfigVersions = useChatStore((s) => s.fetchAgentConfigVersions);
+    const rollbackAgentConfig = useChatStore((s) => s.rollbackAgentConfig);
+    const renameAgentConfigVersion = useChatStore((s) => s.renameAgentConfigVersion);
+    const deleteAgentConfigVersion = useChatStore((s) => s.deleteAgentConfigVersion);
+    const [expanded, setExpanded] = useState(false);
+    const [editing, setEditing] = useState(null); // { key, value }
+    const [saving, setSaving] = useState(false);
+    const [showVersions, setShowVersions] = useState(false);
+    const [rollingBack, setRollingBack] = useState(null); // version id being rolled back
+    const [editingLabelId, setEditingLabelId] = useState(null); // version id being renamed
+    const [labelValue, setLabelValue] = useState("");
+    const loaded = useRef(false);
+
+    useEffect(() => {
+        if (!loaded.current) {
+            loaded.current = true;
+            fetchAgentConfigs();
+        }
+    }, []);
+
+    const handleSave = async (key, value) => {
+        setSaving(true);
+        await updateAgentConfig(key, value);
+        setEditing(null);
+        setSaving(false);
+    };
+
+    // 分类显示配置项
+    const toolConfigs = agentConfigs.filter(c => c.key.startsWith("tool."));
+    const agentConfigs_ = agentConfigs.filter(c => c.key.startsWith("agent."));
+    const memoryConfigs = agentConfigs.filter(c => c.key.startsWith("memory."));
+
+    return (
+        <div className="mt-5 space-y-3 border-t border-[var(--panel-border)] pt-4">
+            <button
+                type="button"
+                onClick={() => setExpanded(!expanded)}
+                className="flex w-full items-center justify-between text-sm font-semibold text-[var(--text-main)]"
+            >
+                <span>⚙️ Agent 调优 {agentConfigs.length > 0 ? `(${agentConfigs.length})` : ""}</span>
+                <span className="text-xs text-[var(--text-muted)]">{expanded ? "收起 ▲" : "展开 ▼"}</span>
+            </button>
+
+            {expanded && (
+                <div className="space-y-4 text-xs">
+                    {agentConfigs.length === 0 && (
+                        <p className="text-[var(--text-muted)]">加载中...</p>
+                    )}
+
+                    {/* 工具描述 */}
+                    {toolConfigs.length > 0 && (
+                        <div>
+                            <p className="mb-2 font-semibold text-[var(--text-main)]">🔧 工具描述</p>
+                            {toolConfigs.map((c) => (
+                                <ConfigRow key={c.key} config={c} editing={editing} setEditing={setEditing} saving={saving} onSave={handleSave} />
+                            ))}
+                        </div>
+                    )}
+
+                    {/* Agent 指令 */}
+                    {agentConfigs_.length > 0 && (
+                        <div>
+                            <p className="mb-2 font-semibold text-[var(--text-main)]">🤖 Agent 指令</p>
+                            {agentConfigs_.map((c) => (
+                                <ConfigRow key={c.key} config={c} editing={editing} setEditing={setEditing} saving={saving} onSave={handleSave} />
+                            ))}
+                        </div>
+                    )}
+
+                    {/* 记忆参数 */}
+                    {memoryConfigs.length > 0 && (
+                        <div>
+                            <p className="mb-2 font-semibold text-[var(--text-main)]">🧠 记忆策略</p>
+                            {memoryConfigs.map((c) => (
+                                <ConfigRow key={c.key} config={c} editing={editing} setEditing={setEditing} saving={saving} onSave={handleSave} numeric />
+                            ))}
+                        </div>
+                    )}
+
+                    {/* G5: 配置版本历史 */}
+                    <div className="border-t border-[var(--panel-border)] pt-3">
+                        <button
+                            type="button"
+                            onClick={() => {
+                                if (!showVersions) fetchAgentConfigVersions();
+                                setShowVersions(!showVersions);
+                            }}
+                            className="flex w-full items-center justify-between text-xs font-semibold text-[var(--text-main)]"
+                        >
+                            <span>📋 版本历史</span>
+                            <span className="text-[var(--text-muted)]">{showVersions ? "收起 ▲" : "展开 ▼"}</span>
+                        </button>
+
+                        {showVersions && (
+                            <div className="mt-2 max-h-48 overflow-auto rounded-lg border border-[var(--panel-border)] bg-[var(--panel-bg)]">
+                                {agentConfigVersions.length === 0 && (
+                                    <p className="px-3 py-2 text-[var(--text-muted)]">暂无版本记录（修改配置后自动生成）</p>
+                                )}
+                                {agentConfigVersions.map((v) => (
+                                    <div
+                                        key={v.id}
+                                        className="flex items-center justify-between border-b border-[var(--panel-border)] px-3 py-2 last:border-b-0"
+                                    >
+                                        <div className="flex flex-col gap-0.5 min-w-0 flex-1">
+                                            <div className="flex items-center gap-1">
+                                                <span className="font-mono text-[11px] text-[var(--text-main)]">
+                                                    v{v.id}
+                                                </span>
+                                                {v.source === "rollback" && (
+                                                    <span className="rounded bg-amber-100 px-1 text-[10px] text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
+                                                        回滚
+                                                    </span>
+                                                )}
+                                            </div>
+                                            {editingLabelId === v.id ? (
+                                                <input
+                                                    type="text"
+                                                    value={labelValue}
+                                                    onChange={(e) => setLabelValue(e.target.value)}
+                                                    onKeyDown={async (e) => {
+                                                        if (e.key === "Enter") {
+                                                            e.preventDefault();
+                                                            await renameAgentConfigVersion(v.id, labelValue.trim() || null);
+                                                            setEditingLabelId(null);
+                                                        } else if (e.key === "Escape") {
+                                                            setEditingLabelId(null);
+                                                        }
+                                                    }}
+                                                    onBlur={async () => {
+                                                        await renameAgentConfigVersion(v.id, labelValue.trim() || null);
+                                                        setEditingLabelId(null);
+                                                    }}
+                                                    placeholder="输入标签名..."
+                                                    className="w-full rounded border border-[var(--brand)] bg-[var(--panel-bg)] px-1 py-0.5 text-[10px] text-[var(--text-main)] outline-none"
+                                                    autoFocus
+                                                />
+                                            ) : (
+                                                <span className="text-[10px] text-[var(--text-muted)]">
+                                                    {v.label || v.created_at}
+                                                </span>
+                                            )}
+                                        </div>
+                                        <div className="flex items-center gap-1 ml-2 shrink-0">
+                                            <button
+                                                type="button"
+                                                title="重命名"
+                                                onClick={() => {
+                                                    setEditingLabelId(v.id);
+                                                    setLabelValue(v.label || "");
+                                                }}
+                                                className="rounded p-1 text-[10px] text-[var(--text-muted)] transition hover:bg-[var(--panel-border)] hover:text-[var(--text-main)]"
+                                            >
+                                                ✏️
+                                            </button>
+                                            <button
+                                                type="button"
+                                                title="删除"
+                                                onClick={async () => {
+                                                    if (!window.confirm(`确认删除版本 v${v.id}${v.label ? ` (${v.label})` : ""}？此操作不可撤销。`)) return;
+                                                    await deleteAgentConfigVersion(v.id);
+                                                }}
+                                                className="rounded p-1 text-[10px] text-[var(--text-muted)] transition hover:bg-red-50 hover:text-red-500 dark:hover:bg-red-900/20"
+                                            >
+                                                🗑️
+                                            </button>
+                                            <button
+                                                type="button"
+                                                disabled={rollingBack === v.id}
+                                                onClick={async () => {
+                                                    setRollingBack(v.id);
+                                                    await rollbackAgentConfig(v.id);
+                                                    setRollingBack(null);
+                                                }}
+                                                className="rounded-md bg-[var(--panel-soft)] px-2 py-1 text-[10px] font-medium text-[var(--brand)] transition hover:bg-[var(--panel-border)] disabled:opacity-50"
+                                            >
+                                                {rollingBack === v.id ? "恢复中..." : "恢复此版本"}
+                                            </button>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
+function ConfigRow({ config, editing, setEditing, saving, onSave, numeric }) {
+    const isEditing = editing?.key === config.key;
+    const label = config.key.replace(/^(tool|agent|memory)\./, "").replace(/\./g, " › ");
+
+    return (
+        <div className="mb-2 rounded-lg border border-[var(--panel-border)] bg-[var(--panel-bg)] p-2">
+            <div className="flex items-start justify-between gap-2">
+                <span className="font-mono text-[var(--text-main)] break-all">{label}</span>
+                {!isEditing && (
+                    <button
+                        type="button"
+                        onClick={() => setEditing({ key: config.key, value: config.value })}
+                        className="shrink-0 text-[var(--text-muted)] hover:text-[var(--text-main)]"
+                    >
+                        ✏️
+                    </button>
+                )}
+            </div>
+            {isEditing ? (
+                <div className="mt-2 space-y-2">
+                    {numeric ? (
+                        <input
+                            type="number"
+                            step="0.05"
+                            min="0"
+                            max="1"
+                            value={editing.value}
+                            onChange={(e) => setEditing({ ...editing, value: e.target.value })}
+                            className="w-full rounded border border-[var(--panel-border)] bg-[var(--bg)] px-2 py-1 text-xs text-[var(--text-main)]"
+                            autoFocus
+                        />
+                    ) : (
+                        <textarea
+                            value={editing.value}
+                            onChange={(e) => setEditing({ ...editing, value: e.target.value })}
+                            className="w-full rounded border border-[var(--panel-border)] bg-[var(--bg)] px-2 py-1 text-xs text-[var(--text-main)]"
+                            rows={3}
+                            autoFocus
+                        />
+                    )}
+                    <div className="flex gap-2">
+                        <button
+                            type="button"
+                            onClick={() => onSave(config.key, editing.value)}
+                            disabled={saving}
+                            className="rounded bg-[#111827] px-3 py-1 text-xs text-white hover:bg-[#0b1220] disabled:opacity-50"
+                        >
+                            {saving ? "保存中..." : "保存"}
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setEditing(null)}
+                            className="rounded border border-[var(--panel-border)] px-3 py-1 text-xs text-[var(--text-muted)]"
+                        >
+                            取消
+                        </button>
+                    </div>
+                </div>
+            ) : (
+                <p className="mt-1 text-[var(--text-muted)] truncate">{config.value || "(空)"}</p>
+            )}
         </div>
     );
 }

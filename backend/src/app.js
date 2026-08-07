@@ -22,6 +22,8 @@ import {
     createBranchSession,
     getSessionById,
     getRecentObservability,
+    getRecentTraces,
+    getTraceById,
     removeMessagePair,
     saveFeedback,
     getFeedbackByMessage,
@@ -602,6 +604,77 @@ app.get("/observability/recent", requireAuth, (req, res) => {
     });
 });
 
+// GET /observability/metrics?window=7d|30d|all
+app.get("/observability/metrics", requireAuth, (req, res) => {
+    try {
+        const window = ["7d", "30d", "all"].includes(req.query?.window)
+            ? req.query.window
+            : "7d";
+        const report = metricsAggregator.getFullReport(req.user.id, window);
+        return res.json({ ok: true, ...report });
+    } catch (err) {
+        console.error("[observability/metrics] GET failed:", err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
+// GET /observability/traces?limit=30 — Phase 6b G9: Trace 列表
+app.get("/observability/traces", requireAuth, (req, res) => {
+    try {
+        const limit = Math.max(1, Math.min(200, Number(req.query?.limit) || 30));
+        const rows = getRecentTraces(req.user.id, limit);
+        const traces = rows.map((r) => ({
+            trace_id: r.trace_id,
+            trace_type: r.trace_type,
+            agent_traversal_path: (() => {
+                try { return JSON.parse(r.agent_traversal_path || "[]"); } catch { return []; }
+            })(),
+            tool_call_count: r.tool_call_count,
+            error_count: r.error_count,
+            total_latency_ms: r.total_latency_ms,
+            model: r.model,
+            created_at: r.created_at ? new Date(r.created_at + "Z").toISOString() : null,
+        }));
+        return res.json({ ok: true, traces, total: traces.length });
+    } catch (err) {
+        console.error("[observability/traces] GET failed:", err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
+// GET /observability/traces/:traceId — Phase 6b G9: Trace 详情（含完整 Span 树）
+app.get("/observability/traces/:traceId", requireAuth, (req, res) => {
+    try {
+        const trace = getTraceById(req.params.traceId);
+        if (!trace) {
+            return res.status(404).json({ ok: false, message: "trace not found" });
+        }
+        const rootSpan = (() => {
+            try { return JSON.parse(trace.root_span || "{}"); } catch { return {}; }
+        })();
+        const agentTraversalPath = (() => {
+            try { return JSON.parse(trace.agent_traversal_path || "[]"); } catch { return []; }
+        })();
+        return res.json({
+            ok: true,
+            trace: {
+                trace_id: trace.trace_id,
+                trace_type: trace.trace_type,
+                total_latency_ms: trace.total_latency_ms,
+                tool_call_count: trace.tool_call_count,
+                error_count: trace.error_count,
+                model: trace.model,
+                agent_traversal_path: agentTraversalPath,
+                root_span: rootSpan,
+                created_at: trace.created_at ? new Date(trace.created_at + "Z").toISOString() : null,
+            },
+        });
+    } catch (err) {
+        console.error("[observability/traces/:id] GET failed:", err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
 // ── Phase 5: 评估系统路由 ──
 app.use("/eval", requireAuth, evalRoutes);
 
@@ -643,6 +716,116 @@ app.post("/chat/feedback", requireAuth, (req, res) => {
         res.json({ ok: true, rating });
     } catch (err) {
         console.error(`[feedback] save failed:`, err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
+// ── Phase 6: Agent 配置管理 ──
+
+import { agentConfig } from "./services/agentConfig.js";
+import { metricsAggregator } from "./trace/metrics.js";
+
+app.get("/agent-config", requireAuth, (req, res) => {
+    try {
+        const all = agentConfig.getAll();
+        return res.json({ ok: true, configs: all });
+    } catch (err) {
+        console.error(`[agent-config] GET failed:`, err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
+app.put("/agent-config", requireAuth, (req, res) => {
+    const { key, value } = req.body || {};
+    if (!key || value === undefined) {
+        return res.status(400).json({ ok: false, message: "key and value are required" });
+    }
+    try {
+        const ok = agentConfig.set(String(key), String(value));
+        return res.json({ ok, config: { key: String(key), value: String(value) } });
+    } catch (err) {
+        console.error(`[agent-config] PUT failed:`, err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
+// ── Phase 6b G5: Agent 配置版本管理 ──
+
+app.get("/agent-config/versions", requireAuth, (req, res) => {
+    try {
+        const versions = agentConfig.listVersions(20);
+        return res.json({ ok: true, versions });
+    } catch (err) {
+        console.error(`[agent-config/versions] GET failed:`, err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
+app.get("/agent-config/versions/:id", requireAuth, (req, res) => {
+    try {
+        const version = agentConfig.getVersion(Number(req.params.id));
+        if (!version) {
+            return res.status(404).json({ ok: false, message: "Version not found" });
+        }
+        return res.json({ ok: true, version });
+    } catch (err) {
+        console.error(`[agent-config/versions/:id] GET failed:`, err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
+app.post("/agent-config/rollback", requireAuth, (req, res) => {
+    const { versionId } = req.body || {};
+    if (!versionId) {
+        return res.status(400).json({ ok: false, message: "versionId is required" });
+    }
+    try {
+        const ok = agentConfig.restoreVersion(Number(versionId));
+        if (!ok) {
+            return res.status(400).json({ ok: false, message: "Rollback failed — version not found or empty snapshot" });
+        }
+        // 回滚后返回当前配置状态
+        const all = agentConfig.getAll();
+        return res.json({ ok: true, configs: all });
+    } catch (err) {
+        console.error(`[agent-config/rollback] POST failed:`, err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
+// PATCH /agent-config/versions/:id/label — 重命名版本标签
+app.patch("/agent-config/versions/:id/label", requireAuth, (req, res) => {
+    const id = Number(req.params.id);
+    const { label } = req.body || {};
+    if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ ok: false, message: "Invalid version id" });
+    }
+    try {
+        const ok = agentConfig.renameVersion(id, label || null);
+        if (!ok) {
+            return res.status(404).json({ ok: false, message: "Version not found" });
+        }
+        return res.json({ ok: true });
+    } catch (err) {
+        console.error(`[agent-config/versions/:id/label] PATCH failed:`, err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
+// DELETE /agent-config/versions/:id — 删除版本记录
+app.delete("/agent-config/versions/:id", requireAuth, (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ ok: false, message: "Invalid version id" });
+    }
+    try {
+        const ok = agentConfig.removeVersion(id);
+        if (!ok) {
+            return res.status(404).json({ ok: false, message: "Version not found" });
+        }
+        return res.json({ ok: true });
+    } catch (err) {
+        console.error(`[agent-config/versions/:id] DELETE failed:`, err.message);
         res.status(500).json({ ok: false, message: err.message });
     }
 });

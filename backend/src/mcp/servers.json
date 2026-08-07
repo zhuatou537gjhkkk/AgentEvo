@@ -4,7 +4,7 @@
       "name": "local-builtin",
       "type": "builtin",
       "enabled": true,
-      "description": "AI-Chat 内置工具（系统时间、数据库统计、联网搜索、知识库检索、任务计划、用户提问）"
+      "description": "AgentEvo 内置工具（系统时间、数据库统计、联网搜索、知识库检索、任务计划、用户提问）"
     },
     {
       "name": "filesystem-example",
@@ -19,7 +19,7 @@
       "description": "MCP 文件系统工具（示例，需安装 npx）"
     },
     {
-      "name": "ai-chat-local",
+      "name": "agent-evo-local",
       "type": "mcp",
       "enabled": true,
       "command": "node",
@@ -35,7 +35,7 @@
       "args": [
         "-y",
         "@modelcontextprotocol/server-filesystem",
-        "d:/AI-Chat"
+        "d:/AgentEvo"
       ]
     }
   ]

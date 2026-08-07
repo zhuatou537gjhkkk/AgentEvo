@@ -1,5 +1,5 @@
 /**
- * MCP Server 实现 — 将 AI-Chat 现有工具对外暴露为 MCP 协议服务
+ * MCP Server 实现 — 将 AgentEvo 现有工具对外暴露为 MCP 协议服务
  *
  * Phase 3: 外部 AI 客户端可通过 Stdio transport 发现并调用我们的工具。
  * 对应 Hello-Agents: Ch10 04_MCPTransport.py (MCPTool server_command 模式)
@@ -20,7 +20,7 @@ import { agentTools } from "./tools.js";
  */
 export function createMCPServer() {
     const server = new Server(
-        { name: "ai-chat-tools", version: "1.0.0" },
+        { name: "agent-evo-tools", version: "1.0.0" },
         {
             capabilities: {
                 tools: {},
@@ -97,6 +97,6 @@ export async function startMCPServer() {
     const server = createMCPServer();
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.log("[mcp:server] AI-Chat MCP Server running (stdio)");
+    console.log("[mcp:server] AgentEvo MCP Server running (stdio)");
     return server;
 }

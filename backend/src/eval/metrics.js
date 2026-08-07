@@ -38,6 +38,7 @@ export function saveEvalRunScores({
     const dimensions = [
         { key: "correctness", score: scores.correctness },
         { key: "tool_usage", score: scores.tool_usage },
+        { key: "tool_quality", score: scores.tool_quality },
         { key: "conciseness", score: scores.conciseness },
         { key: "safety", score: scores.safety },
     ];
@@ -79,7 +80,7 @@ export function getRunSummary(runId) {
     }
 
     const testCaseIds = Object.keys(byTestCase);
-    const avgScores = { correctness: 0, tool_usage: 0, conciseness: 0, safety: 0 };
+    const avgScores = { correctness: 0, tool_usage: 0, tool_quality: 0, conciseness: 0, safety: 0 };
     let passed = 0;
     let failed = 0;
 
@@ -88,12 +89,14 @@ export function getRunSummary(runId) {
         const avg = (
             (dims.correctness || 0) +
             (dims.tool_usage || 0) +
+            (dims.tool_quality || 0) +
             (dims.conciseness || 0) +
             (dims.safety || 0)
-        ) / 4;
+        ) / 5;
 
         avgScores.correctness += dims.correctness || 0;
         avgScores.tool_usage += dims.tool_usage || 0;
+        avgScores.tool_quality += dims.tool_quality || 0;
         avgScores.conciseness += dims.conciseness || 0;
         avgScores.safety += dims.safety || 0;
 

@@ -52,6 +52,25 @@ let deleteFeedbackStmt = null;
 let selectFeedbackByMessageStmt = null;
 let selectFeedbackSummaryStmt = null;
 
+// ── Phase 6: Agent 配置系统 ──
+let selectAgentConfigStmt = null;
+let selectAllAgentConfigStmt = null;
+let upsertAgentConfigStmt = null;
+// G5: 版本管理
+let insertConfigVersionStmt = null;
+let selectConfigVersionsStmt = null;
+let selectConfigVersionByIdStmt = null;
+let updateConfigVersionLabelStmt = null;
+let deleteConfigVersionStmt = null;
+
+// ── Phase 6b G7: 评测集自动生成 ──
+let insertGeneratedTestCaseStmt = null;
+let selectGeneratedTestCasesStmt = null;
+let selectGeneratedTestCaseByIdStmt = null;
+let updateGeneratedTestCaseStmt = null;
+let deleteGeneratedTestCaseStmt = null;
+let selectGeneratedTestCaseIdsStmt = null;
+
 let defaultUserId = null;
 
 function hasTable(tableName) {
@@ -323,6 +342,65 @@ export function initDB() {
     ).run();
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_eval_feedback_msg ON eval_feedback(message_id)`).run();
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_eval_feedback_user ON eval_feedback(user_id)`).run();
+
+    // ── Phase 6: Agent 配置存储 ──
+    db.prepare(
+        `
+        CREATE TABLE IF NOT EXISTS agent_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            default_value TEXT,
+            description TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        `
+    ).run();
+
+    // ── Phase 6b G5: Agent 配置版本历史 ──
+    db.prepare(
+        `
+        CREATE TABLE IF NOT EXISTS agent_config_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'manual',
+            label TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        `
+    ).run();
+
+    // 迁移：为已有表补加 label 列（G5 版本重命名功能）
+    try {
+        db.prepare(`ALTER TABLE agent_config_versions ADD COLUMN label TEXT`).run();
+    } catch {
+        // 列已存在，忽略
+    }
+
+    // ── Phase 6b G7: 评测集自动生成 ──
+    db.prepare(
+        `
+        CREATE TABLE IF NOT EXISTS eval_test_cases (
+            id TEXT PRIMARY KEY,
+            category TEXT NOT NULL,
+            difficulty TEXT NOT NULL DEFAULT 'medium',
+            description TEXT,
+            input TEXT NOT NULL,
+            expected_behavior TEXT,
+            expected_tools TEXT DEFAULT '[]',
+            enable_web_search INTEGER DEFAULT 0,
+            code_checks TEXT,
+            generated INTEGER DEFAULT 1,
+            reviewed INTEGER DEFAULT 0,
+            source_seeds TEXT DEFAULT '[]',
+            gen_batch_id TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        `
+    ).run();
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_eval_test_cases_cat ON eval_test_cases(category)`).run();
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_eval_test_cases_reviewed ON eval_test_cases(reviewed)`).run();
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_eval_test_cases_batch ON eval_test_cases(gen_batch_id)`).run();
 
     if (!insertMessageStmt) {
         insertMessageStmt = db.prepare(
@@ -1042,6 +1120,162 @@ function ensureEvalStatements() {
     }
 }
 
+// ── Phase 6: Agent 配置 prepared statements ──
+
+function ensureAgentConfigStatements() {
+    if (!selectAgentConfigStmt) {
+        selectAgentConfigStmt = db.prepare(
+            `SELECT key, value, default_value, description, updated_at FROM agent_config WHERE key = ?`
+        );
+    }
+    if (!selectAllAgentConfigStmt) {
+        selectAllAgentConfigStmt = db.prepare(
+            `SELECT key, value, default_value, description, updated_at FROM agent_config ORDER BY key`
+        );
+    }
+    if (!upsertAgentConfigStmt) {
+        upsertAgentConfigStmt = db.prepare(
+            `INSERT INTO agent_config (key, value, default_value, description, updated_at)
+             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(key) DO UPDATE SET
+               value = excluded.value,
+               default_value = COALESCE(excluded.default_value, agent_config.default_value),
+               description = COALESCE(excluded.description, agent_config.description),
+               updated_at = CURRENT_TIMESTAMP`
+        );
+    }
+    // G5: 版本管理 statements
+    if (!insertConfigVersionStmt) {
+        insertConfigVersionStmt = db.prepare(
+            `INSERT INTO agent_config_versions (snapshot, source) VALUES (?, ?)`
+        );
+    }
+    if (!selectConfigVersionsStmt) {
+        selectConfigVersionsStmt = db.prepare(
+            `SELECT id, source, label, created_at FROM agent_config_versions ORDER BY id DESC LIMIT ?`
+        );
+    }
+    if (!selectConfigVersionByIdStmt) {
+        selectConfigVersionByIdStmt = db.prepare(
+            `SELECT id, snapshot, source, label, created_at FROM agent_config_versions WHERE id = ?`
+        );
+    }
+    if (!updateConfigVersionLabelStmt) {
+        updateConfigVersionLabelStmt = db.prepare(
+            `UPDATE agent_config_versions SET label = ? WHERE id = ?`
+        );
+    }
+    if (!deleteConfigVersionStmt) {
+        deleteConfigVersionStmt = db.prepare(
+            `DELETE FROM agent_config_versions WHERE id = ?`
+        );
+    }
+}
+
+/**
+ * 获取单个 Agent 配置项
+ * @param {string} key — 配置键名
+ * @returns {{key: string, value: string, default_value: string|null, description: string|null}|null}
+ */
+export function getAgentConfigValue(key) {
+    ensureAgentConfigStatements();
+    const row = selectAgentConfigStmt.get(String(key));
+    return row || null;
+}
+
+/**
+ * 获取所有 Agent 配置项
+ * @returns {Array<{key: string, value: string, default_value: string|null, description: string|null}>}
+ */
+export function getAllAgentConfigValues() {
+    ensureAgentConfigStatements();
+    return selectAllAgentConfigStmt.all();
+}
+
+/**
+ * 设置（插入或更新）一个 Agent 配置项
+ * @param {string} key
+ * @param {string} value
+ * @param {string} [defaultValue]
+ * @param {string} [description]
+ * @returns {boolean} 是否成功
+ */
+export function setAgentConfigValue(key, value, defaultValue = null, description = null) {
+    ensureAgentConfigStatements();
+    const result = upsertAgentConfigStmt.run(
+        String(key),
+        String(value),
+        defaultValue ? String(defaultValue) : null,
+        description ? String(description) : null
+    );
+    return result.changes > 0;
+}
+
+// ── Phase 6b G5: 配置版本管理 ──
+
+/**
+ * 保存当前全量配置快照
+ * @param {object} snapshot — { key: value, ... }
+ * @param {string} source — "manual" | "rollback"
+ * @returns {number} version id
+ */
+export function saveConfigSnapshot(snapshot, source = "manual") {
+    ensureAgentConfigStatements();
+    const json = JSON.stringify(snapshot);
+    const result = insertConfigVersionStmt.run(json, source);
+    return result.lastInsertRowid;
+}
+
+/**
+ * 列出最近的配置版本（不含 snapshot 内容，仅元信息）
+ * @param {number} limit — 最多返回条数
+ * @returns {Array<{id: number, source: string, created_at: string}>}
+ */
+export function listConfigVersions(limit = 20) {
+    ensureAgentConfigStatements();
+    return selectConfigVersionsStmt.all(limit);
+}
+
+/**
+ * 获取某个版本的完整快照
+ * @param {number} id — version id
+ * @returns {{id: number, snapshot: object, source: string, created_at: string}|null}
+ */
+export function getConfigVersion(id) {
+    ensureAgentConfigStatements();
+    const row = selectConfigVersionByIdStmt.get(id);
+    if (!row) return null;
+    try {
+        row.snapshot = JSON.parse(row.snapshot);
+    } catch {
+        row.snapshot = {};
+    }
+    return row;
+}
+
+/**
+ * 更新版本标签（重命名）
+ * @param {number} id — version id
+ * @param {string} label — 新标签名
+ * @returns {boolean}
+ */
+export function updateConfigVersionLabel(id, label) {
+    ensureAgentConfigStatements();
+    const result = updateConfigVersionLabelStmt.run(label || null, id);
+    return result.changes > 0;
+}
+
+/**
+ * 删除某个版本
+ * @param {number} id — version id
+ * @returns {boolean}
+ */
+export function deleteConfigVersion(id) {
+    ensureAgentConfigStatements();
+    const result = deleteConfigVersionStmt.run(id);
+    return result.changes > 0;
+}
+
 /**
  * 添加一条记忆
  * @param {number} userId
@@ -1556,6 +1790,298 @@ export function getFeedbackSummary(userId) {
         result.total += row.count;
     }
     return result;
+}
+
+// ── Phase 6b G6: Metric 聚合查询 ──
+
+/**
+ * 获取时间窗口内的全部延迟数据（用于百分位计算）
+ * @param {string} cutoff — ISO 时间字符串
+ * @returns {Array<{latency_ms: number, created_at: string}>}
+ */
+export function getMetricsLatencies(userId, cutoff) {
+    const rows = db.prepare(
+        `SELECT mm.latency_ms, mm.created_at
+         FROM message_metrics mm
+         JOIN messages m ON m.id = mm.message_id
+         JOIN sessions s ON s.id = m.session_id
+         WHERE s.user_id = ? AND mm.created_at >= ?
+         ORDER BY mm.created_at`
+    ).all(userId, cutoff);
+    return rows;
+}
+
+/**
+ * 获取时间窗口内的全部 token 数据
+ * @param {string} cutoff — ISO 时间字符串
+ * @returns {Array<{prompt_tokens: number, completion_tokens: number, total_tokens: number, model: string, created_at: string}>}
+ */
+export function getMetricsTokens(userId, cutoff) {
+    const rows = db.prepare(
+        `SELECT mm.prompt_tokens, mm.completion_tokens, mm.total_tokens, mm.model, mm.created_at
+         FROM message_metrics mm
+         JOIN messages m ON m.id = mm.message_id
+         JOIN sessions s ON s.id = m.session_id
+         WHERE s.user_id = ? AND mm.created_at >= ?
+         ORDER BY mm.created_at`
+    ).all(userId, cutoff);
+    return rows;
+}
+
+/**
+ * 获取时间窗口内的 Trace 统计数据（按用户过滤）
+ * @param {number} userId
+ * @param {string} cutoff — ISO 时间字符串
+ * @returns {Array<{tool_call_count: number, error_count: number, agent_traversal_path: string, total_latency_ms: number, trace_type: string, created_at: string}>}
+ */
+export function getMetricsTraces(userId, cutoff) {
+    const rows = db.prepare(
+        `SELECT tool_call_count, error_count, agent_traversal_path, total_latency_ms, trace_type, created_at
+         FROM eval_traces WHERE user_id = ? AND created_at >= ? ORDER BY created_at`
+    ).all(userId, cutoff);
+    return rows;
+}
+
+/**
+ * 获取时间窗口内的每日聚合数据
+ * @param {string} cutoff — ISO 时间字符串
+ * @returns {Array<{day: string, count: number, avg_latency: number|null, avg_tokens: number|null}>}
+ */
+export function getMetricsDailyBuckets(userId, cutoff) {
+    const rows = db.prepare(
+        `SELECT DATE(mm.created_at) as day,
+                COUNT(*) as count,
+                AVG(mm.latency_ms) as avg_latency,
+                AVG(mm.total_tokens) as avg_tokens
+         FROM message_metrics mm
+         JOIN messages m ON m.id = mm.message_id
+         JOIN sessions s ON s.id = m.session_id
+         WHERE s.user_id = ? AND mm.created_at >= ?
+         GROUP BY DATE(mm.created_at) ORDER BY day`
+    ).all(userId, cutoff);
+    return rows;
+}
+
+// ══════════════════════════════════════════════════════════
+// Phase 6b G7: 评测集自动生成 — 生成用例 CRUD
+// ══════════════════════════════════════════════════════════
+
+/**
+ * 保存一条生成的测试用例
+ * @param {object} tc
+ * @param {string} tc.id
+ * @param {string} tc.category
+ * @param {string} tc.difficulty
+ * @param {string} tc.description
+ * @param {string} tc.input
+ * @param {string} tc.expectedBehavior
+ * @param {string[]} tc.expectedTools
+ * @param {boolean} [tc.enableWebSearch]
+ * @param {object[]} [tc.codeChecks]
+ * @param {number} [tc.generated] — 1=LLM生成, 0=手动
+ * @param {number} [tc.reviewed] — 0=待审核, 1=已审核
+ * @param {string[]} [tc.sourceSeeds]
+ * @param {string} [tc.genBatchId]
+ */
+export function insertGeneratedTestCase({
+    id,
+    category,
+    difficulty = "medium",
+    description = "",
+    input,
+    expectedBehavior = "",
+    expectedTools = [],
+    enableWebSearch = 0,
+    codeChecks = null,
+    generated = 1,
+    reviewed = 0,
+    sourceSeeds = [],
+    genBatchId = null,
+}) {
+    if (!insertGeneratedTestCaseStmt) {
+        insertGeneratedTestCaseStmt = db.prepare(
+            `INSERT OR REPLACE INTO eval_test_cases
+                (id, category, difficulty, description, input, expected_behavior,
+                 expected_tools, enable_web_search, code_checks,
+                 generated, reviewed, source_seeds, gen_batch_id, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
+        );
+    }
+    return insertGeneratedTestCaseStmt.run(
+        id,
+        category,
+        difficulty,
+        description,
+        input,
+        expectedBehavior,
+        JSON.stringify(expectedTools),
+        enableWebSearch ? 1 : 0,
+        codeChecks ? JSON.stringify(codeChecks) : null,
+        generated ? 1 : 0,
+        reviewed ? 1 : 0,
+        JSON.stringify(sourceSeeds),
+        genBatchId,
+    );
+}
+
+/**
+ * 查询生成的测试用例
+ * @param {object} filters
+ * @param {string} [filters.category]
+ * @param {number|null} [filters.reviewed] — 0=待审核, 1=已审核, null=全部
+ * @param {number} [filters.page] — 分页页码 (1-based)
+ * @param {number} [filters.pageSize] — 每页条数
+ * @returns {object[]}
+ */
+export function getGeneratedTestCases({
+    category = null,
+    reviewed = null,
+    page = 1,
+    pageSize = 50,
+} = {}) {
+    let where = [];
+    let params = [];
+
+    if (category) {
+        where.push("category = ?");
+        params.push(category);
+    }
+    if (reviewed !== null && reviewed !== undefined) {
+        where.push("reviewed = ?");
+        params.push(reviewed ? 1 : 0);
+    }
+
+    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    const offset = (page - 1) * pageSize;
+
+    const rows = db.prepare(
+        `SELECT * FROM eval_test_cases ${whereClause}
+         ORDER BY created_at DESC LIMIT ? OFFSET ?`
+    ).all(...params, pageSize, offset);
+
+    return rows.map(r => ({
+        ...r,
+        expected_tools: safeJsonParse(r.expected_tools, []),
+        code_checks: safeJsonParse(r.code_checks, null),
+        source_seeds: safeJsonParse(r.source_seeds, []),
+    }));
+}
+
+/**
+ * 获取单条生成用例
+ * @param {string} id
+ * @returns {object|null}
+ */
+export function getGeneratedTestCaseById(id) {
+    if (!selectGeneratedTestCaseByIdStmt) {
+        selectGeneratedTestCaseByIdStmt = db.prepare(
+            "SELECT * FROM eval_test_cases WHERE id = ?"
+        );
+    }
+    const row = selectGeneratedTestCaseByIdStmt.get(id);
+    if (!row) return null;
+    return {
+        ...row,
+        expected_tools: safeJsonParse(row.expected_tools, []),
+        code_checks: safeJsonParse(row.code_checks, null),
+        source_seeds: safeJsonParse(row.source_seeds, []),
+    };
+}
+
+/**
+ * 更新一条生成用例（编辑/审核）
+ * @param {string} id
+ * @param {object} updates
+ * @returns {boolean}
+ */
+export function updateGeneratedTestCase(id, updates = {}) {
+    if (!updateGeneratedTestCaseStmt) {
+        updateGeneratedTestCaseStmt = db.prepare(
+            `UPDATE eval_test_cases
+             SET input = COALESCE(?, input),
+                 expected_behavior = COALESCE(?, expected_behavior),
+                 expected_tools = COALESCE(?, expected_tools),
+                 difficulty = COALESCE(?, difficulty),
+                 category = COALESCE(?, category),
+                 description = COALESCE(?, description),
+                 reviewed = COALESCE(?, reviewed),
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?`
+        );
+    }
+    const result = updateGeneratedTestCaseStmt.run(
+        updates.input ?? null,
+        updates.expectedBehavior ?? null,
+        updates.expectedTools ? JSON.stringify(updates.expectedTools) : null,
+        updates.difficulty ?? null,
+        updates.category ?? null,
+        updates.description ?? null,
+        updates.reviewed !== undefined ? (updates.reviewed ? 1 : 0) : null,
+        id,
+    );
+    return result.changes > 0;
+}
+
+/**
+ * 批量审核生成用例
+ * @param {string[]} ids
+ * @returns {number} 实际更新的行数
+ */
+export function approveGeneratedTestCases(ids) {
+    if (!ids || ids.length === 0) return 0;
+    const placeholders = ids.map(() => "?").join(",");
+    const result = db.prepare(
+        `UPDATE eval_test_cases SET reviewed = 1, updated_at = CURRENT_TIMESTAMP WHERE id IN (${placeholders})`
+    ).run(...ids);
+    return result.changes;
+}
+
+/**
+ * 删除一条生成用例
+ * @param {string} id
+ * @returns {boolean}
+ */
+export function deleteGeneratedTestCase(id) {
+    if (!deleteGeneratedTestCaseStmt) {
+        deleteGeneratedTestCaseStmt = db.prepare(
+            "DELETE FROM eval_test_cases WHERE id = ?"
+        );
+    }
+    const result = deleteGeneratedTestCaseStmt.run(id);
+    return result.changes > 0;
+}
+
+/**
+ * 获取所有生成用例的 ID 列表
+ * @param {object} filters
+ * @param {string} [filters.category]
+ * @param {number|null} [filters.reviewed]
+ * @returns {string[]}
+ */
+export function getGeneratedTestCaseIds({ category = null, reviewed = null } = {}) {
+    let where = [];
+    let params = [];
+
+    if (category) {
+        where.push("category = ?");
+        params.push(category);
+    }
+    if (reviewed !== null && reviewed !== undefined) {
+        where.push("reviewed = ?");
+        params.push(reviewed ? 1 : 0);
+    }
+
+    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    const rows = db.prepare(
+        `SELECT id FROM eval_test_cases ${whereClause} ORDER BY created_at DESC`
+    ).all(...params);
+    return rows.map(r => r.id);
+}
+
+/** 安全 JSON 解析 */
+function safeJsonParse(str, fallback) {
+    if (!str) return fallback;
+    try { return JSON.parse(str); } catch { return fallback; }
 }
 
 export default db;

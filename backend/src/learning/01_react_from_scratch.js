@@ -2,7 +2,7 @@
  * 🧪 练习 1：从零实现 ReAct 循环
  *
  * 对应 Hello-Agents: chapter4/ReAct.py + chapter7/my_react_agent.py
- * 对应 AI-Chat:    chat.js → AgentExecutor.streamEvents("v2")
+ * 对应 AgentEvo:    chat.js → AgentExecutor.streamEvents("v2")
  *
  * 目标：理解 LangChain AgentExecutor 内部到底在做什么
  *
@@ -21,7 +21,7 @@ import { ChatOpenAI } from "@langchain/openai";
 //   2. {question}   — 用户的原始问题
 //   3. {history}    — 之前步骤的 Action + Observation
 //
-// AI-Chat 等价物: buildPrompt() → ChatPromptTemplate.fromMessages([
+// AgentEvo 等价物: buildPrompt() → ChatPromptTemplate.fromMessages([
 //   ["system", systemInstruction],          ← 工具描述 + 行为指令
 //   MessagesPlaceholder("chat_history"),    ← 对话历史
 //   ["user", "{input}"],                   ← 用户问题
@@ -29,7 +29,7 @@ import { ChatOpenAI } from "@langchain/openai";
 // ])
 //
 // 区别: Hello-Agents 全部塞进一个 user message
-//       AI-Chat 用 LangChain 的 MessagesPlaceholder 管理
+//       AgentEvo 用 LangChain 的 MessagesPlaceholder 管理
 
 const REACT_PROMPT = `你是一个可以调用工具的 AI 助手。
 
@@ -58,7 +58,7 @@ Question: {question}
 //   - getTool(name) → func
 //   - getAvailableTools() → 格式化描述文本
 //
-// AI-Chat 等价物:
+// AgentEvo 等价物:
 //   - chat.js: agentTools 数组 (DynamicTool[])
 //   - LangChain 自动从 DynamicTool.name/.description 生成工具描述
 //   - LangChain 的 ToolCallingAgent 用 function call 而非文本解析
@@ -98,7 +98,7 @@ class ToolExecutor {
 //       4. 如果是 Finish → 返回答案
 //       5. 否则: 执行工具 → 记录 Observation → 回到循环
 //
-// AI-Chat 等价物:
+// AgentEvo 等价物:
 //   LangChain AgentExecutor 内部做同样的事，但你不可见
 //   区别: LangChain 用 function call (tool_calls) 而不是文本解析
 //   所以你不需要写正则，但你也不可控循环过程
@@ -124,7 +124,7 @@ async function reactLoop(llm, toolExecutor, question, maxSteps = 5) {
             ? response.content
             : response.content?.text || "";
 
-        // ③ 解析 Thought 和 Action (Hello-Agents 用正则，AI-Chat 用 function call)
+        // ③ 解析 Thought 和 Action (Hello-Agents 用正则，AgentEvo 用 function call)
         const thoughtMatch = text.match(/Thought:\s*(.*?)(?=\nAction:|$)/s);
         const actionMatch = text.match(/Action:\s*(.*)/s);
         const thought = thoughtMatch?.[1]?.trim() || "";
@@ -164,10 +164,10 @@ async function reactLoop(llm, toolExecutor, question, maxSteps = 5) {
 
 
 // ═══════════════════════════════════════════════════════
-// 知识点 4: 对比 — AI-Chat 怎么做同样的事
+// 知识点 4: 对比 — AgentEvo 怎么做同样的事
 // ═══════════════════════════════════════════════════════
 //
-// AI-Chat chat.js 等价代码:
+// AgentEvo chat.js 等价代码:
 //
 //   const agentExecutor = await getAgentExecutor(...);
 //   const eventStream = await agentExecutor.streamEvents(
@@ -182,7 +182,7 @@ async function reactLoop(llm, toolExecutor, question, maxSteps = 5) {
 //
 // 区别对照:
 //   ┌────────────────────┬───────────────────┬─────────────────────┐
-//   │ 步骤               │ Hello-Agents      │ AI-Chat (LangChain) │
+//   │ 步骤               │ Hello-Agents      │ AgentEvo (LangChain) │
 //   ├────────────────────┼───────────────────┼─────────────────────┤
 //   │ 循环控制           │ 自己写 while      │ AgentExecutor 内部  │
 //   │ 工具调用解析       │ 正则匹配文本      │ function call 协议  │
@@ -197,7 +197,7 @@ async function reactLoop(llm, toolExecutor, question, maxSteps = 5) {
 // ═══════════════════════════════════════════════════════
 
 async function main() {
-    // 用你 AI-Chat 的 LLM 配置
+    // 用你 AgentEvo 的 LLM 配置
     const llm = new ChatOpenAI({
         modelName: process.env.OPENAI_MODEL || process.env.QWEN_MODEL || "deepseek-v4-flash",
         temperature: 0,

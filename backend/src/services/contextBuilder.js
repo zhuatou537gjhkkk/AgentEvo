@@ -363,7 +363,7 @@ export class ContextBuilder {
 }
 
 /**
- * 创建适合 AI-Chat 的 ContextBuilder 实例
+ * 创建适合 AgentEvo 的 ContextBuilder 实例
  *
  * @param {object} memoryService - MemoryService 实例
  * @param {object} overrides - 覆盖默认配置

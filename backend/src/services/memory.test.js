@@ -256,14 +256,14 @@ describe('MemoryService', () => {
         });
 
         it('should extract "记住" marked info without truncating at commas', () => {
-            const text = '记住，我们的核心项目是 AI-Chat，技术栈是 React + Express + SQLite';
+            const text = '记住，我们的核心项目是 AgentEvo，技术栈是 React + Express + SQLite';
             const extracted = memory.extractFromConversation(text);
             expect(extracted).toBeGreaterThan(0);
             // 验证完整内容被保存（不应在逗号处截断）
-            const results = memory.search('AI-Chat');
+            const results = memory.search('AgentEvo');
             expect(results.length).toBeGreaterThan(0);
             const content = results[0].content;
-            expect(content).toContain('AI-Chat');
+            expect(content).toContain('AgentEvo');
             expect(content).toContain('React');
             expect(content).toContain('Express');
             expect(content).toContain('SQLite');

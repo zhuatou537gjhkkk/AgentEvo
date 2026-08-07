@@ -832,3 +832,68 @@ export async function consolidateMemories(fromType = 'working', toType = 'episod
     });
     return res.json();
 }
+
+// ── Phase 6a: Agent 配置管理 ──
+
+export async function fetchAgentConfig() {
+    const res = await request("/agent-config");
+    return res.json();
+}
+
+export async function updateAgentConfig(key, value) {
+    const res = await request("/agent-config", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key, value }),
+    });
+    return res.json();
+}
+
+export async function fetchAgentConfigVersions() {
+    const res = await request("/agent-config/versions");
+    return res.json();
+}
+
+export async function rollbackAgentConfig(versionId) {
+    const res = await request("/agent-config/rollback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ versionId }),
+    });
+    return res.json();
+}
+
+export async function renameAgentConfigVersion(id, label) {
+    const res = await request(`/agent-config/versions/${id}/label`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label }),
+    });
+    return res.json();
+}
+
+export async function deleteAgentConfigVersion(id) {
+    const res = await request(`/agent-config/versions/${id}`, {
+        method: "DELETE",
+    });
+    return res.json();
+}
+
+// ══════════════════════════════════════════════════════════
+// Phase 6b G9: 观测面板 API
+// ══════════════════════════════════════════════════════════
+
+export async function fetchTraces(limit = 30) {
+    const res = await request(`/observability/traces?limit=${limit}`);
+    return res.json();
+}
+
+export async function fetchTraceDetail(traceId) {
+    const res = await request(`/observability/traces/${encodeURIComponent(traceId)}`);
+    return res.json();
+}
+
+export async function fetchMetricsReport(window = "7d") {
+    const res = await request(`/observability/metrics?window=${window}`);
+    return res.json();
+}

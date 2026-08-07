@@ -499,7 +499,7 @@ describe('createChatContextBuilder()', () => {
         expect(builder).toBeInstanceOf(ContextBuilder);
     });
 
-    it('should use AI-Chat defaults (maxTokens=6000, reserveRatio=0.15, maxHistoryTurns=10)', () => {
+    it('should use AgentEvo defaults (maxTokens=6000, reserveRatio=0.15, maxHistoryTurns=10)', () => {
         const builder = createChatContextBuilder();
         expect(builder.config.maxTokens).toBe(6000);
         expect(builder.config.reserveRatio).toBe(0.15);

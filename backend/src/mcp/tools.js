@@ -4,6 +4,7 @@ import { getMessageStats } from "../db/index.js";
 import { queryKnowledgeBase } from "../rag/index.js";
 import { toolRegistry } from "./registry.js";
 import { MemoryService } from "../services/memory.js";
+import { agentConfig } from "../services/agentConfig.js";
 
 // ── User Question Broker ──────────────────────────────────────
 // 管理 Agent 向用户提问的 Promise/deferred 注册表。
@@ -836,3 +837,28 @@ export const agentTools = [
 // 本地工具注册后，chatGraph.js 和 chatUtils.js 可通过 toolRegistry 统一获取。
 // agentTools 导出继续保留，确保向后兼容（TOOL_REGISTRY_ENABLED=false 时使用）。
 toolRegistry.registerLocalTools(agentTools);
+
+// ── Phase 6a G4: 工具描述可配置 ──
+// 通过 Object.defineProperty getter 让工具描述动态读取 agentConfig，
+// 用户在 SettingsModal 修改描述后即时生效（无需重启）。
+const _TOOL_DESC_OVERRIDES = {
+    get_system_time: "tool.get_system_time.description",
+    get_db_message_count: "tool.get_db_message_count.description",
+    search_knowledge_base: "tool.search_knowledge_base.description",
+    web_search: "tool.web_search.description",
+    memory: "tool.memory.description",
+};
+
+for (const tool of agentTools) {
+    const configKey = _TOOL_DESC_OVERRIDES[tool.name];
+    if (!configKey) continue;
+    const originalDesc = tool.description;
+    Object.defineProperty(tool, "description", {
+        get() {
+            const custom = agentConfig.get(configKey);
+            return custom || originalDesc;
+        },
+        configurable: true,
+        enumerable: true,
+    });
+}

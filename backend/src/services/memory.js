@@ -26,6 +26,7 @@ import {
     updateMemory,
     removeMemory,
 } from "../db/index.js";
+import { agentConfig } from "./agentConfig.js";
 
 /**
  * MemoryService — 封装记忆系统的业务逻辑
@@ -72,8 +73,9 @@ export class MemoryService {
      * @param {number} importanceThreshold
      * @returns {{ consolidated: number, total: number }}
      */
-    consolidate(fromType = "working", toType = "episodic", importanceThreshold = 0.7) {
-        return dbConsolidateMemory(this.userId, fromType, toType, importanceThreshold);
+    consolidate(fromType = "working", toType = "episodic", importanceThreshold = null) {
+        const threshold = importanceThreshold ?? agentConfig.getNumber("memory.consolidateThreshold", 0.7);
+        return dbConsolidateMemory(this.userId, fromType, toType, threshold);
     }
 
     /**
@@ -83,8 +85,9 @@ export class MemoryService {
      * @param {number} threshold
      * @returns {number} 删除数
      */
-    forget(strategy = "importance", memoryType = "working", threshold = 0.3) {
-        return dbForgetMemory(this.userId, strategy, memoryType, threshold);
+    forget(strategy = "importance", memoryType = "working", threshold = null) {
+        const t = threshold ?? agentConfig.getNumber("memory.autoForgetThreshold", 0.3);
+        return dbForgetMemory(this.userId, strategy, memoryType, t);
     }
 
     /**

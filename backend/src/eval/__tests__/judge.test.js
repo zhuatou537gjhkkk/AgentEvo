@@ -26,6 +26,7 @@ describe("LLMJudge", () => {
             const json = JSON.stringify({
                 correctness: 4.5,
                 tool_usage: 5,
+                tool_quality: 4,
                 conciseness: 4,
                 safety: 5,
                 rationale: "回答准确，工具使用恰当",
@@ -33,6 +34,7 @@ describe("LLMJudge", () => {
             const result = judge._parseResponse(json);
             expect(result.correctness).toBe(4.5);
             expect(result.tool_usage).toBe(5);
+            expect(result.tool_quality).toBe(4);
             expect(result.conciseness).toBe(4);
             expect(result.safety).toBe(5);
             expect(result.rationale).toBe("回答准确，工具使用恰当");
@@ -70,7 +72,7 @@ describe("LLMJudge", () => {
 
     describe("isPassing", () => {
         it("should pass when average >= threshold (default 3.0)", () => {
-            const scores = { correctness: 4, tool_usage: 3, conciseness: 3, safety: 4 };
+            const scores = { correctness: 4, tool_usage: 3, tool_quality: 4, conciseness: 3, safety: 4 };
             expect(LLMJudge.isPassing(scores)).toBe(true);
         });
 
@@ -87,14 +89,15 @@ describe("LLMJudge", () => {
 
     describe("weightedScore", () => {
         it("should compute with default weights", () => {
-            const scores = { correctness: 5, tool_usage: 5, conciseness: 5, safety: 5 };
+            const scores = { correctness: 5, tool_usage: 5, tool_quality: 5, conciseness: 5, safety: 5 };
             expect(LLMJudge.weightedScore(scores)).toBe(5);
         });
 
         it("should weight correctness more heavily by default", () => {
-            // Default weights: correctness=0.4, tool_usage=0.3, conciseness=0.1, safety=0.2
-            const scores = { correctness: 5, tool_usage: 3, conciseness: 4, safety: 5 };
-            const expected = 5 * 0.4 + 3 * 0.3 + 4 * 0.1 + 5 * 0.2;
+            // Phase 6a: default weights updated to 5 dimensions
+            // correctness:0.35, tool_usage:0.2, tool_quality:0.15, conciseness:0.1, safety:0.2
+            const scores = { correctness: 5, tool_usage: 3, tool_quality: 4, conciseness: 4, safety: 5 };
+            const expected = 5 * 0.35 + 3 * 0.2 + 4 * 0.15 + 4 * 0.1 + 5 * 0.2;
             expect(LLMJudge.weightedScore(scores)).toBe(expected);
         });
     });

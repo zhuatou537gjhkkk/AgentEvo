@@ -319,6 +319,9 @@ export const useChatStore = create(persist((set, get) => ({
     speakingMessageId: null,
     themeMode: DEFAULT_THEME_MODE,
     mcpServers: [],
+    // Phase 6a G4: Agent 配置项
+    agentConfigs: [],
+    agentConfigVersions: [],    // G5: 配置版本历史
     // Phase 4: 记忆系统
     memories: [],
     memoryStats: null,
@@ -329,6 +332,18 @@ export const useChatStore = create(persist((set, get) => ({
     evalReportData: null,
     evalRunState: null,
     messageFeedback: {},
+    // Phase 6b G7: 评测集自动生成
+    generatedCases: [],
+    generatedCasesLoading: false,
+    // Phase 6b G8: 评估任务对比
+    comparisonData: null,
+    isCompareMode: false,
+    // Phase 6b G9: 观测面板
+    isObservabilityOpen: false,
+    observabilityTraces: [],
+    observabilityTracesLoading: false,
+    observabilityTraceDetail: null,
+    observabilityMetrics: null,
     // Phase 5: 评估 actions
     toggleEvalDashboard: () => set((s) => ({ isEvalDashboardOpen: !s.isEvalDashboardOpen })),
     fetchEvalReport: async (runId = null) => {
@@ -387,6 +402,86 @@ export const useChatStore = create(persist((set, get) => ({
                     return { messageFeedback: next };
                 });
             }
+        }
+    },
+    // Phase 6b G7: 评测集自动生成
+    generateTestCases: async (seeds, options) => {
+        set({ generatedCasesLoading: true });
+        try {
+            const { generateTestCases } = await import("../api/eval.js");
+            const data = await generateTestCases({ seeds, options });
+            if (data?.ok) {
+                // 生成成功后重新拉取列表
+                await get().fetchGeneratedCases();
+            }
+            return data;
+        } catch (err) {
+            console.error("[store] generateTestCases failed:", err);
+            throw err;
+        } finally {
+            set({ generatedCasesLoading: false });
+        }
+    },
+    fetchGeneratedCases: async (filters = {}) => {
+        set({ generatedCasesLoading: true });
+        try {
+            const { fetchGeneratedCases } = await import("../api/eval.js");
+            const data = await fetchGeneratedCases(filters);
+            if (data?.ok) {
+                set({ generatedCases: data.cases || [] });
+            }
+            return data;
+        } catch (err) {
+            console.error("[store] fetchGeneratedCases failed:", err);
+        } finally {
+            set({ generatedCasesLoading: false });
+        }
+    },
+    updateGeneratedCase: async (id, updates) => {
+        try {
+            const { updateGeneratedCase } = await import("../api/eval.js");
+            const data = await updateGeneratedCase(id, updates);
+            if (data?.ok) {
+                // 更新本地列表
+                set((s) => ({
+                    generatedCases: s.generatedCases.map((c) =>
+                        c.id === id ? { ...c, ...updates } : c
+                    ),
+                }));
+            }
+            return data;
+        } catch (err) {
+            console.error("[store] updateGeneratedCase failed:", err);
+        }
+    },
+    deleteGeneratedCase: async (id) => {
+        try {
+            const { deleteGeneratedCase } = await import("../api/eval.js");
+            const data = await deleteGeneratedCase(id);
+            if (data?.ok) {
+                set((s) => ({
+                    generatedCases: s.generatedCases.filter((c) => c.id !== id),
+                }));
+            }
+            return data;
+        } catch (err) {
+            console.error("[store] deleteGeneratedCase failed:", err);
+        }
+    },
+    approveGeneratedCases: async (ids) => {
+        try {
+            const { approveGeneratedCases } = await import("../api/eval.js");
+            const data = await approveGeneratedCases(ids);
+            if (data?.ok) {
+                set((s) => ({
+                    generatedCases: s.generatedCases.map((c) =>
+                        ids.includes(c.id) ? { ...c, reviewed: 1 } : c
+                    ),
+                }));
+            }
+            return data;
+        } catch (err) {
+            console.error("[store] approveGeneratedCases failed:", err);
         }
     },
     sessionDrafts: {},
@@ -540,6 +635,125 @@ export const useChatStore = create(persist((set, get) => ({
                 s.name === name ? { ...s, connected } : s
             ),
         }));
+    },
+    // ── Phase 6a G4: Agent 配置管理 ──
+    fetchAgentConfigs: async () => {
+        try {
+            const { fetchAgentConfig } = await import("../api/chat.js");
+            const data = await fetchAgentConfig();
+            if (data?.ok) set({ agentConfigs: data.configs || [] });
+        } catch { /* 静默 */ }
+    },
+    updateAgentConfig: async (key, value) => {
+        try {
+            const { updateAgentConfig } = await import("../api/chat.js");
+            const data = await updateAgentConfig(key, value);
+            if (data?.ok) {
+                set((state) => ({
+                    agentConfigs: state.agentConfigs.map((c) =>
+                        c.key === key ? { ...c, value: String(value) } : c
+                    ),
+                }));
+                return true;
+            }
+        } catch { /* 静默 */ }
+        return false;
+    },
+    // G5: 配置版本管理
+    fetchAgentConfigVersions: async () => {
+        try {
+            const { fetchAgentConfigVersions } = await import("../api/chat.js");
+            const data = await fetchAgentConfigVersions();
+            if (data?.ok) set({ agentConfigVersions: data.versions || [] });
+        } catch { /* 静默 */ }
+    },
+    rollbackAgentConfig: async (versionId) => {
+        try {
+            const { rollbackAgentConfig } = await import("../api/chat.js");
+            const data = await rollbackAgentConfig(versionId);
+            if (data?.ok) {
+                set({ agentConfigs: data.configs || [] });
+                // 刷新版本历史列表，让新的 rollback 记录立即可见
+                get().fetchAgentConfigVersions();
+                return true;
+            }
+        } catch { /* 静默 */ }
+        return false;
+    },
+    renameAgentConfigVersion: async (id, label) => {
+        try {
+            const { renameAgentConfigVersion } = await import("../api/chat.js");
+            const data = await renameAgentConfigVersion(id, label);
+            if (data?.ok) {
+                const versions = get().agentConfigVersions.map((v) =>
+                    v.id === id ? { ...v, label: label || null } : v
+                );
+                set({ agentConfigVersions: versions });
+                return true;
+            }
+        } catch { /* 静默 */ }
+        return false;
+    },
+    deleteAgentConfigVersion: async (id) => {
+        try {
+            const { deleteAgentConfigVersion } = await import("../api/chat.js");
+            const data = await deleteAgentConfigVersion(id);
+            if (data?.ok) {
+                set({ agentConfigVersions: get().agentConfigVersions.filter((v) => v.id !== id) });
+                return true;
+            }
+        } catch { /* 静默 */ }
+        return false;
+    },
+    // ── Phase 6b G8: 评估任务对比 ──
+    compareRuns: async (runIds) => {
+        try {
+            const { compareRuns } = await import("../api/eval.js");
+            const data = await compareRuns(runIds);
+            if (data?.ok) {
+                set({ comparisonData: data });
+            }
+            return data;
+        } catch (err) {
+            console.error("[store] compareRuns failed:", err);
+            return null;
+        }
+    },
+    // ── Phase 6b G9: 观测面板 ──
+    toggleObservability: () => set((s) => ({ isObservabilityOpen: !s.isObservabilityOpen })),
+    fetchObservabilityTraces: async (limit = 30) => {
+        set({ observabilityTracesLoading: true });
+        try {
+            const { fetchTraces } = await import("../api/chat.js");
+            const data = await fetchTraces(limit);
+            if (data?.ok) set({ observabilityTraces: data.traces || [], observabilityTracesLoading: false });
+            else set({ observabilityTracesLoading: false });
+        } catch (err) {
+            console.error("[store] fetchObservabilityTraces failed:", err);
+            set({ observabilityTracesLoading: false });
+        }
+    },
+    fetchObservabilityTraceDetail: async (traceId) => {
+        try {
+            const { fetchTraceDetail } = await import("../api/chat.js");
+            const data = await fetchTraceDetail(traceId);
+            if (data?.ok) set({ observabilityTraceDetail: data.trace });
+            return data?.trace || null;
+        } catch (err) {
+            console.error("[store] fetchObservabilityTraceDetail failed:", err);
+            return null;
+        }
+    },
+    fetchObservabilityMetrics: async (window = "7d") => {
+        try {
+            const { fetchMetricsReport } = await import("../api/chat.js");
+            const data = await fetchMetricsReport(window);
+            if (data?.ok) set({ observabilityMetrics: data });
+            return data;
+        } catch (err) {
+            console.error("[store] fetchObservabilityMetrics failed:", err);
+            return null;
+        }
     },
     // ── Phase 4: 记忆系统管理 ──
     fetchMemories: async (query = '', memoryType = '', limit = 50) => {

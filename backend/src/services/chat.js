@@ -2,6 +2,7 @@ import crypto from "crypto";
 import { saveMessage, getHistoryMessages } from "../db/index.js";
 import { agentTools, consumePendingQuestion, cancelAllPendingQuestions, setMemoryToolContext } from "../mcp/tools.js";
 import { TraceCollector } from "../trace/collector.js";
+import { OnlineEvaluator } from "../eval/online.js";
 import {
     WEB_SEARCH_TOOL_NAME,
     FORCED_WEB_SEARCH_MAX_CHARS,
@@ -44,7 +45,7 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
     const modelName = resolveModelName(hasImage, forceModel);
 
     // 动态注入模型身份：防止模型幻觉（如 deepseek 训练数据含 Claude 样本，会自称 Claude）
-    systemPrompt += `\n\n[系统信息] 你是 AI-Chat 平台的智能助手，底层由 ${modelName} 模型驱动。如果用户询问你的身份或模型，请如实告知以上信息，不要声称自己是 Claude、GPT 或其他特定模型。`;
+    systemPrompt += `\n\n[系统信息] 你是 AgentEvo 平台的智能助手，底层由 ${modelName} 模型驱动。如果用户询问你的身份或模型，请如实告知以上信息，不要声称自己是 Claude、GPT 或其他特定模型。`;
 
     const abortController = new AbortController();
     let clientDisconnected = false;
@@ -142,6 +143,14 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
             onComplete?.(metrics);
             emitThought(res, "回答生成完成", "done");
             res.write("data: [DONE]\n\n");
+            // Phase 6a G1: 在线评估（异步采样）
+            if (fullText) {
+                new OnlineEvaluator().maybeEvaluate({
+                    userId, sessionId: session_id, messageId: assistantMessageId,
+                    userInput: normalizedUserMessage, assistantText: fullText,
+                    toolCallNames: [],
+                });
+            }
             res.end();
             cleanupDisconnect();
             return;
@@ -579,7 +588,19 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
 
         const assistantMessageId = saveMessage(userId, session_id, "assistant", fullText);
         // Phase 5: finish trace
+        const chatTrace = traceCollector.getTrace(traceId);
+        const chatTraceToolCount = chatTrace?.toolCallCount || 0;
+        const chatTracePath = chatTrace?.agentTraversalPath || [];
         traceCollector.finishTrace(traceId, modelName, { messageId: assistantMessageId });
+
+        // Phase 6a G1: 在线评估（异步采样）
+        if (fullText) {
+            new OnlineEvaluator().maybeEvaluate({
+                userId, sessionId: session_id, messageId: assistantMessageId,
+                userInput: normalizedUserMessage, assistantText: fullText,
+                toolCallNames: chatTracePath.filter(t => !["router","synthesizer"].includes(t)),
+            });
+        }
         // 优先使用真实 API usage，fallback 到 CJK-aware 估算
         const metrics = accumulatedUsage && accumulatedUsage.total_tokens > 0
             ? {

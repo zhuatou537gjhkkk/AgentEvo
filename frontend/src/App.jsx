@@ -4,6 +4,7 @@ import ChatList from './components/ChatList';
 import SettingsModal from './components/SettingsModal';
 import Sidebar from './components/Sidebar';
 import EvalDashboard from './components/EvalDashboard';
+import ObservabilityPanel from './components/ObservabilityPanel';
 import { useChatStore } from './store/chatStore';
 
 export default function App() {
@@ -97,7 +98,7 @@ export default function App() {
                     }}
                     className="w-full max-w-sm rounded-3xl border border-[var(--panel-border)] bg-[var(--panel-bg)] p-5 shadow-lg"
                 >
-                    <h1 className="text-lg font-semibold text-[var(--text-main)]">AI Agent 登录</h1>
+                    <h1 className="text-lg font-semibold text-[var(--text-main)]">AgentEvo 登录</h1>
                     <p className="mt-1 text-xs text-[var(--text-muted)]">登录后可同步你的会话和设置。</p>
 
                     <input
@@ -140,6 +141,7 @@ export default function App() {
         <div className="flex h-screen overflow-hidden bg-[var(--app-bg)] text-[var(--text-main)] transition-colors">
             <SettingsModal />
             <EvalDashboard />
+            <ObservabilityPanel />
             <Sidebar className="hidden md:flex" />
 
             {sidebarOpen && (
@@ -165,7 +167,7 @@ export default function App() {
                         >
                             会话
                         </button>
-                        <span className="font-semibold tracking-wide text-[var(--brand)]">AI Agent 极速版</span>
+                        <span className="font-semibold tracking-wide text-[var(--brand)]">AgentEvo</span>
                         <div className="hidden items-center gap-3 sm:flex">
                             <button
                                 type="button"

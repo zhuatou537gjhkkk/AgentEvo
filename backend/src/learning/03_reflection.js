@@ -2,7 +2,7 @@
  * 🧪 练习 3：从零实现 Reflection (自审循环)
  *
  * 对应 Hello-Agents: chapter4/Reflection.py + chapter7 (MyReflectionAgent)
- * 对应 AI-Chat:    完全没有 (chat.js 输出完直接 res.end)
+ * 对应 AgentEvo:    完全没有 (chat.js 输出完直接 res.end)
  *
  * 目标：理解 Actor → Critic → Refiner 迭代模式
  *
@@ -110,7 +110,7 @@ const REFINER_PROMPT = `你是一位 Python 程序员。请根据审查反馈优
 //      d. 记录到 Memory
 //   → 返回最终代码
 //
-// AI-Chat 缺失的:
+// AgentEvo 缺失的:
 //   - chat.js 没有 Critic 调用
 //   - chat.js 没有 Refiner 调用
 //   - 输出完直接 res.end()
@@ -170,10 +170,10 @@ async function reflectionLoop(llm, task, maxIterations = 2) {
 
 
 // ═══════════════════════════════════════════════════════
-// 知识点 4: 对比 — AI-Chat 需要加什么
+// 知识点 4: 对比 — AgentEvo 需要加什么
 // ═══════════════════════════════════════════════════════
 //
-// AI-Chat chat.js 当前流程:
+// AgentEvo chat.js 当前流程:
 //   用户输入 → AgentExecutor → SSE stream → res.end()
 //
 // 加入 Reflection 后:

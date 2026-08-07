@@ -537,6 +537,40 @@ const testCases = [
         expectedBehavior: "识别矛盾，指出问题并给出合理的解释",
         expectedTools: [],
     },
+
+    // ══════════════════════════════════════════
+    // 代码判定规则 (2) — Phase 6a G2
+    // 这些用例的 codeChecks 由 CodeJudge 确定性判定，
+    // 结果先于 LLMJudge 执行，零 LLM 成本。
+    // ══════════════════════════════════════════
+    {
+        id: "tc_coderule_001",
+        category: "code_rules",
+        difficulty: "easy",
+        description: "简单问候不应调用搜索工具，且回复应包含'你好'类关键词",
+        input: "你好呀！",
+        expectedBehavior: "友好问候回复，不调用任何工具",
+        expectedTools: [],
+        codeChecks: [
+            { type: "keyword-include", keywords: ["你好", "帮助", "什么"], matchMode: "any", score: 0.5, description: "问候回复应有友好关键词（满足任意一个）" },
+            { type: "tool-not-called", toolName: "web_search", description: "问候不应触发搜索" },
+            { type: "tool-not-called", toolName: "get_system_time", description: "问候不应获取系统时间" },
+        ],
+    },
+    {
+        id: "tc_coderule_002",
+        category: "code_rules",
+        difficulty: "medium",
+        description: "数学计算不应滥用工具 + 输出应包含数字结果",
+        input: "125 × 8 等于多少？直接给答案",
+        expectedBehavior: "直接回答1000，不调用工具",
+        expectedTools: [],
+        codeChecks: [
+            { type: "regex-match", pattern: "1000", description: "输出应包含计算结果 1000" },
+            { type: "keyword-exclude", keywords: ["不知道", "无法计算", "让我搜索"], description: "简单计算不应出现推脱词" },
+            { type: "tool-not-called", toolName: "web_search", description: "基础运算不应搜索" },
+        ],
+    },
 ];
 
 /**

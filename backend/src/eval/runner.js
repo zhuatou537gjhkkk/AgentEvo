@@ -13,8 +13,9 @@
 import crypto from "crypto";
 import { testCases, getTestCaseById, getTestCasesByCategory } from "./testCases.js";
 import { LLMJudge } from "./judge.js";
+import { CodeJudge } from "./codeJudge.js";
 import { saveEvalRunScores, getRunSummary } from "./metrics.js";
-import { saveMessage, saveMessageMetric, createSession } from "../db/index.js";
+import { saveMessage, saveMessageMetric, createSession, getGeneratedTestCaseById } from "../db/index.js";
 import { estimateTokens } from "../services/chatUtils.js";
 
 // Resolve which chat implementation to use based on feature flag
@@ -40,8 +41,18 @@ class EvalRunner {
         const { reflect = false, onProgress = null } = options;
 
         const effectiveRunId = runId || this._generateRunId();
+
+        // 解析 ID：先查硬编码用例，再查 DB 生成用例（G7 桥接）
+        const resolveTestCase = (id) => {
+            const hardcoded = getTestCaseById(id);
+            if (hardcoded) return hardcoded;
+            const generated = getGeneratedTestCaseById(id);
+            if (generated) return dbRowToTestCase(generated);
+            return null;
+        };
+
         const selected = testCaseIds.length > 0
-            ? testCaseIds.map(id => getTestCaseById(id)).filter(Boolean)
+            ? testCaseIds.map(resolveTestCase).filter(Boolean)
             : testCases;
         const targetTestCases = testCaseIds.length === 0 && selected.length === 0
             ? [] // All tests filtered out
@@ -155,12 +166,36 @@ class EvalRunner {
         const capturedToolCalls = captured.getToolCalls();
         const toolCallNames = capturedToolCalls.map(tc => tc.toolName);
 
-        // LLMJudge 评分
+        // Phase 6a G2: 代码判定先于 LLMJudge 执行（确定性评估，零 LLM 成本）
+        let codeCheckResults = null;
+        let codeCheckSummary = null;
+        if (Array.isArray(testCase.codeChecks) && testCase.codeChecks.length > 0) {
+            const codeJudge = new CodeJudge();
+            codeCheckResults = codeJudge.evaluate(capturedText, toolCallNames, testCase.codeChecks);
+            codeCheckSummary = CodeJudge.summarize(codeCheckResults);
+        }
+
+        // LLMJudge 评分（含工具调用详情供 tool_quality 维度）
+        const toolCallsDetail = capturedToolCalls.map(tc => ({
+            toolName: tc.toolName,
+            input: typeof tc.input === "string" ? tc.input : JSON.stringify(tc.input || {}),
+            output: typeof tc.output === "string" ? tc.output : JSON.stringify(tc.output || {}),
+        }));
         const scores = await this.judge.evaluate(testCase, {
             text: capturedText,
             toolCallNames,
+            toolCallsDetail,
             trace: null,
         });
+
+        // 如果代码判定器对 tool_usage 有修正建议，融合到 LLMJudge 评分中
+        if (codeCheckResults && codeCheckResults.length > 0) {
+            const hint = CodeJudge.toToolUsageHint(codeCheckResults);
+            if (hint >= 0 && typeof scores.tool_usage === "number") {
+                // 加权融合：代码判定权重 60%，LLMJudge 权重 40%
+                scores.tool_usage = Math.round((hint * 0.6 + scores.tool_usage * 0.4) * 100) / 100;
+            }
+        }
 
         // 判定是否通过
         const passed = LLMJudge.isPassing(scores, 3.0);
@@ -189,6 +224,7 @@ class EvalRunner {
             expectedTools: testCase.expectedTools || [],
             textPreview: capturedText.slice(0, 200),
             error: null,
+            codeCheckSummary,  // Phase 6a G2: 代码判定结果（null 表示无代码判定）
         };
     }
 
@@ -200,13 +236,14 @@ class EvalRunner {
 
     _computeAvgScores(results) {
         const valid = results.filter(r => r.scores && !r.skipped);
-        if (valid.length === 0) return { correctness: 0, tool_usage: 0, conciseness: 0, safety: 0 };
+        if (valid.length === 0) return { correctness: 0, tool_usage: 0, tool_quality: 0, conciseness: 0, safety: 0 };
 
-        const avg = { correctness: 0, tool_usage: 0, conciseness: 0, safety: 0 };
+        const avg = { correctness: 0, tool_usage: 0, tool_quality: 0, conciseness: 0, safety: 0 };
         for (const r of valid) {
             if (r.scores) {
                 avg.correctness += r.scores.correctness || 0;
                 avg.tool_usage += r.scores.tool_usage || 0;
+                avg.tool_quality += r.scores.tool_quality || 0;
                 avg.conciseness += r.scores.conciseness || 0;
                 avg.safety += r.scores.safety || 0;
             }
@@ -217,6 +254,28 @@ class EvalRunner {
         }
         return avg;
     }
+}
+
+/**
+ * 将 DB 行 (snake_case) 转为 EvalTestCase 格式 (camelCase)
+ * G7 桥接：让生成用例可以被 EvalRunner 执行
+ * @param {object} row
+ * @returns {EvalTestCase}
+ */
+function dbRowToTestCase(row) {
+    return {
+        id: row.id,
+        category: row.category,
+        difficulty: row.difficulty,
+        description: row.description || "",
+        input: row.input,
+        expectedBehavior: row.expected_behavior || "",
+        expectedTools: Array.isArray(row.expected_tools) ? row.expected_tools : [],
+        enableWebSearch: row.enable_web_search === 1,
+        codeChecks: row.code_checks || null,
+        // 标记来源
+        generated: true,
+    };
 }
 
 /**

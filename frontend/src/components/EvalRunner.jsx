@@ -25,6 +25,7 @@ export default function EvalRunner() {
         { key: "code_generation", label: "代码生成" },
         { key: "creative", label: "创意任务" },
         { key: "tool_selection", label: "工具选择" },
+        { key: "code_rules", label: "代码判定" },
         { key: "edge_case", label: "边界场景" },
     ];
 
@@ -139,12 +140,39 @@ export default function EvalRunner() {
                                     {result.results.slice(0, 10).map((r) => (
                                         <div
                                             key={r.testCaseId}
-                                            className={`flex items-center justify-between border-b border-[var(--panel-border)] px-3 py-1.5 text-xs last:border-b-0 ${
+                                            className={`border-b border-[var(--panel-border)] px-3 py-2 text-xs last:border-b-0 ${
                                                 r.passed ? "text-[var(--text-main)]" : "text-red-600"
                                             }`}
                                         >
-                                            <span className="truncate">{r.testCaseId}</span>
-                                            <span className="ml-2 shrink-0">{r.passed ? "✅" : "❌"}</span>
+                                            <div className="flex items-center justify-between">
+                                                <span className="truncate font-medium">{r.testCaseId}</span>
+                                                <span className="ml-2 shrink-0">{r.passed ? "✅" : "❌"}</span>
+                                            </div>
+                                            {/* Phase 6a G2: 代码判定摘要 */}
+                                            {r.codeCheckSummary && r.codeCheckSummary.total > 0 && (
+                                                <div className="mt-1 flex items-center gap-2 text-[11px] text-[var(--text-muted)]">
+                                                    <span className="rounded-md bg-[var(--panel-soft)] px-1.5 py-0.5">
+                                                        🔍 代码判定: {r.codeCheckSummary.passed}/{r.codeCheckSummary.total}
+                                                    </span>
+                                                    <span>
+                                                        均分 {r.codeCheckSummary.avgScore}
+                                                    </span>
+                                                </div>
+                                            )}
+                                            {/* 各维度分数 */}
+                                            {r.scores && (
+                                                <div className="mt-1 flex flex-wrap gap-1.5 text-[11px] text-[var(--text-muted)]">
+                                                    {["correctness","tool_usage","tool_quality","conciseness","safety"].map((dim) => {
+                                                        if (r.scores[dim] === undefined) return null;
+                                                        const dimLabels = {correctness:"正确性",tool_usage:"工具选择",tool_quality:"工具质量",conciseness:"简洁",safety:"安全"};
+                                                        return (
+                                                            <span key={dim} className="rounded-md bg-[var(--panel-soft)] px-1.5 py-0.5">
+                                                                {dimLabels[dim]}: <strong className="text-[var(--text-main)]">{r.scores[dim]}</strong>
+                                                            </span>
+                                                        );
+                                                    })}
+                                                </div>
+                                            )}
                                         </div>
                                     ))}
                                     {result.results.length > 10 && (

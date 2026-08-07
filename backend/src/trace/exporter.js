@@ -5,7 +5,7 @@
  * 当前为占位实现，后续可扩展为 OTLP/gRPC 导出。
  *
  * 目标格式：符合 OpenTelemetry Trace 数据模型，
- * 使 AI-Chat 的 trace 数据可被 AgentArts 兼容的观测平台消费。
+ * 使 AgentEvo 的 trace 数据可被 AgentArts 兼容的观测平台消费。
  */
 
 /**
@@ -56,13 +56,13 @@ export function toOpenTelemetryFormat(traceRecord) {
             {
                 resource: {
                     attributes: [
-                        { key: "service.name", value: { stringValue: "ai-chat" } },
+                        { key: "service.name", value: { stringValue: "agent-evo" } },
                         { key: "service.version", value: { stringValue: "phase-5" } },
                     ],
                 },
                 scopeSpans: [
                     {
-                        scope: { name: "ai-chat-agent" },
+                        scope: { name: "agent-evo-agent" },
                         spans: allSpans,
                     },
                 ],

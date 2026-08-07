@@ -2,7 +2,7 @@
  * 🧪 练习 2：从零实现 Plan-and-Solve (架构级分离)
  *
  * 对应 Hello-Agents: chapter4/Plan_and_solve.py
- * 对应 AI-Chat:    chat.js 的 Plan 模式 (PLAN_MODE_INSTRUCTION + update_todo)
+ * 对应 AgentEvo:    chat.js 的 Plan 模式 (PLAN_MODE_INSTRUCTION + update_todo)
  *
  * 目标：理解 "prompt suggestion" vs "架构分离" 的本质区别
  *
@@ -21,7 +21,7 @@ import { ChatOpenAI } from "@langchain/openai";
 //   - ast.literal_eval 解析 LLM 输出的 Python 列表
 //   - 返回结构化的计划: ["步骤1", "步骤2", "步骤3"]
 //
-// AI-Chat 当前做法:
+// AgentEvo 当前做法:
 //   - chat.js:22-23 PLAN_MODE_INSTRUCTION 塞进 System Prompt
 //   - 同一个 LLM 在 ReAct 循环中"顺便"调 update_todo
 //   - 没有独立的 Planner 调用
@@ -79,7 +79,7 @@ async function planner(llm, question) {
 //   - 能看到"前面步骤的结果" (history)
 //   - 专注于当前这一个步骤
 //
-// AI-Chat 当前:
+// AgentEvo 当前:
 //   - 同一个 ReAct 循环，没有"步骤边界"
 //   - Agent 可能在执行一半时"忘记"计划
 
@@ -130,7 +130,7 @@ async function executor(llm, question, plan) {
 // 知识点 3: 对比 — prompt-level vs architecture-level
 // ═══════════════════════════════════════════════════════
 //
-// AI-Chat 当前 (prompt-level):
+// AgentEvo 当前 (prompt-level):
 //
 //   buildPrompt(planMode=true)
 //     → 注入 PLAN_MODE_INSTRUCTION: "你必须先调用 update_todo..."
@@ -147,7 +147,7 @@ async function executor(llm, question, plan) {
 //     → 每步都能看到前面步骤的结果
 //
 // ┌─────────────────────┬──────────────────────┬──────────────────────┐
-// │ 维度                │ AI-Chat (prompt)     │ Hello-Agents (架构)  │
+// │ 维度                │ AgentEvo (prompt)     │ Hello-Agents (架构)  │
 // ├─────────────────────┼──────────────────────┼──────────────────────┤
 // │ Planner Prompt      │ 一句话混在 System    │ 独立模板，精细控制   │
 // │ Planner LLM         │ 和 Executor 共用一个 │ 独立调用             │
@@ -158,7 +158,7 @@ async function executor(llm, question, plan) {
 
 
 // ═══════════════════════════════════════════════════════
-// 知识点 4: AI-Chat 改造的关键洞察
+// 知识点 4: AgentEvo 改造的关键洞察
 // ═══════════════════════════════════════════════════════
 //
 // 你不需要完全替换现有 System Prompt。
@@ -210,7 +210,7 @@ async function main() {
 
     console.log(`\n🎉 最终答案: ${answer}`);
     console.log("\n---");
-    console.log("对比: AI-Chat 当前用 planMode 开关 → 在 System Prompt 加一句话");
+    console.log("对比: AgentEvo 当前用 planMode 开关 → 在 System Prompt 加一句话");
     console.log("      本演示 → Planner 和 Executor 是两个完全独立的 LLM 调用");
     console.log("      Phase 2 目标: 把这种架构分离引入 chatWithStream()");
 }
