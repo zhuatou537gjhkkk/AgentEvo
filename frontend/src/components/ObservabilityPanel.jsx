@@ -114,9 +114,20 @@ export default function ObservabilityPanel() {
     const fetchObservabilityTraceDetail = useChatStore((s) => s.fetchObservabilityTraceDetail);
     const fetchObservabilityMetrics = useChatStore((s) => s.fetchObservabilityMetrics);
 
-    const [activeTab, setActiveTab] = useState("traces"); // "traces" | "overview"
+    const [activeTab, setActiveTab] = useState("traces"); // "traces" | "overview" | "otel-import"
     const [metricsWindow, setMetricsWindow] = useState("7d");
     const [expandedTrace, setExpandedTrace] = useState(null);
+
+    // OTel import state
+    const [otelInput, setOtelInput] = useState("");
+    const [otelImportResult, setOtelImportResult] = useState(null);
+    const [otelImportError, setOtelImportError] = useState(null);
+    const [otelImporting, setOtelImporting] = useState(false);
+    const importOtelTrace = useChatStore((s) => s.importOtelTrace);
+
+    // OTel export state (per-trace)
+    const [otelExporting, setOtelExporting] = useState(null); // traceId being exported
+    const [exportResult, setExportResult] = useState(null); // { traceId, message, error }
 
     // 初始加载
     useEffect(() => {
@@ -149,6 +160,39 @@ export default function ObservabilityPanel() {
         setExpandedTrace(traceId);
         await fetchObservabilityTraceDetail(traceId);
     }, [expandedTrace, fetchObservabilityTraceDetail]);
+
+    const handleImportOtel = useCallback(async () => {
+        if (!otelInput.trim()) {
+            setOtelImportError("请粘贴 OTel Trace JSON");
+            return;
+        }
+        setOtelImporting(true);
+        setOtelImportError(null);
+        setOtelImportResult(null);
+        try {
+            let otel;
+            try {
+                otel = JSON.parse(otelInput);
+            } catch {
+                setOtelImportError("JSON 解析失败，请检查格式");
+                setOtelImporting(false);
+                return;
+            }
+            const data = await importOtelTrace(otel);
+            if (data?.ok) {
+                setOtelImportResult({ type: "import", message: `导入成功！${data.spans || 0} 个 Span，trace_id: ${data.trace_id}` });
+                setOtelInput("");
+                // 刷新 trace 列表
+                fetchObservabilityTraces(30);
+            } else {
+                setOtelImportError(data?.message || "导入失败");
+            }
+        } catch (err) {
+            setOtelImportError("导入失败: " + err.message);
+        } finally {
+            setOtelImporting(false);
+        }
+    }, [otelInput, importOtelTrace, fetchObservabilityTraces]);
 
     if (!isOpen) return null;
 
@@ -226,7 +270,7 @@ export default function ObservabilityPanel() {
                     <div className="flex-1" />
                     {/* Tabs */}
                     <div className="flex gap-1 rounded-lg bg-[var(--panel-soft)] p-1">
-                        {["traces", "overview"].map((tab) => (
+                        {["traces", "overview", "otel-import"].map((tab) => (
                             <button
                                 key={tab}
                                 type="button"
@@ -237,7 +281,7 @@ export default function ObservabilityPanel() {
                                         : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
                                 }`}
                             >
-                                {tab === "traces" ? "📋 Trace 列表" : "📊 统计概览"}
+                                {tab === "traces" ? "📋 Trace 列表" : tab === "overview" ? "📊 统计概览" : "📥 OTel 导入"}
                             </button>
                         ))}
                     </div>
@@ -327,7 +371,49 @@ export default function ObservabilityPanel() {
                                     {isExpanded && (
                                         <div className="border-t border-[var(--panel-border)] px-3 py-2">
                                             {traceDetail && traceDetail.trace_id === t.trace_id ? (
-                                                <TraceTreeView rootSpan={traceDetail.root_span} />
+                                                <>
+                                                    <TraceTreeView rootSpan={traceDetail.root_span} />
+                                                    {/* OTel 导出按钮 */}
+                                                    <div className="mt-2 flex justify-end">
+                                                        <button
+                                                            type="button"
+                                                            disabled={otelExporting === t.trace_id}
+                                                            onClick={async (e) => {
+                                                                e.stopPropagation();
+                                                                setOtelExporting(t.trace_id);
+                                                                setExportResult(null);
+                                                                try {
+                                                                    const { exportTraceAsOtel } = await import("../api/chat.js");
+                                                                    const data = await exportTraceAsOtel(t.trace_id);
+                                                                    if (data?.ok && data?.otel) {
+                                                                        const json = JSON.stringify(data.otel, null, 2);
+                                                                        await navigator.clipboard.writeText(json);
+                                                                        setExportResult({ traceId: t.trace_id, message: `已复制 ${data.otel.resourceSpans?.[0]?.scopeSpans?.[0]?.spans?.length || 0} 个 Span 到剪贴板` });
+                                                                    } else {
+                                                                        setExportResult({ traceId: t.trace_id, error: data?.message || "未知错误" });
+                                                                    }
+                                                                } catch (err) {
+                                                                    setExportResult({ traceId: t.trace_id, error: err.message });
+                                                                } finally {
+                                                                    setOtelExporting(null);
+                                                                }
+                                                            }}
+                                                            className="rounded-lg px-2.5 py-1 text-[10px] font-medium text-[var(--brand)] border border-[var(--brand)]/30 hover:bg-[var(--brand)]/10 transition disabled:opacity-50"
+                                                        >
+                                                            {otelExporting === t.trace_id ? "导出中..." : "📤 OTel 导出"}
+                                                        </button>
+                                                    </div>
+                                                    {/* 导出结果提示（仅当前 trace） */}
+                                                    {exportResult && exportResult.traceId === t.trace_id && (
+                                                        <div className={`mt-1 rounded-lg px-2.5 py-1.5 text-[10px] ${
+                                                            exportResult.error
+                                                                ? "border border-red-300 bg-red-50 text-red-700 dark:border-red-800 dark:bg-red-950/30 dark:text-red-400"
+                                                                : "border border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-400"
+                                                        }`}>
+                                                            {exportResult.error || exportResult.message}
+                                                        </div>
+                                                    )}
+                                                </>
                                             ) : (
                                                 <p className="py-2 text-center text-xs text-[var(--text-muted)]">加载中...</p>
                                             )}
@@ -417,6 +503,68 @@ export default function ObservabilityPanel() {
                                     })}
                                 </div>
                             )}
+                        </div>
+                    </div>
+                )}
+
+                {/* ── OTel 导入 Tab ── */}
+                {activeTab === "otel-import" && (
+                    <div className="space-y-4">
+                        {/* 导入区域 */}
+                        <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                            <h3 className="mb-3 text-sm font-semibold text-[var(--text-main)]">📥 导入外部 OpenTelemetry Trace</h3>
+                            <p className="mb-3 text-xs text-[var(--text-muted)]">
+                                粘贴标准 OTLP/JSON 格式的 Trace 数据。支持 LangChain、AutoGen、CrewAI 等框架按 OTel 规范导出的 Trace。
+                            </p>
+                            <textarea
+                                value={otelInput}
+                                onChange={(e) => { setOtelInput(e.target.value); setOtelImportError(null); setOtelImportResult(null); }}
+                                placeholder={`{\n  "resourceSpans": [{\n    "resource": { "attributes": [...] },\n    "scopeSpans": [{\n      "scope": { "name": "..." },\n      "spans": [...]\n    }]\n  }]\n}`}
+                                rows={8}
+                                className="w-full rounded-lg border border-[var(--panel-border)] bg-[var(--panel-bg)] px-3 py-2 text-xs font-mono text-[var(--text-main)] placeholder:text-[var(--text-muted)] resize-y"
+                            />
+                            <div className="mt-3 flex items-center gap-3">
+                                <button
+                                    type="button"
+                                    disabled={otelImporting || !otelInput.trim()}
+                                    onClick={handleImportOtel}
+                                    className="rounded-lg bg-[var(--brand)] px-4 py-2 text-xs font-medium text-white hover:opacity-90 disabled:opacity-50 transition"
+                                >
+                                    {otelImporting ? "导入中..." : "导入 Trace"}
+                                </button>
+                                {otelInput.trim() && (
+                                    <button
+                                        type="button"
+                                        onClick={() => { setOtelInput(""); setOtelImportError(null); setOtelImportResult(null); }}
+                                        className="rounded-lg px-3 py-2 text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] transition"
+                                    >
+                                        清空
+                                    </button>
+                                )}
+                            </div>
+                            {/* 结果/错误提示 */}
+                            {otelImportError && (
+                                <div className="mt-3 rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-800 dark:bg-red-950/30 dark:text-red-400">
+                                    {otelImportError}
+                                </div>
+                            )}
+                            {otelImportResult && (
+                                <div className="mt-3 rounded-lg border border-[var(--brand)]/30 bg-[var(--brand)]/5 px-3 py-2 text-xs text-[var(--text-main)]">
+                                    {otelImportResult.message}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* 说明卡片 */}
+                        <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                            <h3 className="mb-2 text-sm font-semibold text-[var(--text-main)]">格式说明</h3>
+                            <div className="space-y-2 text-xs text-[var(--text-muted)]">
+                                <p>• 支持的格式：<code className="rounded bg-[var(--panel-bg)] px-1 py-0.5 text-[11px]">OTLP/JSON</code>（OpenTelemetry Protocol JSON）</p>
+                                <p>• Span 会按 <code className="rounded bg-[var(--panel-bg)] px-1 py-0.5 text-[11px]">parentSpanId</code> 重建调用链树</p>
+                                <p>• <code className="rounded bg-[var(--panel-bg)] px-1 py-0.5 text-[11px]">attributes</code> 中的 <code className="rounded bg-[var(--panel-bg)] px-1 py-0.5 text-[11px]">gen_ai.*</code> 属性会自动提取为元数据</p>
+                                <p>• 导入后在「📋 Trace 列表」Tab 中查看，标记为 <span className="rounded bg-purple-500/20 px-1 py-0.5 text-[10px] font-medium text-purple-600 dark:text-purple-400">import</span> 类型</p>
+                                <p>• 每条 Trace 可点击 <span className="rounded bg-[var(--brand)]/20 px-1 py-0.5 text-[10px] font-medium text-[var(--brand)]">📤 OTel 导出</span> 按钮反向导出</p>
+                            </div>
                         </div>
                     </div>
                 )}

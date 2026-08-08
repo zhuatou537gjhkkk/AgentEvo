@@ -897,3 +897,32 @@ export async function fetchMetricsReport(window = "7d") {
     const res = await request(`/observability/metrics?window=${window}`);
     return res.json();
 }
+
+// ══════════════════════════════════════════════════════════
+// Phase 6c OTel: Trace 格式导出/导入
+// ══════════════════════════════════════════════════════════
+
+/**
+ * 导出 Trace 为 OpenTelemetry 格式
+ * @param {string} traceId
+ * @returns {Promise<object>} { ok, otel }
+ */
+export async function exportTraceAsOtel(traceId) {
+    const res = await request(`/observability/traces/${encodeURIComponent(traceId)}/otel`);
+    return res.json();
+}
+
+/**
+ * 导入外部 OTel Trace JSON
+ * @param {object|string} otel — OTel JSON 对象或 JSON 字符串
+ * @param {number} sessionId — 关联的 session ID（可选）
+ * @returns {Promise<object>} { ok, trace_id, db_id, spans }
+ */
+export async function importOtelTrace(otel, sessionId = 0) {
+    const res = await request("/observability/otel/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ otel, session_id: sessionId }),
+    });
+    return res.json();
+}

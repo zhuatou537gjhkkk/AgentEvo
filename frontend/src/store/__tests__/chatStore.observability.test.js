@@ -329,3 +329,114 @@ describe("observability — state isolation", () => {
         expect(getState().messages).toBe(before);
     });
 });
+
+// ═══════════════════════════════════════════════════════
+// Phase 6c OTel: importOtelTrace / exportTraceAsOtel
+// ═══════════════════════════════════════════════════════
+
+describe("importOtelTrace", () => {
+    it("should call POST /observability/otel/import with otel body", async () => {
+        fetch.mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ ok: true, trace_id: "otel-abc", db_id: 1, spans: 3 }),
+        });
+
+        const result = await getState().importOtelTrace({ resourceSpans: [] }, 5);
+
+        const [url, opts] = fetch.mock.calls[0];
+        expect(url).toContain("/observability/otel/import");
+        expect(opts.method).toBe("POST");
+        expect(opts.headers["Content-Type"]).toBe("application/json");
+        const body = JSON.parse(opts.body);
+        expect(body.otel).toBeDefined();
+        expect(body.session_id).toBe(5);
+
+        expect(result.ok).toBe(true);
+        expect(result.trace_id).toBe("otel-abc");
+    });
+
+    it("should handle import error gracefully", async () => {
+        fetch.mockRejectedValueOnce(new Error("Network error"));
+        const result = await getState().importOtelTrace({});
+        expect(result.ok).toBe(false);
+        expect(result.message).toBeTruthy();
+    });
+
+    it("should handle server error response", async () => {
+        fetch.mockResolvedValueOnce({
+            ok: false,
+            status: 400,
+            json: () => Promise.resolve({ ok: false, message: "no valid spans found" }),
+        });
+
+        const result = await getState().importOtelTrace({ resourceSpans: [] });
+        expect(result.ok).toBe(false);
+    });
+
+    it("should default sessionId to 0", async () => {
+        fetch.mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ ok: true, trace_id: "otel-xyz", spans: 1 }),
+        });
+
+        await getState().importOtelTrace({ resourceSpans: [] });
+
+        const [, opts] = fetch.mock.calls[0];
+        const body = JSON.parse(opts.body);
+        expect(body.session_id).toBe(0);
+    });
+});
+
+describe("exportTraceAsOtel", () => {
+    it("should call GET /observability/traces/:traceId/otel", async () => {
+        const mockOtel = {
+            resourceSpans: [{
+                resource: { attributes: [{ key: "service.name", value: { stringValue: "agent-evo" } }] },
+                scopeSpans: [{ scope: { name: "agent-evo-agent" }, spans: [] }],
+            }],
+        };
+
+        fetch.mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ ok: true, otel: mockOtel }),
+        });
+
+        const result = await getState().exportTraceAsOtel("test-trace-id");
+
+        const [url] = fetch.mock.calls[0];
+        expect(url).toContain("/observability/traces/test-trace-id/otel");
+
+        expect(result.ok).toBe(true);
+        expect(result.otel).toEqual(mockOtel);
+    });
+
+    it("should handle export error gracefully", async () => {
+        fetch.mockRejectedValueOnce(new Error("Network error"));
+        const result = await getState().exportTraceAsOtel("bad-id");
+        expect(result.ok).toBe(false);
+        expect(result.message).toBeTruthy();
+    });
+
+    it("should handle 404 for non-existent trace", async () => {
+        fetch.mockResolvedValueOnce({
+            ok: false,
+            status: 404,
+            json: () => Promise.resolve({ ok: false, message: "trace not found" }),
+        });
+
+        const result = await getState().exportTraceAsOtel("nonexistent");
+        expect(result.ok).toBe(false);
+    });
+
+    it("should URL-encode traceId with special chars", async () => {
+        fetch.mockResolvedValueOnce({
+            ok: true,
+            json: () => Promise.resolve({ ok: true, otel: {} }),
+        });
+
+        await getState().exportTraceAsOtel("trace/id/with/slashes");
+
+        const [url] = fetch.mock.calls[0];
+        expect(url).toContain("trace%2Fid%2Fwith%2Fslashes");
+    });
+});

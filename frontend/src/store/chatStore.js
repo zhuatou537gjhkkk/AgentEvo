@@ -755,6 +755,27 @@ export const useChatStore = create(persist((set, get) => ({
             return null;
         }
     },
+    // ── Phase 6c OTel: 导入/导出 ──
+    importOtelTrace: async (otel, sessionId = 0) => {
+        try {
+            const { importOtelTrace } = await import("../api/chat.js");
+            const data = await importOtelTrace(otel, sessionId);
+            return data;
+        } catch (err) {
+            console.error("[store] importOtelTrace failed:", err);
+            return { ok: false, message: err.message };
+        }
+    },
+    exportTraceAsOtel: async (traceId) => {
+        try {
+            const { exportTraceAsOtel } = await import("../api/chat.js");
+            const data = await exportTraceAsOtel(traceId);
+            return data;
+        } catch (err) {
+            console.error("[store] exportTraceAsOtel failed:", err);
+            return { ok: false, message: err.message };
+        }
+    },
     // ── Phase 4: 记忆系统管理 ──
     fetchMemories: async (query = '', memoryType = '', limit = 50) => {
         set({ isMemoryLoading: true });

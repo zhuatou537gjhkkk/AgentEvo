@@ -232,6 +232,95 @@ class TraceCollector {
         return this._traces.get(traceId);
     }
 
+    /**
+     * 将已结束的 Trace 导出为 OpenTelemetry 兼容格式 (Phase 6c OTel)
+     *
+     * 映射内部 Span → OTel gen_ai.* 语义约定 JSON。
+     * 可用于将数据导出到 Grafana/Jaeger 等外部监控平台。
+     *
+     * @param {object} traceRecord — finishTrace() 的返回值，或从 DB 读取的 trace 对象
+     * @returns {object|null} OTel 格式的 trace（resourceSpans 结构）
+     */
+    static toOpenTelemetry(traceRecord) {
+        if (!traceRecord || !traceRecord.rootSpan) return null;
+
+        /** OTel SpanKind 映射 */
+        const SPAN_KIND_MAP = {
+            root: 1,    // SPAN_KIND_SERVER
+            agent: 1,   // SPAN_KIND_SERVER
+            tool: 2,    // SPAN_KIND_CLIENT
+        };
+
+        const convertSpan = (span, parentSpanId) => {
+            const startedAt = span.startedAt ? new Date(span.startedAt).getTime() : Date.now();
+            const endedAt = span.endedAt ? new Date(span.endedAt).getTime() : Date.now();
+
+            const attrs = [
+                { key: "gen_ai.span.type", value: { stringValue: span.type || "unknown" } },
+            ];
+
+            // 展开 metadata 为 OTel attributes
+            if (span.metadata && typeof span.metadata === "object") {
+                for (const [k, v] of Object.entries(span.metadata)) {
+                    if (v === null || v === undefined) continue;
+                    attrs.push({
+                        key: `gen_ai.metadata.${k}`,
+                        value: typeof v === "string"
+                            ? { stringValue: v }
+                            : { stringValue: JSON.stringify(v) },
+                    });
+                }
+            }
+
+            return {
+                traceId: traceRecord.traceId || traceRecord.trace_id || "",
+                spanId: span.id,
+                parentSpanId: parentSpanId || null,
+                name: span.name,
+                kind: SPAN_KIND_MAP[span.type] || 1,
+                startTimeUnixNano: String(startedAt * 1_000_000),
+                endTimeUnixNano: String(endedAt * 1_000_000),
+                attributes: attrs,
+                status: span.metadata?.error
+                    ? { code: 2, message: String(span.metadata.error) }
+                    : { code: 1 },
+            };
+        };
+
+        const allSpans = [];
+
+        const walkSpanTree = (span, parentId) => {
+            allSpans.push(convertSpan(span, parentId));
+            if (span.children) {
+                for (const child of span.children) {
+                    walkSpanTree(child, span.id);
+                }
+            }
+        };
+
+        const rootSpan = traceRecord.rootSpan;
+        walkSpanTree(rootSpan, null);
+
+        return {
+            resourceSpans: [{
+                resource: {
+                    attributes: [
+                        { key: "service.name", value: { stringValue: "agent-evo" } },
+                        { key: "service.version", value: { stringValue: "phase-6c" } },
+                        { key: "gen_ai.agent.traversal_path", value: { stringValue: JSON.stringify(traceRecord.agentTraversalPath || []) } },
+                        { key: "gen_ai.agent.tool_call_count", value: { intValue: String(traceRecord.toolCallCount || 0) } },
+                        { key: "gen_ai.agent.error_count", value: { intValue: String(traceRecord.errorCount || 0) } },
+                        { key: "gen_ai.agent.model", value: { stringValue: traceRecord.model || "" } },
+                    ],
+                },
+                scopeSpans: [{
+                    scope: { name: "agent-evo-agent", version: "phase-6c" },
+                    spans: allSpans,
+                }],
+            }],
+        };
+    }
+
     // ── private ──
 
     _generateId() {
