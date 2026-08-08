@@ -236,6 +236,21 @@ export default function EvalDashboard() {
     const [editingCaseId, setEditingCaseId] = useState(null);
     const [editForm, setEditForm] = useState({ input: "", expectedBehavior: "", difficulty: "" });
 
+    // G10: 优化闭环 state
+    const [optSelectedRunId, setOptSelectedRunId] = useState("");
+    const [optBadCases, setOptBadCases] = useState(null);
+    const [optSuggestions, setOptSuggestions] = useState(null);
+    const [optSelectedIds, setOptSelectedIds] = useState(new Set());
+    const [optLabel, setOptLabel] = useState("");
+    const [optLogId, setOptLogId] = useState(null);
+    const [optResult, setOptResult] = useState(null); // { logId, configVersionId }
+    const [optReevalResult, setOptReevalResult] = useState(null); // { newRunId, scoreAfter }
+    const [optCompareResult, setOptCompareResult] = useState(null); // before/after comparison
+    const [optLoading, setOptLoading] = useState(false);
+    const [optLoadingMsg, setOptLoadingMsg] = useState("");
+    const [optHistory, setOptHistory] = useState([]);
+    const [optShowHistory, setOptShowHistory] = useState(false);
+
     // 获取已有用例作为可选种子
     const availableCases = useChatStore((s) => {
         // 从 evalReportData 的 categories 获取分类信息
@@ -463,6 +478,522 @@ export default function EvalDashboard() {
                         </div>
                     </div>
                 ))}
+            </div>
+        );
+    };
+
+    // ── G10: 优化闭环面板 ──
+    const OptimizationPanel = () => {
+        const handleAnalyze = async () => {
+            if (!optSelectedRunId) return;
+            setOptLoading(true);
+            setOptLoadingMsg("正在分析 BadCase...");
+            setOptBadCases(null);
+            setOptSuggestions(null);
+            setOptResult(null);
+            setOptReevalResult(null);
+            setOptCompareResult(null);
+            try {
+                const { analyzeBadCases } = await import("../api/eval.js");
+                const data = await analyzeBadCases(optSelectedRunId);
+                if (data?.ok) {
+                    setOptBadCases(data);
+                } else {
+                    // 后端返回 ok: false（如 run 不存在、无评分数据等）
+                    setOptBadCases({ ok: false, error: data?.message || "分析失败，请检查该 run 是否有评估数据" });
+                }
+            } catch (err) {
+                setOptBadCases({ ok: false, error: err.message });
+            } finally {
+                setOptLoading(false);
+                setOptLoadingMsg("");
+            }
+        };
+
+        const handleSuggest = async () => {
+            if (!optBadCases?.badCases?.length) return;
+            setOptLoading(true);
+            setOptLoadingMsg("LLM 正在生成优化建议...");
+            setOptSuggestions(null);
+            try {
+                const { suggestOptimizations } = await import("../api/eval.js");
+                const data = await suggestOptimizations(optSelectedRunId, optBadCases.badCases);
+                if (data?.ok) {
+                    setOptSuggestions(data);
+                    // 默认全选
+                    setOptSelectedIds(new Set(data.suggestions.map((s, i) => i)));
+                }
+            } catch (err) {
+                setOptSuggestions({ ok: false, error: err.message });
+            } finally {
+                setOptLoading(false);
+                setOptLoadingMsg("");
+            }
+        };
+
+        const handleApply = async () => {
+            if (!optSuggestions?.suggestions?.length) return;
+            const selectedSuggestions = optSuggestions.suggestions.filter((_, i) => optSelectedIds.has(i));
+            if (selectedSuggestions.length === 0) return;
+
+            const changes = selectedSuggestions.map(s => ({ key: s.configKey, value: s.suggestedValue }));
+            const badCaseIds = optBadCases?.badCases?.map(bc => bc.testCaseId) || [];
+            const scoreBefore = {
+                weightedAvg: optBadCases?.summary?.avgWeightedScore || 0,
+                badCount: optBadCases?.summary?.badCount || 0,
+                total: optBadCases?.summary?.total || 0,
+            };
+
+            setOptLoading(true);
+            setOptLoadingMsg("正在应用配置变更...");
+            try {
+                const { applyOptimizations } = await import("../api/eval.js");
+                const data = await applyOptimizations({
+                    sourceRunId: optSelectedRunId,
+                    changes,
+                    suggestions: selectedSuggestions,
+                    badCaseIds,
+                    scoreBefore,
+                    label: optLabel || `优化 ${new Date().toLocaleDateString("zh-CN")}`,
+                });
+                setOptResult(data);
+                if (data?.ok) {
+                    setOptLogId(data.logId);
+                }
+            } catch (err) {
+                setOptResult({ ok: false, error: err.message });
+            } finally {
+                setOptLoading(false);
+                setOptLoadingMsg("");
+            }
+        };
+
+        const handleReevaluate = async () => {
+            if (!optLogId || !optBadCases?.badCases?.length) return;
+            const testCaseIds = optBadCases.badCases.map(bc => bc.testCaseId);
+
+            setOptLoading(true);
+            setOptLoadingMsg("正在重新评估（可能需要几分钟）...");
+            try {
+                const { reevaluateOptimization } = await import("../api/eval.js");
+                const data = await reevaluateOptimization(optLogId, testCaseIds);
+                setOptReevalResult(data);
+
+                // Step ⑥: 自动对比
+                if (data?.ok && data.newRunId) {
+                    setOptLoadingMsg("正在对比优化前后分数...");
+                    const { compareRuns } = await import("../api/eval.js");
+                    const comp = await compareRuns([optSelectedRunId, data.newRunId]);
+                    if (comp?.ok) {
+                        setOptCompareResult(comp);
+                    }
+                }
+            } catch (err) {
+                setOptReevalResult({ ok: false, error: err.message });
+            } finally {
+                setOptLoading(false);
+                setOptLoadingMsg("");
+            }
+        };
+
+        const handleLoadHistory = async () => {
+            setOptShowHistory(!optShowHistory);
+            if (!optShowHistory) {
+                try {
+                    const { fetchOptimizationHistory } = await import("../api/eval.js");
+                    const data = await fetchOptimizationHistory(20);
+                    if (data?.ok) setOptHistory(data.logs || []);
+                } catch { /* 静默 */ }
+            }
+        };
+
+        // 回滚：通过 restoreVersion 恢复旧配置
+        const handleRollback = async (logId, configVersionId) => {
+            if (!configVersionId) return;
+            if (!window.confirm("确定回滚到此优化之前的配置版本吗？")) return;
+            try {
+                const { request } = await import("../api/chat.js");
+                // 使用 agentConfig 的 restore 逻辑
+                await request("/agent-config/rollback", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ versionId: configVersionId }),
+                });
+                alert("已回滚配置版本");
+                handleLoadHistory();
+            } catch (err) {
+                alert("回滚失败: " + err.message);
+            }
+        };
+
+        const dimLabels = ["正确性", "工具选择", "工具质量", "简洁度", "安全性"];
+        const dimColors = ["text-blue-600", "text-green-600", "text-teal-600", "text-amber-600", "text-purple-600"];
+        const dimBgColors = ["bg-blue-50 dark:bg-blue-900/20", "bg-green-50 dark:bg-green-900/20", "bg-teal-50 dark:bg-teal-900/20", "bg-amber-50 dark:bg-amber-900/20", "bg-purple-50 dark:bg-purple-900/20"];
+        const dims = ["correctness", "tool_usage", "tool_quality", "conciseness", "safety"];
+
+        const stepActive = (step) => {
+            if (optLoading) return false;
+            if (step === 1) return !!optSelectedRunId;
+            if (step === 2) return !!optBadCases?.badCases?.length;
+            if (step === 3) return !!optSuggestions?.suggestions?.length && optSelectedIds.size > 0;
+            if (step === 4) return !!optResult?.ok && !!optLogId;
+            return false;
+        };
+
+        return (
+            <div className="space-y-4">
+                {/* Step 1: 选择 Run */}
+                <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                    <h3 className="mb-3 text-sm font-semibold text-[var(--text-main)]">
+                        ① 选择评估 Run
+                    </h3>
+                    <div className="flex items-center gap-3">
+                        <select
+                            value={optSelectedRunId}
+                            onChange={(e) => {
+                                setOptSelectedRunId(e.target.value);
+                                setOptBadCases(null);
+                                setOptSuggestions(null);
+                                setOptResult(null);
+                                setOptReevalResult(null);
+                                setOptCompareResult(null);
+                            }}
+                            className="flex-1 rounded-xl border border-[var(--panel-border)] bg-[var(--panel-bg)] px-3 py-2 text-sm text-[var(--text-main)] outline-none focus:border-[var(--brand)]"
+                        >
+                            <option value="">选择评估 Run...</option>
+                            {runs.map((r) => (
+                                <option key={r.run_id} value={r.run_id}>
+                                    {r.run_id} ({new Date(r.created_at).toLocaleDateString("zh-CN")})
+                                </option>
+                            ))}
+                        </select>
+                        <button
+                            type="button"
+                            onClick={handleAnalyze}
+                            disabled={!optSelectedRunId || optLoading}
+                            className="shrink-0 rounded-xl bg-[var(--brand)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50 transition"
+                        >
+                            {optLoading && optLoadingMsg.includes("分析") ? "分析中..." : "② 分析 BadCase"}
+                        </button>
+                    </div>
+                </div>
+
+                {/* Loading indicator */}
+                {optLoading && (
+                    <div className="rounded-xl border border-[var(--brand)] bg-indigo-50 dark:bg-indigo-900/10 px-4 py-3 text-sm text-[var(--brand)] flex items-center gap-2">
+                        <svg className="h-4 w-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                        </svg>
+                        {optLoadingMsg || "处理中..."}
+                    </div>
+                )}
+
+                {/* 分析结果：错误 / 空 / 成功 */}
+                {optBadCases && !optBadCases.ok && (
+                    <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
+                        ❌ 分析失败: {optBadCases.error || "未知错误"}
+                    </div>
+                )}
+
+                {optBadCases?.ok && optBadCases.badCases?.length === 0 && (
+                    <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-700 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-400">
+                        📭 该 run 未发现 BadCase（所有用例加权分均 ≥ 3.0），无需优化。
+                        {optBadCases.summary && (
+                            <span className="ml-1 text-[var(--text-muted)]">
+                                (共 {optBadCases.summary.total} 个用例，均分 {optBadCases.summary.avgWeightedScore})
+                            </span>
+                        )}
+                    </div>
+                )}
+
+                {/* Step 2: BadCase 列表 */}
+                {optBadCases?.ok && optBadCases.badCases?.length > 0 && (
+                    <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                        <div className="flex items-center justify-between mb-3">
+                            <h3 className="text-sm font-semibold text-[var(--text-main)]">
+                                ② BadCase 分析
+                                <span className="ml-2 text-xs font-normal text-[var(--text-muted)]">
+                                    {optBadCases.badCases.length}/{optBadCases.summary.total} 用例低于阈值 ({optBadCases.summary.avgWeightedScore} 分)
+                                </span>
+                            </h3>
+                            <button
+                                type="button"
+                                onClick={handleSuggest}
+                                disabled={optLoading}
+                                className="shrink-0 rounded-xl bg-[#111827] px-4 py-1.5 text-xs font-semibold text-white hover:bg-[#0b1220] disabled:opacity-50 transition"
+                            >
+                                {optLoading && optLoadingMsg.includes("建议") ? "生成中..." : "③ 生成优化建议"}
+                            </button>
+                        </div>
+
+                        {/* 根因分布 */}
+                        {optBadCases.summary.byRootCause && (
+                            <div className="mb-3 flex gap-2 text-[11px]">
+                                {Object.entries(optBadCases.summary.byRootCause).map(([cause, count], i) => (
+                                    <span key={cause} className={`rounded-full px-2 py-0.5 font-medium ${dimBgColors[i % 5]} ${dimColors[i % 5]}`}>
+                                        {dimLabels[dims.indexOf(cause)] || cause}: {count}
+                                    </span>
+                                ))}
+                            </div>
+                        )}
+
+                        <div className="max-h-[40vh] space-y-1.5 overflow-auto">
+                            {optBadCases.badCases.map((bc, i) => (
+                                <div key={bc.testCaseId} className="rounded-lg border border-[var(--panel-border)] bg-[var(--panel-bg)] p-2.5 text-xs">
+                                    <div className="flex items-center justify-between gap-2 mb-1">
+                                        <span className="font-mono text-[var(--text-muted)]">{bc.testCaseId}</span>
+                                        <span className="rounded bg-red-100 px-1.5 py-0.5 font-semibold text-red-700 dark:bg-red-900/30 dark:text-red-400">
+                                            {bc.weightedAvg} 分
+                                        </span>
+                                    </div>
+                                    <p className="text-[var(--text-main)] truncate">{bc.description || bc.input || ""}</p>
+                                    <div className="mt-1 flex gap-2 text-[11px]">
+                                        {dims.map((dim, di) => {
+                                            const score = bc.scores?.[dim];
+                                            const low = score !== undefined && score < 3.0;
+                                            return (
+                                                <span key={dim} className={low ? "font-semibold text-red-600 dark:text-red-400" : "text-[var(--text-muted)]"}>
+                                                    {dimLabels[di]}: {score ?? "-"}
+                                                </span>
+                                            );
+                                        })}
+                                    </div>
+                                    {bc.rootCause && (
+                                        <span className={`mt-0.5 inline-block rounded px-1 py-0.5 text-[10px] ${dimBgColors[dims.indexOf(bc.rootCause)]} ${dimColors[dims.indexOf(bc.rootCause)]}`}>
+                                            根因: {dimLabels[dims.indexOf(bc.rootCause)] || bc.rootCause}
+                                        </span>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                )}
+
+                {/* Step 3: LLM 优化建议 */}
+                {optSuggestions?.ok && optSuggestions.suggestions?.length > 0 && (
+                    <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                        <h3 className="mb-3 text-sm font-semibold text-[var(--text-main)]">
+                            ③ 优化建议
+                            {optSuggestions.summary && (
+                                <span className="ml-2 text-xs font-normal text-[var(--text-muted)]">
+                                    {optSuggestions.summary}
+                                </span>
+                            )}
+                        </h3>
+
+                        <div className="space-y-2">
+                            {optSuggestions.suggestions.map((s, i) => {
+                                const isSelected = optSelectedIds.has(i);
+                                return (
+                                    <div
+                                        key={i}
+                                        className={`rounded-xl border p-3 text-xs cursor-pointer transition ${
+                                            isSelected
+                                                ? "border-[var(--brand)] bg-indigo-50 dark:bg-indigo-900/10"
+                                                : "border-[var(--panel-border)] bg-[var(--panel-bg)] opacity-70"
+                                        }`}
+                                        onClick={() => {
+                                            const next = new Set(optSelectedIds);
+                                            if (isSelected) next.delete(i);
+                                            else next.add(i);
+                                            setOptSelectedIds(next);
+                                        }}
+                                    >
+                                        <div className="flex items-start gap-2">
+                                            <input
+                                                type="checkbox"
+                                                checked={isSelected}
+                                                onChange={() => {}}
+                                                className="mt-0.5 shrink-0 accent-[var(--brand)]"
+                                            />
+                                            <div className="flex-1 min-w-0">
+                                                <div className="flex items-center gap-2 mb-1">
+                                                    <code className="rounded bg-[var(--panel-soft)] px-1.5 py-0.5 text-[11px] font-mono text-[var(--brand)]">
+                                                        {s.configKey}
+                                                    </code>
+                                                    <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
+                                                        置信度 {(s.confidence * 100).toFixed(0)}%
+                                                    </span>
+                                                </div>
+                                                <div className="space-y-1 text-[var(--text-muted)]">
+                                                    <p>
+                                                        <span className="text-red-500 line-through">当前: {s.currentValue?.slice(0, 100) || "(空)"}</span>
+                                                    </p>
+                                                    <p>
+                                                        <span className="text-green-600 dark:text-green-400">建议: {s.suggestedValue?.slice(0, 200)}</span>
+                                                    </p>
+                                                </div>
+                                                {s.rationale && (
+                                                    <p className="mt-1 text-[var(--text-muted)] italic">{s.rationale}</p>
+                                                )}
+                                            </div>
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+
+                        {/* 标签输入 + 应用按钮 */}
+                        <div className="mt-4 flex items-center gap-3">
+                            <input
+                                type="text"
+                                value={optLabel}
+                                onChange={(e) => setOptLabel(e.target.value)}
+                                placeholder={'优化标签（可选，如“修复 knowledge correctness”）'}
+                                className="flex-1 rounded-xl border border-[var(--panel-border)] bg-[var(--panel-bg)] px-3 py-2 text-xs text-[var(--text-main)] outline-none focus:border-[var(--brand)]"
+                            />
+                            <button
+                                type="button"
+                                onClick={handleApply}
+                                disabled={optLoading || optSelectedIds.size === 0}
+                                className="shrink-0 rounded-xl bg-green-600 px-4 py-2 text-sm font-semibold text-white hover:bg-green-700 disabled:opacity-50 transition"
+                            >
+                                {optLoading && optLoadingMsg.includes("应用") ? "应用中..." : `④ 应用选中建议 (${optSelectedIds.size})`}
+                            </button>
+                        </div>
+                    </div>
+                )}
+
+                {/* Step 4: 应用结果 */}
+                {optResult && (
+                    <div className={`rounded-xl p-3 text-xs ${optResult.ok ? "bg-green-50 text-green-700 dark:bg-green-900/20 dark:text-green-400" : "bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-400"}`}>
+                        {optResult.ok
+                            ? `✅ 已应用配置变更 (logId=${optResult.logId}, versionId=${optResult.configVersionId})`
+                            : `❌ 应用失败: ${optResult.error || "未知错误"}`}
+                    </div>
+                )}
+
+                {/* Step ⑤: 重评 */}
+                {optResult?.ok && (
+                    <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                        <h3 className="mb-3 text-sm font-semibold text-[var(--text-main)]">
+                            ⑤ 重评验证
+                        </h3>
+                        <p className="mb-3 text-xs text-[var(--text-muted)]">
+                            使用新配置重新评估 {optBadCases?.badCases?.length || 0} 个 BadCase
+                        </p>
+                        <button
+                            type="button"
+                            onClick={handleReevaluate}
+                            disabled={optLoading}
+                            className="rounded-xl bg-[#111827] px-4 py-2 text-sm font-semibold text-white hover:bg-[#0b1220] disabled:opacity-50 transition"
+                        >
+                            {optLoading && optLoadingMsg.includes("评估") ? "评估中..." : "🔄 重评 BadCase"}
+                        </button>
+                    </div>
+                )}
+
+                {/* Step ⑥: 对比结果 */}
+                {optCompareResult && (
+                    <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                        <h3 className="mb-3 text-sm font-semibold text-[var(--text-main)]">
+                            ⑥ 优化对比
+                            {optReevalResult?.scoreAfter && (
+                                <span className={`ml-2 text-xs font-normal ${optReevalResult.scoreAfter.weightedAvg > (optBadCases?.summary?.avgWeightedScore || 0) ? "text-green-600" : "text-red-600"}`}>
+                                    {optReevalResult.scoreAfter.weightedAvg > (optBadCases?.summary?.avgWeightedScore || 0) ? "✅ " : "❌ "}
+                                    {optBadCases?.summary?.avgWeightedScore || 0} → {optReevalResult.scoreAfter.weightedAvg?.toFixed(2) || "?"}
+                                </span>
+                            )}
+                        </h3>
+
+                        {/* 维度差值表 */}
+                        {optCompareResult.comparisons && optCompareResult.comparisons.length >= 2 && (
+                            <div className="overflow-auto rounded-xl border border-[var(--panel-border)]">
+                                <table className="w-full text-xs">
+                                    <thead>
+                                        <tr className="border-b border-[var(--panel-border)]">
+                                            <th className="px-3 py-2 text-left font-semibold text-[var(--text-main)]">维度</th>
+                                            <th className="px-3 py-2 text-center text-[var(--text-muted)]">优化前</th>
+                                            <th className="px-3 py-2 text-center text-[var(--text-muted)]">优化后</th>
+                                            <th className="px-3 py-2 text-center text-[var(--text-muted)]">差值</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {dims.map((dim, i) => {
+                                            const baseline = optCompareResult.comparisons[0];
+                                            const after = optCompareResult.comparisons[1];
+                                            const beforeVal = baseline?.avgScores?.[dim] || 0;
+                                            const afterVal = after?.avgScores?.[dim] || 0;
+                                            const delta = afterVal - beforeVal;
+                                            return (
+                                                <tr key={dim} className="border-b border-[var(--panel-border)]">
+                                                    <td className="px-3 py-2 font-medium text-[var(--text-main)]">{dimLabels[i]}</td>
+                                                    <td className="px-3 py-2 text-center text-[var(--text-main)]">{beforeVal}</td>
+                                                    <td className="px-3 py-2 text-center text-[var(--text-main)]">{afterVal}</td>
+                                                    <td className={`px-3 py-2 text-center font-semibold ${delta >= 0 ? "text-green-600" : "text-red-600"}`}>
+                                                        {delta >= 0 ? "+" : ""}{delta.toFixed(2)}
+                                                    </td>
+                                                </tr>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                {/* 优化历史 Toggle */}
+                <div>
+                    <button
+                        type="button"
+                        onClick={handleLoadHistory}
+                        className="rounded-lg border border-[var(--panel-border)] bg-[var(--panel-soft)] px-3 py-1.5 text-xs font-medium text-[var(--text-main)] hover:opacity-80 transition"
+                    >
+                        {optShowHistory ? "隐藏历史" : "📋 优化历史"}
+                    </button>
+
+                    {optShowHistory && (
+                        <div className="mt-2 space-y-1">
+                            {optHistory.length === 0 ? (
+                                <p className="py-4 text-center text-xs text-[var(--text-muted)]">暂无优化记录</p>
+                            ) : (
+                                optHistory.map((log) => (
+                                    <div key={log.id} className="rounded-lg border border-[var(--panel-border)] bg-[var(--panel-soft)] p-2.5 text-xs">
+                                        <div className="flex items-center justify-between gap-2">
+                                            <div>
+                                                <span className="font-semibold text-[var(--text-main)]">{log.label || `优化 #${log.id}`}</span>
+                                                <span className="ml-2 text-[var(--text-muted)]">
+                                                    来源: {String(log.source_run_id).slice(0, 12)}...
+                                                </span>
+                                                {log.score_before && typeof log.score_before === "object" && log.score_after && typeof log.score_after === "object" && (
+                                                    <span className={`ml-2 font-semibold ${
+                                                        (log.score_after.weightedAvg || 0) > (log.score_before.weightedAvg || 0)
+                                                            ? "text-green-600" : "text-red-600"
+                                                    }`}>
+                                                        {log.score_before.weightedAvg?.toFixed?.(2) || log.score_before.weightedAvg}
+                                                        {" → "}
+                                                        {log.score_after.weightedAvg?.toFixed?.(2) || log.score_after.weightedAvg}
+                                                    </span>
+                                                )}
+                                            </div>
+                                            <div className="flex items-center gap-1.5">
+                                                <span className={`rounded-full px-1.5 py-0.5 text-[10px] ${
+                                                    log.status === "applied" ? "bg-amber-100 text-amber-700" :
+                                                    log.status === "reevaluated" ? "bg-green-100 text-green-700" :
+                                                    "bg-gray-100 text-gray-600"
+                                                }`}>
+                                                    {log.status === "applied" ? "已应用" : log.status === "reevaluated" ? "已重评" : log.status}
+                                                </span>
+                                                <span className="text-[var(--text-muted)]">{new Date(log.created_at).toLocaleDateString("zh-CN")}</span>
+                                                {log.config_version_before && log.status === "applied" && (
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => handleRollback(log.id, log.config_version_before)}
+                                                        className="rounded border border-red-200 px-1.5 py-0.5 text-[10px] text-red-500 hover:bg-red-50 transition"
+                                                    >
+                                                        回滚
+                                                    </button>
+                                                )}
+                                            </div>
+                                        </div>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    )}
+                </div>
             </div>
         );
     };
@@ -990,25 +1521,25 @@ export default function EvalDashboard() {
                     )}
                 </div>
 
-                {loading && evalMode !== "generator" && (
+                {loading && evalMode !== "generator" && evalMode !== "optimizer" && (
                     <p className="py-8 text-center text-sm text-[var(--text-muted)]">加载中...</p>
                 )}
 
                 {/* Eval Runner */}
-                {showRunner && evalMode !== "generator" && (
+                {showRunner && evalMode !== "generator" && evalMode !== "optimizer" && (
                     <div className="mb-6">
                         <EvalRunner />
                     </div>
                 )}
 
                 {/* Phase 6b G8: 对比结果 */}
-                {comparisonData && isCompareMode && evalMode !== "generator" && (
+                {comparisonData && isCompareMode && evalMode !== "generator" && evalMode !== "optimizer" && (
                     <CompareResults data={comparisonData} />
                 )}
 
-                {/* Phase 6a: 评估模式切换 + G7 生成 */}
+                {/* Phase 6a: 评估模式切换 + G7 生成 + G10 优化 */}
                 <div className="mb-4 flex gap-1 rounded-lg bg-[var(--panel-soft)] p-1">
-                    {["offline", "online", "generator"].map((mode) => (
+                    {["offline", "online", "generator", "optimizer"].map((mode) => (
                         <button
                             key={mode}
                             type="button"
@@ -1019,7 +1550,7 @@ export default function EvalDashboard() {
                                     : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
                             }`}
                         >
-                            {mode === "offline" ? "📋 离线评估" : mode === "online" ? "🌐 在线采样" : "🤖 生成用例"}
+                            {mode === "offline" ? "📋 离线评估" : mode === "online" ? "🌐 在线采样" : mode === "generator" ? "🤖 生成用例" : "🔄 优化闭环"}
                         </button>
                     ))}
                 </div>
@@ -1029,8 +1560,13 @@ export default function EvalDashboard() {
                     <GeneratorPanel />
                 )}
 
+                {/* ── G10: 优化闭环面板 ── */}
+                {evalMode === "optimizer" && (
+                    <OptimizationPanel />
+                )}
+
                 {/* Stat cards */}
-                {evalMode !== "generator" && (
+                {evalMode !== "generator" && evalMode !== "optimizer" && (
                 <>
                 <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
                     <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
@@ -1097,7 +1633,7 @@ export default function EvalDashboard() {
                     </div>
                 )}
                 </>
-                )}{/* end evalMode !== "generator" */}
+                )}{/* end evalMode !== "generator" && evalMode !== "optimizer" */}
             </div>
         </div>
     );

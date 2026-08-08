@@ -43,3 +43,9 @@ leetcode-progress.json
 # 本地文件
 docs
 test
+
+# Memory / Session artifacts
+memory/
+skills-lock.json
+tmp_obs.json
+*.bak.*

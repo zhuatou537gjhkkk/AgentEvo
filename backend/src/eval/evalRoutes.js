@@ -14,7 +14,7 @@ import { EvalRunner } from "./runner.js";
 import { TestCaseGenerator } from "./generator.js";
 import { getTestCasesByCategory, getTestCaseCategories, testCases } from "./testCases.js";
 import { getRunSummary, getTrends, getTrendsByRun, getRunList, getFeedback, getFeedbackStats } from "./metrics.js";
-import { saveFeedback, getScoresByRun } from "../db/index.js";
+import { saveFeedback, getScoresByRun, listConfigVersions } from "../db/index.js";
 import {
     getGeneratedTestCases,
     getGeneratedTestCaseById,
@@ -22,6 +22,7 @@ import {
     deleteGeneratedTestCase,
     approveGeneratedTestCases,
 } from "../db/index.js";
+import { OptimizationPipeline } from "../services/optimize.js";
 
 const router = express.Router();
 
@@ -435,6 +436,191 @@ router.post("/compare", (req, res) => {
         });
     } catch (err) {
         console.error(`[eval] POST /compare failed:`, err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
+// ══════════════════════════════════════════════════════════
+// Phase 6c G10: 优化闭环流水线
+// ══════════════════════════════════════════════════════════
+
+const optimizer = new OptimizationPipeline();
+
+/**
+ * POST /eval/optimize/analyze
+ * Step ①+②: 分析 BadCase + 根因分类
+ *
+ * Body: { runId: string }
+ */
+router.post("/optimize/analyze", (req, res) => {
+    try {
+        const { runId } = req.body || {};
+        if (!runId) {
+            return res.status(400).json({ ok: false, message: "runId 不能为空" });
+        }
+
+        const result = optimizer.analyze(runId);
+
+        // analyze() 是同步的（只读 DB），包装成 Promise 统一接口
+        Promise.resolve(result).then(data => {
+            res.json({ ok: true, ...data });
+        }).catch(err => {
+            console.error(`[eval] POST /optimize/analyze failed:`, err.message);
+            res.status(500).json({ ok: false, message: err.message });
+        });
+    } catch (err) {
+        console.error(`[eval] POST /optimize/analyze failed:`, err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
+/**
+ * POST /eval/optimize/suggest
+ * Step ③: LLM 生成优化建议
+ *
+ * Body: { runId: string, badCases: object[] }
+ */
+router.post("/optimize/suggest", async (req, res) => {
+    try {
+        const { runId, badCases = [] } = req.body || {};
+        if (!runId) {
+            return res.status(400).json({ ok: false, message: "runId 不能为空" });
+        }
+
+        const result = await optimizer.suggest(runId, badCases);
+        res.json({ ok: true, ...result });
+    } catch (err) {
+        console.error(`[eval] POST /optimize/suggest failed:`, err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
+/**
+ * POST /eval/optimize/apply
+ * Step ④: 应用优化变更
+ *
+ * Body: {
+ *   sourceRunId: string,
+ *   changes: [{key: string, value: string}, ...],
+ *   suggestions?: object[],
+ *   badCaseIds?: string[],
+ *   scoreBefore?: object,
+ *   label?: string
+ * }
+ */
+router.post("/optimize/apply", async (req, res) => {
+    try {
+        const {
+            sourceRunId,
+            changes = [],
+            suggestions = [],
+            badCaseIds = [],
+            scoreBefore = null,
+            label = "",
+        } = req.body || {};
+
+        if (!sourceRunId) {
+            return res.status(400).json({ ok: false, message: "sourceRunId 不能为空" });
+        }
+        if (!Array.isArray(changes) || changes.length === 0) {
+            return res.status(400).json({ ok: false, message: "changes 不能为空" });
+        }
+
+        const result = await optimizer.apply(
+            sourceRunId,
+            changes,
+            suggestions,
+            badCaseIds,
+            scoreBefore,
+            label
+        );
+
+        res.json(result);
+    } catch (err) {
+        console.error(`[eval] POST /optimize/apply failed:`, err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
+/**
+ * POST /eval/optimize/reevaluate
+ * Step ⑤: 用新配置重评 BadCase
+ *
+ * Body: { optimizationLogId: number, testCaseIds: string[] }
+ */
+router.post("/optimize/reevaluate", async (req, res) => {
+    try {
+        const { optimizationLogId, testCaseIds = [] } = req.body || {};
+
+        if (!optimizationLogId) {
+            return res.status(400).json({ ok: false, message: "optimizationLogId 不能为空" });
+        }
+        if (!Array.isArray(testCaseIds) || testCaseIds.length === 0) {
+            return res.status(400).json({ ok: false, message: "testCaseIds 不能为空" });
+        }
+
+        const result = await optimizer.reevaluate(optimizationLogId, testCaseIds);
+        res.json(result);
+    } catch (err) {
+        console.error(`[eval] POST /optimize/reevaluate failed:`, err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
+/**
+ * GET /eval/optimize/history
+ * 获取优化历史列表
+ *
+ * Query: ?limit=20
+ */
+router.get("/optimize/history", (req, res) => {
+    try {
+        const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
+        const logs = optimizer.getHistory(limit);
+
+        // G10: 为每条日志补充 config_version_before，供前端回滚使用
+        // config_version_id 是优化后的快照，回滚应恢复到优化前的版本
+        try {
+            const allVersions = listConfigVersions(200); // id DESC
+            for (const log of logs) {
+                if (log.config_version_id) {
+                    const before = allVersions.find(v => v.id < log.config_version_id);
+                    log.config_version_before = before ? before.id : null;
+                } else {
+                    log.config_version_before = null;
+                }
+            }
+        } catch (e) {
+            // 版本查询失败不阻塞历史返回
+            console.warn("[eval] /optimize/history enrich config_version_before failed:", e.message);
+            for (const log of logs) log.config_version_before = null;
+        }
+
+        res.json({ ok: true, logs });
+    } catch (err) {
+        console.error(`[eval] GET /optimize/history failed:`, err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
+/**
+ * GET /eval/optimize/:id
+ * 获取单条优化记录详情
+ */
+router.get("/optimize/:id", (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        if (!id || id <= 0) {
+            return res.status(400).json({ ok: false, message: "invalid id" });
+        }
+
+        const log = optimizer.getOne(id);
+        if (!log) {
+            return res.status(404).json({ ok: false, message: "优化记录不存在" });
+        }
+        res.json({ ok: true, log });
+    } catch (err) {
+        console.error(`[eval] GET /optimize/:id failed:`, err.message);
         res.status(500).json({ ok: false, message: err.message });
     }
 });

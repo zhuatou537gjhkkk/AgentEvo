@@ -63,6 +63,12 @@ let selectConfigVersionByIdStmt = null;
 let updateConfigVersionLabelStmt = null;
 let deleteConfigVersionStmt = null;
 
+// ── Phase 6c G10: 优化闭环流水线 ──
+let insertOptimizationLogStmt = null;
+let selectOptimizationLogsStmt = null;
+let selectOptimizationLogByIdStmt = null;
+let updateOptimizationLogStmt = null;
+
 // ── Phase 6b G7: 评测集自动生成 ──
 let insertGeneratedTestCaseStmt = null;
 let selectGeneratedTestCasesStmt = null;
@@ -401,6 +407,38 @@ export function initDB() {
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_eval_test_cases_cat ON eval_test_cases(category)`).run();
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_eval_test_cases_reviewed ON eval_test_cases(reviewed)`).run();
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_eval_test_cases_batch ON eval_test_cases(gen_batch_id)`).run();
+
+    // ── Phase 6c G10: 优化闭环日志 ──
+    db.prepare(
+        `
+        CREATE TABLE IF NOT EXISTS optimization_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_run_id TEXT NOT NULL,
+            target_run_id TEXT,
+            config_version_id INTEGER,
+            label TEXT,
+            bad_case_ids TEXT NOT NULL DEFAULT '[]',
+            changes TEXT NOT NULL DEFAULT '[]',
+            suggestions TEXT NOT NULL DEFAULT '[]',
+            score_before TEXT,
+            score_after TEXT,
+            status TEXT NOT NULL DEFAULT 'applied',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        `
+    ).run();
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_optimization_log_run ON optimization_log(source_run_id)`).run();
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_optimization_log_status ON optimization_log(status)`).run();
+
+    // G10: optimization_log prepared statements
+    if (!insertOptimizationLogStmt) {
+        insertOptimizationLogStmt = db.prepare(
+            `INSERT INTO optimization_log
+                (source_run_id, target_run_id, config_version_id, label, bad_case_ids,
+                 changes, suggestions, score_before, score_after, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        );
+    }
 
     if (!insertMessageStmt) {
         insertMessageStmt = db.prepare(
@@ -2082,6 +2120,119 @@ export function getGeneratedTestCaseIds({ category = null, reviewed = null } = {
 function safeJsonParse(str, fallback) {
     if (!str) return fallback;
     try { return JSON.parse(str); } catch { return fallback; }
+}
+
+// ══════════════════════════════════════════════════════════
+// Phase 6c G10: 优化闭环 — 日志 CRUD
+// ══════════════════════════════════════════════════════════
+
+function ensureOptimizationLogStatements() {
+    if (!selectOptimizationLogsStmt) {
+        selectOptimizationLogsStmt = db.prepare(
+            "SELECT * FROM optimization_log ORDER BY created_at DESC LIMIT ?"
+        );
+    }
+    if (!selectOptimizationLogByIdStmt) {
+        selectOptimizationLogByIdStmt = db.prepare(
+            "SELECT * FROM optimization_log WHERE id = ?"
+        );
+    }
+    if (!updateOptimizationLogStmt) {
+        updateOptimizationLogStmt = db.prepare(
+            `UPDATE optimization_log
+             SET target_run_id = COALESCE(?, target_run_id),
+                 score_after = COALESCE(?, score_after),
+                 status = COALESCE(?, status)
+             WHERE id = ?`
+        );
+    }
+}
+
+/**
+ * 保存优化日志
+ * @param {object} log
+ * @returns {number} id
+ */
+export function saveOptimizationLog({
+    sourceRunId,
+    targetRunId = null,
+    configVersionId = null,
+    label = null,
+    badCaseIds = [],
+    changes = [],
+    suggestions = [],
+    scoreBefore = null,
+    scoreAfter = null,
+    status = "applied",
+}) {
+    if (!insertOptimizationLogStmt) initDB();
+    const result = insertOptimizationLogStmt.run(
+        String(sourceRunId),
+        targetRunId ? String(targetRunId) : null,
+        configVersionId ? Number(configVersionId) : null,
+        label ? String(label) : null,
+        JSON.stringify(badCaseIds),
+        JSON.stringify(changes),
+        JSON.stringify(suggestions),
+        scoreBefore ? JSON.stringify(scoreBefore) : null,
+        scoreAfter ? JSON.stringify(scoreAfter) : null,
+        String(status)
+    );
+    return Number(result.lastInsertRowid);
+}
+
+/**
+ * 查询优化日志列表
+ * @param {number} limit
+ * @returns {Array}
+ */
+export function getOptimizationLogs(limit = 20) {
+    ensureOptimizationLogStatements();
+    const rows = selectOptimizationLogsStmt.all(limit);
+    return rows.map(row => ({
+        ...row,
+        bad_case_ids: safeJsonParse(row.bad_case_ids, []),
+        changes: safeJsonParse(row.changes, []),
+        suggestions: safeJsonParse(row.suggestions, []),
+        score_before: safeJsonParse(row.score_before, null),
+        score_after: safeJsonParse(row.score_after, null),
+    }));
+}
+
+/**
+ * 获取单条优化日志
+ * @param {number} id
+ * @returns {object|null}
+ */
+export function getOptimizationLogById(id) {
+    ensureOptimizationLogStatements();
+    const row = selectOptimizationLogByIdStmt.get(id);
+    if (!row) return null;
+    return {
+        ...row,
+        bad_case_ids: safeJsonParse(row.bad_case_ids, []),
+        changes: safeJsonParse(row.changes, []),
+        suggestions: safeJsonParse(row.suggestions, []),
+        score_before: safeJsonParse(row.score_before, null),
+        score_after: safeJsonParse(row.score_after, null),
+    };
+}
+
+/**
+ * 更新优化日志（重评完成后调用）
+ * @param {number} id
+ * @param {object} updates
+ * @returns {boolean}
+ */
+export function updateOptimizationLog(id, { targetRunId, scoreAfter, status } = {}) {
+    ensureOptimizationLogStatements();
+    const result = updateOptimizationLogStmt.run(
+        targetRunId ? String(targetRunId) : null,
+        scoreAfter ? JSON.stringify(scoreAfter) : null,
+        status || null,
+        id
+    );
+    return result.changes > 0;
 }
 
 export default db;

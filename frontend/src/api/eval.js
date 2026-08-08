@@ -196,3 +196,92 @@ export async function compareRuns(runIds = []) {
     });
     return res.json();
 }
+
+// ══════════════════════════════════════════════════════════
+// Phase 6c G10: 优化闭环流水线
+// ══════════════════════════════════════════════════════════
+
+/**
+ * Step ①+②: 分析 BadCase + 根因分类
+ * @param {string} runId
+ * @returns {Promise<object>}
+ */
+export async function analyzeBadCases(runId) {
+    const res = await request("/eval/optimize/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ runId }),
+    });
+    return res.json();
+}
+
+/**
+ * Step ③: LLM 生成优化建议
+ * @param {string} runId
+ * @param {object[]} badCases
+ * @returns {Promise<object>}
+ */
+export async function suggestOptimizations(runId, badCases = []) {
+    const res = await request("/eval/optimize/suggest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ runId, badCases }),
+    }, { timeoutMs: 120000 }); // 2min — LLM 生成需要时间
+    return res.json();
+}
+
+/**
+ * Step ④: 应用优化变更
+ * @param {object} params
+ * @returns {Promise<object>}
+ */
+export async function applyOptimizations({
+    sourceRunId,
+    changes = [],
+    suggestions = [],
+    badCaseIds = [],
+    scoreBefore = null,
+    label = "",
+} = {}) {
+    const res = await request("/eval/optimize/apply", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sourceRunId, changes, suggestions, badCaseIds, scoreBefore, label }),
+    });
+    return res.json();
+}
+
+/**
+ * Step ⑤: 重评验证
+ * @param {number} optimizationLogId
+ * @param {string[]} testCaseIds
+ * @returns {Promise<object>}
+ */
+export async function reevaluateOptimization(optimizationLogId, testCaseIds = []) {
+    const res = await request("/eval/optimize/reevaluate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ optimizationLogId, testCaseIds }),
+    }, { timeoutMs: 10 * 60 * 1000 }); // 10min
+    return res.json();
+}
+
+/**
+ * 获取优化历史
+ * @param {number} [limit=20]
+ * @returns {Promise<object>}
+ */
+export async function fetchOptimizationHistory(limit = 20) {
+    const res = await request(`/eval/optimize/history?limit=${limit}`, { method: "GET" });
+    return res.json();
+}
+
+/**
+ * 获取单条优化记录详情
+ * @param {number} id
+ * @returns {Promise<object>}
+ */
+export async function fetchOptimizationLog(id) {
+    const res = await request(`/eval/optimize/${id}`, { method: "GET" });
+    return res.json();
+}

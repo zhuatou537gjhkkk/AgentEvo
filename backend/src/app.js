@@ -24,6 +24,7 @@ import {
     getRecentObservability,
     getRecentTraces,
     getTraceById,
+    saveTrace,
     removeMessagePair,
     saveFeedback,
     getFeedbackByMessage,
@@ -675,6 +676,87 @@ app.get("/observability/traces/:traceId", requireAuth, (req, res) => {
     }
 });
 
+// GET /observability/traces/:traceId/otel — Phase 6c OTel: 导出为 OpenTelemetry 格式
+app.get("/observability/traces/:traceId/otel", requireAuth, (req, res) => {
+    try {
+        const trace = getTraceById(req.params.traceId);
+        if (!trace) {
+            return res.status(404).json({ ok: false, message: "trace not found" });
+        }
+        const rootSpan = (() => {
+            try { return JSON.parse(trace.root_span || "{}"); } catch { return {}; }
+        })();
+        const agentTraversalPath = (() => {
+            try { return JSON.parse(trace.agent_traversal_path || "[]"); } catch { return []; }
+        })();
+
+        const traceRecord = {
+            traceId: trace.trace_id,
+            rootSpan,
+            agentTraversalPath,
+            toolCallCount: trace.tool_call_count,
+            errorCount: trace.error_count,
+            model: trace.model,
+        };
+
+        const otelFormat = TraceCollector.toOpenTelemetry(traceRecord);
+        if (!otelFormat) {
+            return res.status(500).json({ ok: false, message: "failed to convert to OTel format" });
+        }
+        return res.json({ ok: true, otel: otelFormat });
+    } catch (err) {
+        console.error("[observability/traces/:id/otel] GET failed:", err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
+// POST /observability/otel/import — Phase 6c OTel: 导入外部 OTel Trace
+app.post("/observability/otel/import", requireAuth, (req, res) => {
+    try {
+        const { otel } = req.body || {};
+        if (!otel) {
+            return res.status(400).json({ ok: false, message: "otel is required in request body" });
+        }
+        // 支持 JSON 字符串或已解析对象
+        const otelJson = typeof otel === "string" ? JSON.parse(otel) : otel;
+
+        // 获取有效 session_id：导入 Trace 没有真实 session，取用户最新 session 兜底
+        let sessionId = Number(req.body?.session_id) || 0;
+        if (!sessionId) {
+            const sessions = getSessions(req.user.id);
+            if (sessions.length > 0) {
+                sessionId = sessions[0].id;
+            } else {
+                // 用户没有任何 session，创建一个占位 session
+                const newSession = createSession(req.user.id, "OTel 导入");
+                sessionId = newSession.id;
+            }
+        }
+
+        const internal = otelToInternalTrace(otelJson, {
+            userId: req.user.id,
+            sessionId,
+        });
+
+        if (!internal) {
+            return res.status(400).json({ ok: false, message: "failed to parse OTel trace: no valid spans found" });
+        }
+
+        // 写入 DB
+        const id = saveTrace(internal);
+        console.log(`[observability/otel/import] imported trace "${internal.traceId}" (${internal.toolCallCount} tools, ${internal.agentTraversalPath.length} agents), db id=${id}`);
+        return res.json({
+            ok: true,
+            trace_id: internal.traceId,
+            db_id: id,
+            spans: internal.agentTraversalPath.length + internal.toolCallCount,
+        });
+    } catch (err) {
+        console.error("[observability/otel/import] POST failed:", err.message);
+        res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
 // ── Phase 5: 评估系统路由 ──
 app.use("/eval", requireAuth, evalRoutes);
 
@@ -724,6 +806,8 @@ app.post("/chat/feedback", requireAuth, (req, res) => {
 
 import { agentConfig } from "./services/agentConfig.js";
 import { metricsAggregator } from "./trace/metrics.js";
+import { TraceCollector } from "./trace/collector.js";
+import { otelToInternalTrace } from "./trace/import.js";
 
 app.get("/agent-config", requireAuth, (req, res) => {
     try {

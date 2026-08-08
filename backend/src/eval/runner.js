@@ -54,9 +54,14 @@ class EvalRunner {
         const selected = testCaseIds.length > 0
             ? testCaseIds.map(resolveTestCase).filter(Boolean)
             : testCases;
+
+        // Phase 6c G10 fix: 如果调用方明确指定了 ID 但全部解析失败，
+        // 不要静默回退到全部用例 — 这会导致优化重评跑错用例。
+        const allResolvedFailed = testCaseIds.length > 0 && selected.length === 0;
+
         const targetTestCases = testCaseIds.length === 0 && selected.length === 0
-            ? [] // All tests filtered out
-            : (selected.length > 0 ? selected : testCases);
+            ? [] // All tests filtered out (no IDs specified, none found)
+            : (selected.length > 0 ? selected : (allResolvedFailed ? [] : testCases));
 
         if (targetTestCases.length === 0) {
             return {
