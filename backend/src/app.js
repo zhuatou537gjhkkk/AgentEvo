@@ -30,7 +30,7 @@ import {
     getFeedbackByMessage,
     deleteFeedback,
 } from "./db/index.js";
-import { chatWithStream, estimateTokens } from "./services/chat.js";
+import { chatWithStream, estimateTokens, resolveModelName, getModelContextWindow } from "./services/chat.js";
 import { chatWithGraph } from "./services/chatGraph.js";
 import { resolveUserQuestion } from "./mcp/tools.js";
 import { toolRegistry } from "./mcp/registry.js";
@@ -523,6 +523,147 @@ app.get("/sessions/:id/messages", requireAuth, (req, res) => {
         ok: true,
         messages: history
     });
+});
+
+// ── 上下文窗口管理 ──
+
+// GET /sessions/:id/context-usage — 估算当前会话的 token 用量
+app.get("/sessions/:id/context-usage", requireAuth, (req, res) => {
+    const sessionId = Number(req.params.id);
+    if (!Number.isInteger(sessionId) || sessionId <= 0) {
+        return res.status(400).json({ ok: false, message: "invalid session id" });
+    }
+
+    try {
+        const history = getHistoryMessages(req.user.id, sessionId, 200);
+        // 从最新向最旧遍历，遇到压缩摘要标记即停止——被压缩替换的消息不再计入
+        let totalTokens = 0;
+        for (let i = history.length - 1; i >= 0; i--) {
+            const msg = history[i];
+            // 压缩摘要替代了所有更早的消息，遇到后停止遍历
+            if (msg.role === "system" && String(msg.content || "").startsWith("[上下文压缩摘要")) {
+                totalTokens += msg.metrics?.total_tokens || estimateTokens(String(msg.content || ""));
+                break;
+            }
+            if (msg.metrics && typeof msg.metrics.total_tokens === "number") {
+                totalTokens += msg.metrics.total_tokens;
+            } else {
+                totalTokens += estimateTokens(String(msg.content || ""));
+            }
+        }
+        // 预留 ~2000 tokens 给系统提示词 + 工具定义
+        const overheadTokens = 2000;
+        const usedTokens = totalTokens + overheadTokens;
+
+        // 从当前模型配置读取上下文窗口上限
+        const modelName = resolveModelName(false);
+        const maxTokens = getModelContextWindow(modelName);
+
+        return res.json({
+            ok: true,
+            data: {
+                sessionId,
+                usedTokens,
+                maxTokens,
+                ratio: Math.round((usedTokens / maxTokens) * 100),
+                messageCount: history.length,
+                modelName,
+            },
+        });
+    } catch (err) {
+        console.error("[context-usage] GET failed:", err.message);
+        return res.status(500).json({ ok: false, message: err.message });
+    }
+});
+
+// POST /sessions/:id/compact — 压缩上下文：LLM 摘要旧消息
+app.post("/sessions/:id/compact", requireAuth, async (req, res) => {
+    const sessionId = Number(req.params.id);
+    if (!Number.isInteger(sessionId) || sessionId <= 0) {
+        return res.status(400).json({ ok: false, message: "invalid session id" });
+    }
+
+    try {
+        const history = getHistoryMessages(req.user.id, sessionId, 200);
+
+        // 保留最近 6 条消息（3 轮对话），更早的纳入压缩
+        const KEEP_RECENT = 6;
+        const messagesToCompact = history.slice(0, Math.max(0, history.length - KEEP_RECENT));
+
+        if (messagesToCompact.length === 0) {
+            console.log(`[compact] session ${sessionId}: 0 messages to compact (total ${history.length}, keep ${KEEP_RECENT})`);
+            return res.json({
+                ok: true,
+                data: { summary: null, tokensSaved: 0, messageCount: 0, message: "没有需要压缩的消息" },
+            });
+        }
+
+        console.log(`[compact] session ${sessionId}: compacting ${messagesToCompact.length} messages, keeping recent ${KEEP_RECENT}`);
+
+        // 拼接对话文本 + 估算压缩前的 token 数
+        const conversationText = messagesToCompact
+            .map((m) => `[${m.role === "user" ? "用户" : "助手"}]: ${m.content}`)
+            .join("\n\n");
+        let tokensBefore = 0;
+        for (const msg of messagesToCompact) {
+            tokensBefore += msg.metrics?.total_tokens || estimateTokens(String(msg.content || ""));
+        }
+
+        // 调 LLM 生成摘要
+        const { ChatOpenAI } = await import("@langchain/openai");
+        const { SystemMessage, HumanMessage } = await import("@langchain/core/messages");
+        const chatUtils = await import("./services/chatUtils.js");
+        const config = chatUtils.buildChatOpenAIConfig(false);
+        const llm = new ChatOpenAI({
+            modelName: chatUtils.resolveModelName(false),
+            temperature: 0.3,
+            ...config,
+        });
+
+        const systemMsg = new SystemMessage(
+            "你是一个对话摘要助手。请用中文将以下对话历史压缩为一段简洁的摘要，" +
+            "保留关键信息：用户的主要问题、你的回答要点、重要决策或结论。" +
+            "摘要控制在 150-300 字以内。"
+        );
+        const userMsg = new HumanMessage(
+            `对话历史：\n\n${conversationText.slice(0, 12000)}\n\n请生成摘要：`
+        );
+
+        const result = await llm.invoke([systemMsg, userMsg]);
+        const summaryContent = String(result?.content || "").trim();
+
+        if (!summaryContent) {
+            return res.status(500).json({ ok: false, message: "LLM 摘要生成失败" });
+        }
+
+        console.log(`[compact] session ${sessionId}: LLM summary generated (${summaryContent.length} chars)`);
+
+        const summaryTokens = estimateTokens(summaryContent);
+        const tokensSaved = Math.max(0, tokensBefore - summaryTokens);
+        console.log(`[compact] session ${sessionId}: tokensSaved=${tokensSaved}, tokensBefore=${tokensBefore}, summaryTokens=${summaryTokens}`);
+
+        // 存摘要为 system 消息（标记为上下文压缩边界）
+        saveMessage(
+            req.user.id,
+            sessionId,
+            "system",
+            `[上下文压缩摘要 — ${new Date().toLocaleString("zh-CN")}]\n${summaryContent}`
+        );
+
+        return res.json({
+            ok: true,
+            data: {
+                summary: summaryContent,
+                tokensSaved,
+                tokensBefore,
+                summaryTokens,
+                compactedMessages: messagesToCompact.length,
+            },
+        });
+    } catch (err) {
+        console.error("[compact] POST failed:", err.message);
+        return res.status(500).json({ ok: false, message: err.message });
+    }
 });
 
 app.delete("/sessions/:id/messages/:messageId/pair", requireAuth, (req, res) => {

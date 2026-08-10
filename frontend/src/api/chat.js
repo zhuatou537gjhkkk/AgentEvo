@@ -926,3 +926,19 @@ export async function importOtelTrace(otel, sessionId = 0) {
     });
     return res.json();
 }
+
+// ═══════════════════════════════════════════════════════
+// 上下文窗口管理 (Context Window Management)
+// ═══════════════════════════════════════════════════════
+
+/** 获取当前会话的 token 用量估算 */
+export async function fetchContextUsage(sessionId) {
+    const res = await request(`/sessions/${sessionId}/context-usage`);
+    return res.json();
+}
+
+/** 压缩会话上下文（LLM 摘要旧消息） */
+export async function compactContext(sessionId) {
+    const res = await request(`/sessions/${sessionId}/compact`, { method: "POST" });
+    return res.json();
+}

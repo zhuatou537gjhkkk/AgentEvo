@@ -16,6 +16,7 @@ import {
     deleteMessagePair,
     sendUserAnswer,
 } from '../api/chat';
+import { fetchContextUsage, compactContext } from '../api/chat';
 import { createToolExecutionStateMachine, ToolStatus } from '../utils/toolExecutionStateMachine';
 
 // 模块级 Map：存储活跃 FSM 及其 syncToolLogs，用于 stop 时立即取消工具
@@ -308,6 +309,9 @@ export const useChatStore = create(persist((set, get) => ({
     enableWebSearch: false,
     planMode: false,
     enableMemory: true,
+    // 上下文窗口管理
+    contextUsage: null,         // { usedTokens, maxTokens, ratio, messageCount, modelName }
+    isCompacting: false,
     systemPrompt: DEFAULT_SYSTEM_PROMPT,
     temperature: DEFAULT_TEMPERATURE,
     sessionAgentSettings: {},
@@ -517,6 +521,41 @@ export const useChatStore = create(persist((set, get) => ({
 
             return { enableMemory: Boolean(nextValue) };
         });
+    },
+    // 上下文窗口管理
+    fetchContextUsage: async (sessionId) => {
+        if (!sessionId) return;
+        try {
+            const data = await fetchContextUsage(sessionId);
+            if (data?.ok) {
+                set({ contextUsage: data.data });
+            }
+        } catch (err) {
+            // 静默失败，不阻塞用户操作
+            console.error("[store] fetchContextUsage failed:", err);
+        }
+    },
+    compactContext: async (sessionId) => {
+        if (!sessionId) return;
+        set({ isCompacting: true });
+        try {
+            const data = await compactContext(sessionId);
+            console.log("[store] compactContext response:", data);
+            if (data?.ok) {
+                // 重新加载消息列表以获取摘要消息
+                const history = await fetchMessagesBySession(sessionId);
+                set((state) => {
+                    if (state.currentSessionId !== sessionId) return {};
+                    return { messages: Array.isArray(history) ? history : state.messages };
+                });
+                // 刷新上下文用量
+                await get().fetchContextUsage(sessionId);
+            }
+        } catch (err) {
+            console.error("[store] compactContext failed:", err);
+        } finally {
+            set({ isCompacting: false });
+        }
     },
     setSelectedImage: (payload) => {
         set({ selectedImage: payload || null });
@@ -1152,6 +1191,9 @@ export const useChatStore = create(persist((set, get) => ({
                     };
                 })(),
             });
+
+            // 切会话后刷新上下文用量
+            get().fetchContextUsage(id);
         } catch (error) {
             const state = get();
             if (state.activeSessionRequestId !== requestId || state.currentSessionId !== id) {
@@ -2264,6 +2306,9 @@ export const useChatStore = create(persist((set, get) => ({
                     })
                     .catch(() => {
                         // Ignore refresh failures and keep optimistic messages.
+                    })
+                    .finally(() => {
+                        get().fetchContextUsage(sessionId);
                     });
             },
             (error) => {
@@ -2319,6 +2364,9 @@ export const useChatStore = create(persist((set, get) => ({
                             imageId: selectedImageId,
                         },
                 }));
+
+                // 出错后刷新上下文用量
+                get().fetchContextUsage(sessionId);
             },
             {
                 signal: controller.signal,

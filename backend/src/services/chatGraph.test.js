@@ -111,6 +111,7 @@ vi.mock('./chatUtils.js', () => ({
 
 import {
     mapIntentToNode,
+    resolveSubTaskNode,
     enforceSubTaskOrder,
     subTasksToPlan,
     isSoloRun,
@@ -345,6 +346,80 @@ describe('fanoutBySubTasks — subTask 驱动扇出 (路径A)', () => {
         const result = fanoutBySubTasks({ subTasks: [] });
         expect(result).toBe('synthesizer');
     });
+
+    // Phase 4: agent routing tests
+    it('single agent subTask -> Send to agent node', () => {
+        const result = fanoutBySubTasks({
+            subTasks: [
+                { id: '1', type: 'agent', agent: 'search', goal: 'search for news', status: 'pending', content: 'search' },
+            ],
+        });
+        expect(result).toBeInstanceOf(Send);
+        expect(result.node).toBe('search_agent');
+        expect(result.state.currentSubTask.goal).toBe('search for news');
+        expect(result.state.currentSubTask.status).toBe('in_progress');
+    });
+
+    it('multiple agent subTasks -> Send[] to respective nodes', () => {
+        const result = fanoutBySubTasks({
+            subTasks: [
+                { id: '1', type: 'agent', agent: 'search', goal: 's1', status: 'pending', content: 'c1' },
+                { id: '2', type: 'agent', agent: 'knowledge', goal: 'k1', status: 'pending', content: 'c2' },
+            ],
+        });
+        expect(Array.isArray(result)).toBe(true);
+        expect(result).toHaveLength(2);
+        expect(result[0].node).toBe('search_agent');
+        expect(result[1].node).toBe('knowledge_agent');
+    });
+
+    it('mixed agent + tool subTasks -> Send[] to respective nodes', () => {
+        const result = fanoutBySubTasks({
+            subTasks: [
+                { id: '1', type: 'agent', agent: 'search', goal: 's1', status: 'pending', content: 'c1' },
+                { id: '2', type: 'tool', toolName: 'web_search', status: 'pending', content: 'c2' },
+            ],
+        });
+        expect(Array.isArray(result)).toBe(true);
+        expect(result).toHaveLength(2);
+        expect(result[0].node).toBe('search_agent');
+        expect(result[1].node).toBe('tool_executor'); // backward compat
+    });
+
+    it('unknown agent -> fallback to tool_executor', () => {
+        const result = fanoutBySubTasks({
+            subTasks: [
+                { id: '1', type: 'agent', agent: 'unknown_xyz', goal: 'x', status: 'pending', content: 'c1' },
+            ],
+        });
+        expect(result).toBeInstanceOf(Send);
+        expect(result.node).toBe('tool_executor');
+    });
+});
+
+// ============================================================
+// resolveSubTaskNode — subTask 类型→节点名解析
+// ============================================================
+
+describe('resolveSubTaskNode — 节点解析', () => {
+    it('agent "search" -> "search_agent"', () => {
+        expect(resolveSubTaskNode({ type: 'agent', agent: 'search' })).toBe('search_agent');
+    });
+    it('agent "knowledge" -> "knowledge_agent"', () => {
+        expect(resolveSubTaskNode({ type: 'agent', agent: 'knowledge' })).toBe('knowledge_agent');
+    });
+    it('agent "code" -> "code_agent"', () => {
+        expect(resolveSubTaskNode({ type: 'agent', agent: 'code' })).toBe('code_agent');
+    });
+    it('agent "general" -> "general_chat"', () => {
+        expect(resolveSubTaskNode({ type: 'agent', agent: 'general' })).toBe('general_chat');
+    });
+    it('unknown agent -> "tool_executor"', () => {
+        expect(resolveSubTaskNode({ type: 'agent', agent: 'nonexistent' })).toBe('tool_executor');
+    });
+    it('type "tool" -> "tool_executor"', () => {
+        expect(resolveSubTaskNode({ type: 'tool', toolName: 'web_search' })).toBe('tool_executor');
+    });
 });
 
 // ============================================================
@@ -453,6 +528,28 @@ describe('enforceSubTaskOrder — 步骤排序', () => {
         const output = enforceSubTaskOrder(input);
         expect(output[0].id).toBe('1');
         expect(output[1].id).toBe('2');
+    });
+    // Phase 4: agent type
+    it('agent tasks sorted before reasoning', () => {
+        const input = [
+            { id: '1', type: 'reasoning', content: 'r', status: 'pending' },
+            { id: '2', type: 'agent', agent: 'search', goal: 's', content: 'a', status: 'pending' },
+        ];
+        const result = enforceSubTaskOrder(input);
+        expect(result[0].type).toBe('agent');
+        expect(result[1].type).toBe('reasoning');
+    });
+    it('agent + tool + reasoning -> agents/tools first', () => {
+        const input = [
+            { id: '1', type: 'reasoning', content: 'r', status: 'pending' },
+            { id: '2', type: 'agent', agent: 'search', goal: 's', content: 'a', status: 'pending' },
+            { id: '3', type: 'tool', toolName: 'web_search', content: 't', status: 'pending' },
+        ];
+        const result = enforceSubTaskOrder(input);
+        expect(result.filter(s => s.type === 'reasoning')).toHaveLength(1);
+        expect(result[0].type !== 'reasoning').toBe(true);
+        expect(result[1].type !== 'reasoning').toBe(true);
+        expect(result[2].type).toBe('reasoning');
     });
 });
 

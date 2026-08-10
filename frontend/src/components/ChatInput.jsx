@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useChatStore } from '../store/chatStore';
 import { uploadFile, uploadImage } from '../api/chat';
+import ContextIndicator from './ContextIndicator';
 
 const MAX_IMAGE_UPLOAD_BYTES = 8 * 1024 * 1024;
 const TARGET_IMAGE_BYTES = 2 * 1024 * 1024;
@@ -468,6 +469,7 @@ export default function ChatInput() {
                         >
                             🧠 记忆: {enableMemory ? '开' : '关'}
                         </button>
+                        <ContextIndicator />
                     </div>
 
                     <div className="flex items-end gap-2 sm:gap-3">

@@ -19,9 +19,10 @@ import {
     buildDirectAnswerSystemInstruction,
     streamDirectChat,
     getAgentExecutor,
+    getModelContextWindow,
 } from "./chatUtils.js";
 
-export { estimateTokens, resolveModelName, buildChatOpenAIConfig, emitThought, toLangChainMessage, normalizeChunkContent, normalizeTemperature, resolveSystemPrompt, isCreativeTask, buildDirectAnswerSystemInstruction, streamDirectChat, getAgentExecutor, buildPrompt, buildHumanInputMessage, TOOL_ACTIVE_FORMS, PLAN_MODE_INSTRUCTION, WEB_SEARCH_TOOL_NAME, FORCED_WEB_SEARCH_MAX_CHARS, DEFAULT_SYSTEM_PROMPT, DEFAULT_TEMPERATURE } from "./chatUtils.js";
+export { estimateTokens, resolveModelName, getModelContextWindow, buildChatOpenAIConfig, emitThought, toLangChainMessage, normalizeChunkContent, normalizeTemperature, resolveSystemPrompt, isCreativeTask, buildDirectAnswerSystemInstruction, streamDirectChat, getAgentExecutor, buildPrompt, buildHumanInputMessage, TOOL_ACTIVE_FORMS, PLAN_MODE_INSTRUCTION, WEB_SEARCH_TOOL_NAME, FORCED_WEB_SEARCH_MAX_CHARS, DEFAULT_SYSTEM_PROMPT, DEFAULT_TEMPERATURE } from "./chatUtils.js";
 
 export async function chatWithStream(userId, session_id, userMessage, image, systemPromptInput, temperatureInput, res, options = {}) {
     const {

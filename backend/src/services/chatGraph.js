@@ -194,8 +194,8 @@ const AgentState = Annotation.Root({
 // ═══════════════════════════════════════════════════════
 
 function createSSEEmitter(res, traceCollector = null, traceId = null) {
-    /** @type {string|null} — current agent span ID */
-    let currentAgentSpanId = null;
+    /** @type {Map<string, string[]>} — agentType → spanId[] stack，支持同类型并行实例 */
+    const agentSpanStacks = new Map();
     /** @type {Map<string, string>} — toolCallId → toolSpanId */
     const toolSpanMap = new Map();
 
@@ -203,6 +203,12 @@ function createSSEEmitter(res, traceCollector = null, traceId = null) {
     const _traceAlive = () => traceCollector && traceId && traceCollector.getTrace(traceId);
 
     return {
+        /**
+         * 开始一个 Agent Span，返回 spanId（调用方可用于精确 end/tool 归属）。
+         * 同 agentType 并行实例：span 推入对应栈，tool/parent 取栈顶（当前活跃实例）。
+         * @param {string} agentType
+         * @returns {string|null} spanId
+         */
         agentStart(agentType) {
             const meta = AGENT_META[agentType] || {};
             const payload = {
@@ -213,12 +219,20 @@ function createSSEEmitter(res, traceCollector = null, traceId = null) {
             };
             try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch (_) { /* response ended */ }
             // Phase 5: start agent span
-            if (_traceAlive()) {
-                currentAgentSpanId = traceCollector.startSpan(traceId, payload.agentName, "agent",
-                    currentAgentSpanId || traceId);
+            if (!_traceAlive()) return null;
+            const spanId = traceCollector.startSpan(traceId, payload.agentName, "agent", traceId);
+            if (spanId) {
+                if (!agentSpanStacks.has(agentType)) agentSpanStacks.set(agentType, []);
+                agentSpanStacks.get(agentType).push(spanId);
             }
+            return spanId;
         },
-        agentEnd(agentType) {
+        /**
+         * 结束一个 Agent Span。
+         * @param {string} agentType
+         * @param {string|null} [exactSpanId] — 精确 spanId（同类型并行时必传），不传则 pop 栈顶
+         */
+        agentEnd(agentType, exactSpanId = null) {
             const meta = AGENT_META[agentType] || {};
             const payload = {
                 type: "agent_end",
@@ -228,9 +242,25 @@ function createSSEEmitter(res, traceCollector = null, traceId = null) {
             };
             try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch (_) { /* response ended */ }
             // Phase 5: end agent span
-            if (_traceAlive() && currentAgentSpanId) {
-                traceCollector.endSpan(traceId, currentAgentSpanId);
-                currentAgentSpanId = null;
+            if (!_traceAlive()) return;
+            const stack = agentSpanStacks.get(agentType);
+            if (!stack || stack.length === 0) return;
+
+            let spanId;
+            if (exactSpanId) {
+                // 精确匹配：从栈中移除指定 spanId
+                const idx = stack.indexOf(exactSpanId);
+                if (idx !== -1) {
+                    spanId = stack[idx];
+                    stack.splice(idx, 1);
+                }
+            } else {
+                // Fallback：pop 栈顶（兼容不同 agentType 的无并行场景）
+                spanId = stack.pop();
+            }
+            if (spanId) {
+                traceCollector.endSpan(traceId, spanId);
+                if (stack.length === 0) agentSpanStacks.delete(agentType);
             }
         },
         agentHandoff(fromType, toType) {
@@ -246,7 +276,7 @@ function createSSEEmitter(res, traceCollector = null, traceId = null) {
             };
             try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch (_) { /* response ended */ }
         },
-        toolStart(toolCallId, toolName, input, agentType) {
+        toolStart(toolCallId, toolName, input, agentType, parentSpanId = null) {
             const meta = AGENT_META[agentType] || {};
             const payload = {
                 type: "tool_start",
@@ -259,10 +289,11 @@ function createSSEEmitter(res, traceCollector = null, traceId = null) {
                 agentType: meta.type || agentType || "react",
             };
             try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch (_) { /* response ended */ }
-            // Phase 5: start tool span
+            // Phase 5: start tool span（精确 parentSpanId > 栈顶 > root）
             if (_traceAlive()) {
-                const parentId = currentAgentSpanId || traceId;
-                const toolSpanId = traceCollector.startSpan(traceId, toolName, "tool", parentId, { input });
+                const stack = agentSpanStacks.get(agentType);
+                const resolvedParent = parentSpanId || (stack && stack.length > 0 ? stack[stack.length - 1] : null) || traceId;
+                const toolSpanId = traceCollector.startSpan(traceId, toolName, "tool", resolvedParent, { input });
                 if (toolSpanId) toolSpanMap.set(toolCallId, toolSpanId);
             }
         },
@@ -321,6 +352,24 @@ function createSSEEmitter(res, traceCollector = null, traceId = null) {
             } catch (_) { /* response ended */ }
         },
     };
+}
+
+/**
+ * 发射 agent_start SSE 事件，并在其前发射 agent_handoff（从上一个 Agent 到当前 Agent）。
+ * 这确保了前端事件时间线的正确顺序：handoff → agent_start → ... → agent_end，
+ * 而不是之前的 agent_start → agent_end → handoff（handoff 在 streamGraphToSSE 后才发射）。
+ *
+ * @param {object} sse — SSE emitter
+ * @param {object} state — 当前 state（用于读取 state.currentAgent）
+ * @param {string} agentType — 当前 Agent 类型（如 "general", "search", "knowledge" 等）
+ * @returns {string|null} agent spanId
+ */
+function emitAgentStart(sse, state, agentType) {
+    if (sse && state.currentAgent && state.currentAgent !== agentType) {
+        sse.agentHandoff(state.currentAgent, agentType);
+    }
+    if (sse) return sse.agentStart(agentType);
+    return null;
 }
 
 // ═══════════════════════════════════════════════════════
@@ -719,32 +768,35 @@ async function plannerNode(state, config) {
 
     const prompt = `你是一个任务规划助手。将用户的请求分解为具体的执行步骤（subTasks）。
 
-当前可用的工具列表：
-${toolListText || "(暂无可用工具)"}
+当前可用的专业智能体（Agent）：
+- "search": 联网搜索专家 — 负责搜索最新网络信息、改写查询词、筛选结果
+- "knowledge": 知识库检索专家 — 负责从用户已上传的文档中检索相关内容
+- "code": 代码专家 — 负责编写、分析、调试代码
+- "general": 通用对话 — 负责不需要工具的纯文本分析和回答
 
 用户问题：${state.userInput}
 用户意图类型：${[...new Set(state.intents || [state.intent || "general"])].join("、")}
 
 每个 subTask 包含以下字段：
 - id: 字符串ID（从"1"递增）
-- type: "tool"（调用工具获取数据）或 "reasoning"（分析/推理/综合）
-- content: 步骤的人类可读描述
-- toolName: 仅 type="tool" 时需要，必须是上方可用工具列表中的工具名
-- toolInput: 仅 type="tool" 时需要，传递给工具的输入。⚠️ 必须是**纯字符串**（如搜索词、文件路径），不要用 JSON 对象！
+- type: "agent"（交给专业智能体执行）或 "reasoning"（分析/推理/综合，在最后一步）
+- agent: 仅 type="agent" 时需要，指定由哪个专业智能体执行（search/knowledge/code/general）
+- goal: 仅 type="agent" 时需要，描述这个步骤要达成的目标（自然语言，该智能体会用自己的专业知识执行）
+- content: 步骤的人类可读描述（显示在进度卡片中）
 - dependsOn: 依赖的前置步骤id列表，无依赖则为空数组[]
 - status: 固定为 "pending"
 
 步骤分解规则：
-1. type="tool" 的步骤放在前面，type="reasoning" 的步骤放在最后
-2. 多个独立的 tool 步骤之间 dependsOn 应为空（可并行执行）
-3. reasoning 步骤 dependsOn 应包含所有前置 tool 步骤的 id
-4. 通常 1-3 个 tool 步骤 + 1 个 reasoning 步骤即可
-5. ⚠️ toolInput 始终使用简单字符串，不要写成对象格式。文件读取传路径字符串，搜索传查询词字符串
+1. type="agent" 的步骤放在前面，type="reasoning" 的步骤放在最后
+2. 多个无依赖的 agent 步骤 dependsOn 应为空（可并行执行）
+3. reasoning 步骤 dependsOn 应包含所有前置 agent 步骤的 id
+4. 通常 1-3 个 agent 步骤 + 1 个 reasoning 步骤即可
+5. goal 写清楚要做什么即可，不需要指定用哪个工具——Agent 自己会决定
 
-请严格返回 JSON 数组（toolInput 必须是简单字符串，不要用对象字面量）：
+请严格返回 JSON 数组：
 [
-  {"id":"1", "type":"tool", "content":"搜索相关信息", "toolName":"web_search", "toolInput":"最近的AI新闻", "dependsOn":[], "status":"pending"},
-  {"id":"2", "type":"tool", "content":"读取指定文件", "toolName":"filesystem/read_file", "toolInput":"d:/AgentEvo/CLAUDE.md", "dependsOn":[], "status":"pending"},
+  {"id":"1", "type":"agent", "agent":"search", "goal":"获取最近的AI新闻动态", "content":"搜索最新AI新闻", "dependsOn":[], "status":"pending"},
+  {"id":"2", "type":"agent", "agent":"knowledge", "goal":"检索知识库中关于机器学习的文档", "content":"搜索知识库中的ML文档", "dependsOn":[], "status":"pending"},
   {"id":"3", "type":"reasoning", "content":"综合对比分析并给出最终回答", "dependsOn":["1","2"], "status":"pending"}
 ]
 
@@ -769,19 +821,31 @@ ${toolListText || "(暂无可用工具)"}
         console.log(`[graph][planner] LLM failed, generating fallback subTasks`);
         const agentMeta = AGENT_META[state.intent] || AGENT_META.general;
         subTasks = [
-            { id: "1", type: "reasoning", content: `执行${agentMeta.name}任务`, dependsOn: [], status: "pending" },
+            { id: "1", type: "agent", agent: state.intent || "general", goal: state.userInput, content: `执行${agentMeta.name}任务`, dependsOn: [], status: "pending" },
+            { id: "2", type: "reasoning", content: "综合结果并生成回答", dependsOn: ["1"], status: "pending" },
         ];
     }
 
     // Phase 4: subTask 可用性校验
+    const VALID_AGENTS = new Set(["search", "knowledge", "code", "general"]);
     subTasks = subTasks.map((st) => {
+        if (st.type === "agent" && st.agent) {
+            if (!VALID_AGENTS.has(st.agent)) {
+                console.log(`[graph][planner] unknown agent "${st.agent}", marking blocked`);
+                return { ...st, status: "blocked", blockedReason: `未知智能体 "${st.agent}"` };
+            }
+            // search agent 需要 enableWebSearch
+            if (st.agent === "search" && !state.enableWebSearch) {
+                return { ...st, status: "blocked", blockedReason: "联网搜索已关闭" };
+            }
+        }
+        // 向后兼容：旧格式 type="tool"
         if (st.type === "tool" && st.toolName) {
             const tool = toolRegistry.getTool(st.toolName);
             if (!tool) {
                 console.log(`[graph][planner] tool "${st.toolName}" not available, marking blocked`);
                 return { ...st, status: "blocked", blockedReason: `工具 "${st.toolName}" 不可用` };
             }
-            // web_search 需要 enableWebSearch
             if (st.toolName === "web_search" && !state.enableWebSearch) {
                 return { ...st, status: "blocked", blockedReason: "联网搜索已关闭" };
             }
@@ -797,8 +861,8 @@ ${toolListText || "(暂无可用工具)"}
     if (firstReady) firstReady.status = "in_progress";
 
     console.log(`[graph][planner] generated ${subTasks.length} subTasks (${
-        subTasks.filter(s => s.type === "tool").length
-    } tool + ${
+        subTasks.filter(s => s.type === "agent" || s.type === "tool").length
+    } agent/tool + ${
         subTasks.filter(s => s.type === "reasoning").length
     } reasoning, ${subTasks.filter(s => s.status === "blocked").length} blocked)`);
 
@@ -832,13 +896,13 @@ function subTasksToPlan(subTasks) {
 }
 
 /**
- * 强制执行 tool 步骤在前、reasoning 步骤在后的排序。
+ * 强制执行 tool/agent 步骤在前、reasoning 步骤在后的排序。
  */
 function enforceSubTaskOrder(subTasks) {
     if (!Array.isArray(subTasks) || subTasks.length < 2) return subTasks;
-    const toolTasks = subTasks.filter(s => s.type === "tool");
+    const executableTasks = subTasks.filter(s => s.type === "tool" || s.type === "agent");
     const reasoningTasks = subTasks.filter(s => s.type === "reasoning");
-    const sorted = [...toolTasks, ...reasoningTasks];
+    const sorted = [...executableTasks, ...reasoningTasks];
     // 重新分配 ID
     return sorted.map((step, i) => ({ ...step, id: String(i + 1) }));
 }
@@ -865,7 +929,7 @@ async function generalChatNode(state, config) {
 
     const sse = config?.configurable?.sse;
     const signal = config?.configurable?.abortSignal;
-    if (sse) sse.agentStart("general");
+    emitAgentStart(sse, state, "general");
 
     // Phase 4: 获取 system 类别工具（memory, get_system_time, update_todo 等），
     // 让 general_chat 节点也能调用这些通用工具。
@@ -891,7 +955,7 @@ ${hasTools ? `\n你可以使用以下系统工具：memory（记忆管理）、g
 使用规则：
 - 用户要求执行具体操作时，直接执行，不要先搜索或验证。
 - 例如用户说"添加记忆"，直接用 memory action="add" 添加。` : ""}${generalInstr ? `\n\n[优化指令] ${generalInstr}` : ""}`),
-        ...state.chatHistory,
+        ...(Array.isArray(state.chatHistory) ? state.chatHistory : []),
         new HumanMessage(state.userInput),
     ];
 
@@ -1042,6 +1106,19 @@ ${hasTools ? `\n你可以使用以下系统工具：memory（记忆管理）、g
 
     if (sse) sse.agentEnd("general");
 
+    // Plan 模式：结果存入 planResults，避免与并行节点冲突 messages LastValue
+    if (state.currentSubTask) {
+        const updatedSubTasks = (state.subTasks || []).map(s =>
+            s.id === state.currentSubTask.id ? { ...s, status: "completed" } : s
+        );
+        return {
+            planResults: { [state.currentSubTask.id]: fullText },
+            subTasks: updatedSubTasks,
+            currentAgent: "general",
+            tokenUsage: nodeUsage.total_tokens > 0 ? nodeUsage : null,
+        };
+    }
+
     return {
         messages: [new AIMessage({ content: fullText })],
         currentAgent: "general",
@@ -1061,7 +1138,7 @@ async function searchAgentNode(state, config) {
     const signal = config?.configurable?.abortSignal;
     const agentType = "search";
 
-    if (sse) sse.agentStart(agentType);
+    emitAgentStart(sse, state, agentType);
 
     const webSearchTool = toolRegistry.getTool(WEB_SEARCH_TOOL_NAME);
     if (!webSearchTool) {
@@ -1073,12 +1150,21 @@ async function searchAgentNode(state, config) {
     // Plan 模式：标记首个步骤为 in_progress
     let plan = emitPlanProgress(sse, state.plan, 'agent_start');
 
-    // ── 执行 web_search（solo/parallel 都需要） ──
-    const query = state.searchQuery || state.userInput;
-    const toolCallId = crypto.randomUUID();
-    if (state.searchQuery) {
-        console.log(`[graph][search] reformulated query: "${query}"`);
+    // Plan 模式 goal 优先：subTask.goal 比 Router 的全局 searchQuery 更精确
+    // Router 的 searchQuery 是用户整个问题的改写，无法区分"对比区别"vs"GitHub趋势"
+    // 只做轻量正则清理（去"搜索"等前缀）
+    const goal = state.currentSubTask?.goal;
+    let query;
+    if (goal) {
+        query = goal.replace(/^(搜索|查找|检索|获取|帮我|帮忙|请|[并和]?整理|[并和]?分析|[并和]?总结|对比|比较)\s*/g, "").slice(0, 100);
+        console.log(`[graph][search] goal → query: "${query.slice(0, 80)}"`);
+    } else {
+        query = state.searchQuery || state.userInput;
+        if (state.searchQuery) {
+            console.log(`[graph][search] reformulated query: "${query}"`);
+        }
     }
+    const toolCallId = crypto.randomUUID();
     sse.toolStart(toolCallId, WEB_SEARCH_TOOL_NAME, query, agentType);
 
     let searchResults = "";
@@ -1106,14 +1192,15 @@ async function searchAgentNode(state, config) {
 
         // Solo 模式：进度由 emitPlanProgress 自动管理，不给 LLM update_todo 指令(LLM 没有 tool 会文字模拟)
         const searchInstr = agentConfig.get("agent.search.instruction");
+        const taskDescription = goal ? `子任务目标：${goal}\n原始用户问题：${state.userInput}` : state.userInput;
         const systemMsg = new SystemMessage(
             `你是搜索专家。下面是一次 web_search 的检索结果。请基于这些结果为用户问题提供客观、结构化的总结回答。\n当前时间：${state.currentDate}\n\n重要：你必须在回答中引用搜索结果的来源信息。${searchInstr ? `\n\n[优化指令] ${searchInstr}` : ""}`
         );
 
         const messages = [
             systemMsg,
-            ...state.chatHistory,
-            new HumanMessage(`${state.userInput}\n\n[web_search 结果]\n${searchResults.slice(0, 6000)}`),
+            ...(Array.isArray(state.chatHistory) ? state.chatHistory : []),
+            new HumanMessage(`${taskDescription}\n\n[web_search 结果]\n${searchResults.slice(0, 6000)}`),
         ];
 
         let fullText = "";
@@ -1126,17 +1213,32 @@ async function searchAgentNode(state, config) {
                 const text = normalizeChunkContent(chunk?.content);
                 if (!text) continue;
                 fullText += text;
-                if (sse) sse.textChunk(text);
+                // Plan 模式不流式输出中间结果，由 Synthesizer 统一输出
+                if (sse && !state.currentSubTask) sse.textChunk(text);
             }
             searchUsage = extractUsageFromChunk(response);
         } catch (err) {
             console.log(`[graph][search] stream error: ${err.message}`);
             fullText = searchResults;
-            if (sse) sse.textChunk(fullText);
+            if (sse && !state.currentSubTask) sse.textChunk(fullText);
         }
 
         plan = emitPlanProgress(sse, plan, 'all_done');
         if (sse) sse.agentEnd(agentType);
+
+        // Plan 模式：结果存入 planResults，Synthesizer 统一融合；不能写 messages/searchResults（并行冲突）
+        if (state.currentSubTask) {
+            const updatedSubTasks = (state.subTasks || []).map(s =>
+                s.id === state.currentSubTask.id ? { ...s, status: "completed" } : s
+            );
+            return {
+                planResults: { [state.currentSubTask.id]: fullText },
+                subTasks: updatedSubTasks,
+                plan,
+                currentAgent: "search",
+                tokenUsage: searchUsage,
+            };
+        }
 
         return {
             messages: [new AIMessage({ content: fullText })],
@@ -1144,6 +1246,21 @@ async function searchAgentNode(state, config) {
             plan,
             currentAgent: "search",
             tokenUsage: searchUsage,
+        };
+    }
+
+    // ── Plan 模式（非 solo）：工具结果写入 planResults ──
+    if (state.currentSubTask) {
+        const updatedSubTasks = (state.subTasks || []).map(s =>
+            s.id === state.currentSubTask.id ? { ...s, status: "completed" } : s
+        );
+        plan = emitPlanProgress(sse, plan, 'tools_done');
+        if (sse) sse.agentEnd(agentType);
+        return {
+            planResults: { [state.currentSubTask.id]: searchResults },
+            subTasks: updatedSubTasks,
+            plan,
+            currentAgent: "search",
         };
     }
 
@@ -1170,7 +1287,7 @@ async function knowledgeAgentNode(state, config) {
     const signal = config?.configurable?.abortSignal;
     const agentType = "knowledge";
 
-    if (sse) sse.agentStart(agentType);
+    emitAgentStart(sse, state, agentType);
 
     // Plan 模式：确保首个步骤为 in_progress
     let plan = emitPlanProgress(sse, state.plan, 'agent_start');
@@ -1201,6 +1318,12 @@ async function knowledgeAgentNode(state, config) {
         ? "检索完成后，请基于检索结果生成一个完整的回答。"
         : "重要：只需要执行工具返回检索结果即可，不需要生成最终回答。最终回答由综合Agent负责。";
 
+    // Plan 模式 goal 优先：Planner 分配的子任务目标
+    const goal = state.currentSubTask?.goal;
+    const searchTarget = goal
+        ? `子任务目标：${goal}\n（原始用户问题：${state.userInput}）\n请使用 search_knowledge_base 检索与目标相关的文档内容。`
+        : state.userInput;
+
     const knowledgeInstr = agentConfig.get("agent.knowledge.instruction");
     const systemMsg = new SystemMessage(
         `你是知识库检索专家。使用 search_knowledge_base 工具从用户上传的文档中检索相关信息。\n当前时间：${state.currentDate}\n\n${soloHint}${knowledgeInstr ? `\n\n[优化指令] ${knowledgeInstr}` : ""}`
@@ -1208,8 +1331,8 @@ async function knowledgeAgentNode(state, config) {
 
     const messages = [
         systemMsg,
-        ...state.chatHistory,
-        new HumanMessage(state.userInput),
+        ...(Array.isArray(state.chatHistory) ? state.chatHistory : []),
+        new HumanMessage(searchTarget),
     ];
 
     let knowledgeResults = "";
@@ -1248,7 +1371,7 @@ async function knowledgeAgentNode(state, config) {
 
                 const summaryMessages = [
                     summarySys,
-                    ...state.chatHistory,
+                    ...(Array.isArray(state.chatHistory) ? state.chatHistory : []),
                     new HumanMessage(`${state.userInput}\n\n[知识库检索结果]\n${knowledgeResults.slice(0, 4000)}`),
                 ];
 
@@ -1261,17 +1384,32 @@ async function knowledgeAgentNode(state, config) {
                         const text = normalizeChunkContent(chunk?.content);
                         if (!text) continue;
                         fullText += text;
-                        if (sse) sse.textChunk(text);
+                        // Plan 模式不流式输出中间结果，由 Synthesizer 统一输出
+                        if (sse && !state.currentSubTask) sse.textChunk(text);
                     }
                     kaAddUsage(extractUsageFromChunk(summaryResponse));
                 } catch (err) {
                     console.log(`[graph][knowledge] summary stream error: ${err.message}`);
                     fullText = knowledgeResults;
-                    if (sse) sse.textChunk(fullText);
+                    if (sse && !state.currentSubTask) sse.textChunk(fullText);
                 }
 
                 plan = emitPlanProgress(sse, plan, 'all_done');
                 if (sse) sse.agentEnd(agentType);
+
+                // Plan 模式：结果存入 planResults，Synthesizer 统一融合
+                if (state.currentSubTask) {
+                    const updatedSubTasks = (state.subTasks || []).map(s =>
+                        s.id === state.currentSubTask.id ? { ...s, status: "completed" } : s
+                    );
+                    return {
+                        planResults: { [state.currentSubTask.id]: fullText },
+                        subTasks: updatedSubTasks,
+                        plan,
+                        currentAgent: "knowledge",
+                        tokenUsage: knowledgeUsage.total_tokens > 0 ? knowledgeUsage : null,
+                    };
+                }
 
                 return {
                     messages: [new AIMessage({ content: fullText })],
@@ -1290,6 +1428,22 @@ async function knowledgeAgentNode(state, config) {
     }
 
     console.log(`[graph][knowledge] retrieval completed, result length=${knowledgeResults.length}`);
+
+    // Plan 模式（非 solo）：检索结果写入 planResults
+    if (state.currentSubTask) {
+        const updatedSubTasks = (state.subTasks || []).map(s =>
+            s.id === state.currentSubTask.id ? { ...s, status: "completed" } : s
+        );
+        plan = emitPlanProgress(sse, plan, 'tools_done');
+        if (sse) sse.agentEnd(agentType);
+        return {
+            planResults: { [state.currentSubTask.id]: knowledgeResults },
+            subTasks: updatedSubTasks,
+            plan,
+            currentAgent: "knowledge",
+            tokenUsage: knowledgeUsage.total_tokens > 0 ? knowledgeUsage : null,
+        };
+    }
 
     // Parallel 模式：只存结果，留给 Synthesizer
     plan = emitPlanProgress(sse, plan, 'tools_done');
@@ -1315,7 +1469,7 @@ async function codeAgentNode(state, config) {
     const signal = config?.configurable?.abortSignal;
     const agentType = "code";
 
-    if (sse) sse.agentStart(agentType);
+    emitAgentStart(sse, state, agentType);
 
     // Plan 模式：确保首个步骤为 in_progress
     let plan = emitPlanProgress(sse, state.plan, 'agent_start');
@@ -1340,7 +1494,7 @@ async function codeAgentNode(state, config) {
 
     const messages = [
         systemMsg,
-        ...state.chatHistory,
+        ...(Array.isArray(state.chatHistory) ? state.chatHistory : []),
         new HumanMessage(state.userInput),
     ];
 
@@ -1356,17 +1510,32 @@ async function codeAgentNode(state, config) {
                 const text = normalizeChunkContent(chunk?.content);
                 if (!text) continue;
                 fullText += text;
-                if (sse) sse.textChunk(text);
+                // Plan 模式不流式输出中间结果，由 Synthesizer 统一输出
+                if (sse && !state.currentSubTask) sse.textChunk(text);
             }
             soloUsage = extractUsageFromChunk(response);
         } catch (err) {
             console.log(`[graph][code] stream error: ${err.message}`);
             fullText = `代码生成失败: ${err.message}`;
-            if (sse) sse.textChunk(fullText);
+            if (sse && !state.currentSubTask) sse.textChunk(fullText);
         }
 
         plan = emitPlanProgress(sse, plan, 'all_done');
         if (sse) sse.agentEnd(agentType);
+
+        // Plan 模式：结果存入 planResults，Synthesizer 统一融合
+        if (state.currentSubTask) {
+            const updatedSubTasks = (state.subTasks || []).map(s =>
+                s.id === state.currentSubTask.id ? { ...s, status: "completed" } : s
+            );
+            return {
+                planResults: { [state.currentSubTask.id]: fullText },
+                subTasks: updatedSubTasks,
+                plan,
+                currentAgent: "code",
+                tokenUsage: soloUsage,
+            };
+        }
 
         return {
             messages: [new AIMessage({ content: fullText })],
@@ -1390,6 +1559,22 @@ async function codeAgentNode(state, config) {
     }
 
     console.log(`[graph][code] generation completed, result length=${codeResults.length}`);
+
+    // Plan 模式（非 solo）：生成结果写入 planResults
+    if (state.currentSubTask) {
+        const updatedSubTasks = (state.subTasks || []).map(s =>
+            s.id === state.currentSubTask.id ? { ...s, status: "completed" } : s
+        );
+        plan = emitPlanProgress(sse, plan, 'tools_done');
+        if (sse) sse.agentEnd(agentType);
+        return {
+            planResults: { [state.currentSubTask.id]: codeResults },
+            subTasks: updatedSubTasks,
+            plan,
+            currentAgent: "code",
+            tokenUsage: parallelUsage,
+        };
+    }
 
     plan = emitPlanProgress(sse, plan, 'tools_done');
     if (sse) sse.agentEnd(agentType);
@@ -1427,7 +1612,7 @@ async function synthesizerNode(state, config) {
     const intents = state.intents || [state.intent || "general"];
     const subTasks = state.subTasks || [];
 
-    if (sse) sse.agentStart(agentType);
+    emitAgentStart(sse, state, agentType);
 
     // Synthesizer 启动 → 若计划未全部完成，标记最后一个步骤为 in_progress
     let plan = state.plan || [];
@@ -1563,7 +1748,7 @@ async function synthesizerNode(state, config) {
 
     const messages = [
         systemMsg,
-        ...state.chatHistory,
+        ...(Array.isArray(state.chatHistory) ? state.chatHistory : []),
         new HumanMessage(state.userInput),
     ];
 
@@ -1630,41 +1815,61 @@ function fanoutToAgents(state) {
 
 /**
  * Phase 4 路径 A: subTask 驱动扇出。
- * 所有 type="tool" 且未 blocked 的 subTask 并行扇出到 tool_executor。
+ * type="agent" → 路由到对应专业 Agent 节点（search/knowledge/code/general）
+ * type="tool"  → 向后兼容，路由到 tool_executor
  * reasoning subTask 延迟到 Synthesizer 处理。
  */
 function fanoutBySubTasks(state) {
-    const toolSubTasks = state.subTasks.filter(s =>
-        s.type === "tool" && s.status !== "blocked" && s.status !== "completed"
+    const executableSubTasks = state.subTasks.filter(s =>
+        (s.type === "agent" || s.type === "tool") && s.status !== "blocked" && s.status !== "completed"
     );
     const blockedCount = state.subTasks.filter(s => s.status === "blocked").length;
 
-    if (toolSubTasks.length === 0) {
-        // 无 tool 步骤（全部 blocked 或全部是 reasoning）→ 直接到 synthesizer
-        console.log(`[graph][route] subTask: 0 tool tasks (${blockedCount} blocked), direct to synthesizer`);
+    if (executableSubTasks.length === 0) {
+        console.log(`[graph][route] subTask: 0 executable tasks (${blockedCount} blocked), direct to synthesizer`);
         return "synthesizer";
     }
 
-    // 单 tool subTask → Send 传递 currentSubTask（与多 tool 路径一致）
-    if (toolSubTasks.length === 1) {
-        const st = toolSubTasks[0];
-        console.log(`[graph][route] subTask: solo tool "${st.toolName}" (id=${st.id}) → tool_executor`);
-        return new Send("tool_executor", {
+    // 单 executable subTask
+    if (executableSubTasks.length === 1) {
+        const st = executableSubTasks[0];
+        const nodeName = resolveSubTaskNode(st);
+        console.log(`[graph][route] subTask: solo ${st.type}${st.agent ? ` "${st.agent}"` : ""} (id=${st.id}) → ${nodeName}`);
+        return new Send(nodeName, {
             currentSubTask: { ...st, status: "in_progress" },
         });
     }
 
-    // 多 tool subTask → Send[] 并行扇出
-    const sends = toolSubTasks.map(st => {
-        console.log(`[graph][route] subTask: fanout "${st.toolName}" (id=${st.id}) → tool_executor`);
-        return new Send("tool_executor", {
+    // 多 executable subTask → Send[] 并行扇出，各自路由到对应节点
+    // ⚠️ 必须展开 state 全部字段（如 modelName/chatHistory/temperature），
+    // 否则 Send 目标节点的 Annotation defaults 不生效，ChatOpenAI 会退化到 gpt-3.5-turbo
+    const sends = executableSubTasks.map(st => {
+        const nodeName = resolveSubTaskNode(st);
+        console.log(`[graph][route] subTask: fanout ${st.type}${st.agent ? ` "${st.agent}"` : ""} (id=${st.id}) → ${nodeName}`);
+        return new Send(nodeName, {
+            ...state,
             currentSubTask: { ...st, status: "in_progress" },
         });
     });
 
-    console.log(`[graph][route] subTask fanout: ${sends.length} tool executor(s)` +
+    console.log(`[graph][route] subTask fanout: ${sends.length} executor(s)` +
         (blockedCount > 0 ? ` + ${blockedCount} blocked (skipped)` : ""));
     return sends;
+}
+
+/**
+ * 根据 subTask 类型解析目标节点名。
+ * type="agent" → AGENT_NODE_MAP[agent]
+ * type="tool"  → tool_executor（向后兼容）
+ */
+function resolveSubTaskNode(subTask) {
+    if (subTask.type === "agent" && subTask.agent) {
+        const nodeName = AGENT_NODE_MAP[subTask.agent];
+        if (nodeName) return nodeName;
+        console.log(`[graph][route] unknown agent "${subTask.agent}", falling back to tool_executor`);
+    }
+    // type="tool" 或未知 agent → tool_executor
+    return "tool_executor";
 }
 
 /**
@@ -1764,7 +1969,7 @@ async function toolExecutorNode(state, config) {
         : JSON.stringify(rawPreview).slice(0, 60);
     console.log(`[graph][tool_executor] executing subTask ${subTask.id}: ${subTask.toolName}("${safePreview}")`);
 
-    if (sse) sse.agentStart(agentType);
+    const agentSpanId = emitAgentStart(sse, state, agentType);
 
     // 动态获取工具（支持命名空间格式 "serverName/toolName"）
     const tool = toolRegistry.getTool(subTask.toolName);
@@ -1775,15 +1980,15 @@ async function toolExecutorNode(state, config) {
         const errMsg = `工具 "${subTask.toolName}" 不可用`;
         console.log(`[graph][tool_executor] ${errMsg}`);
         if (sse) sse.toolError(toolCallId, subTask.toolName, errMsg, agentType);
-        if (sse) sse.agentEnd(agentType);
+        if (sse) sse.agentEnd(agentType, agentSpanId);
         return {
             planResults: { [subTask.id]: `(blocked: ${subTask.blockedReason || errMsg})` },
             currentAgent: agentType,
         };
     }
 
-    // 发射 tool_start SSE
-    if (sse) sse.toolStart(toolCallId, subTask.toolName, toolInput, agentType);
+    // 发射 tool_start SSE（传入精确 parentSpanId 避免同类型并行实例归属错乱）
+    if (sse) sse.toolStart(toolCallId, subTask.toolName, toolInput, agentType, agentSpanId);
 
     let result;
     let hasError = false;
@@ -1805,7 +2010,7 @@ async function toolExecutorNode(state, config) {
         if (sse) sse.toolError(toolCallId, subTask.toolName, err.message, agentType);
     }
 
-    if (sse) sse.agentEnd(agentType);
+    if (sse) sse.agentEnd(agentType, agentSpanId);
 
     // 标记当前 subTask 为 completed；自动构造的 subTask 也追加到数组
     const wasAutoConstructed = !state.currentSubTask?.toolName && subTask.toolName;
@@ -1869,8 +2074,6 @@ function buildAgentGraph() {
 // ═══════════════════════════════════════════════════════
 
 async function streamGraphToSSE(graph, initialState, config, res, sse, abortController) {
-    let previousAgent = "router";
-
     try {
         const eventStream = await graph.stream(initialState, config);
 
@@ -1886,15 +2089,8 @@ async function streamGraphToSSE(graph, initialState, config, res, sse, abortCont
 
                 const currentNodeAgent = nodeOutput?.currentAgent;
 
-                // 检测 Agent 切换 → 发射 handoff
-                if (currentNodeAgent && currentNodeAgent !== previousAgent) {
-                    sse.agentHandoff(previousAgent, currentNodeAgent);
-                }
-
-                if (currentNodeAgent) {
-                    // agent_start 和 agent_end 在各自节点函数内部发射
-                    previousAgent = currentNodeAgent;
-                }
+                // agent_start / agent_end / agent_handoff 现在统一在 emitAgentStart() 中发射
+                // 确保时序：handoff → agent_start → ... → agent_end
 
                 console.log(`[graph][event] node=${nodeName} agent=${currentNodeAgent || "none"}`);
             }
@@ -2207,6 +2403,7 @@ export {
     AGENT_META,
     AGENT_NODE_MAP,
     mapIntentToNode,
+    resolveSubTaskNode,
     enforceSubTaskOrder,
     subTasksToPlan,
     isSoloRun,

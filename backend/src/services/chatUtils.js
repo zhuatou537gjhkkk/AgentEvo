@@ -52,6 +52,44 @@ export function estimateTokens(text) {
     return estimate > 0 ? estimate : 0;
 }
 
+// ═══════════════════════════════════════════════════════
+// 模型上下文窗口映射
+// ═══════════════════════════════════════════════════════
+
+/** 模型 → 上下文窗口上限 (tokens) */
+const MODEL_CONTEXT_WINDOWS = {
+    "qwen-long": 1_000_000,
+    "qwen-turbo": 1_000_000,
+    "qwen-plus": 131_072,
+    "deepseek-v4-pro": 128_000,
+    "deepseek-v4-flash": 128_000,
+    "deepseek-v3": 64_000,
+    "gpt-4o": 128_000,
+    "gpt-4o-mini": 128_000,
+    "claude-sonnet-5": 200_000,
+    "claude-opus-5": 200_000,
+    "claude-fable-5": 200_000,
+    "agnes-2.0-flash": 32_000,
+    "agnes-2.0-pro": 32_000,
+};
+
+/**
+ * 根据模型名获取上下文窗口上限
+ * @param {string|null} modelName
+ * @returns {number}
+ */
+export function getModelContextWindow(modelName) {
+    if (!modelName) return 128_000;
+    // 精确匹配
+    if (MODEL_CONTEXT_WINDOWS[modelName]) return MODEL_CONTEXT_WINDOWS[modelName];
+    // 模糊匹配：遍历所有已知模型前缀
+    for (const [key, limit] of Object.entries(MODEL_CONTEXT_WINDOWS)) {
+        if (modelName.includes(key)) return limit;
+    }
+    // 默认 128K（最常见的上下文窗口）
+    return 128_000;
+}
+
 /**
  * 从 AIMessageChunk/AIMessage 中提取真实 LLM API 返回的 token usage。
  * @param {object} chunk — LangChain AIMessageChunk 或 AIMessage
