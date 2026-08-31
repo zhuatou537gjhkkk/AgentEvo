@@ -40,14 +40,14 @@ function Row({ index, style, data }) {
 
     return (
         <div style={style}>
-            <div ref={rowRef} className="mx-auto w-full max-w-4xl px-1 sm:px-3">
+            <div ref={rowRef} className="message-row-shell">
                 <MessageItem message={message} />
             </div>
         </div>
     );
 }
 
-export default function ChatList() {
+export default function ChatList({ hideInitialPlaceholder = false }) {
     const messages = useChatStore((state) => state.messages);
     const messageSearchKeyword = useChatStore((state) => state.messageSearchKeyword);
     const isSessionLoading = useChatStore((state) => state.isSessionLoading);
@@ -63,14 +63,16 @@ export default function ChatList() {
     const [listHeight, setListHeight] = useState(0);
     const [showBackToBottom, setShowBackToBottom] = useState(false);
 
+    const normalizedKeyword = String(messageSearchKeyword || '').trim().toLowerCase();
     const displayedMessages = useMemo(() => {
-        const keyword = String(messageSearchKeyword || '').trim().toLowerCase();
-        if (!keyword) {
-            return messages;
-        }
+        const filtered = normalizedKeyword
+            ? messages.filter((message) => String(message.content || '').toLowerCase().includes(normalizedKeyword))
+            : messages;
 
-        return messages.filter((message) => String(message.content || '').toLowerCase().includes(keyword));
-    }, [messages, messageSearchKeyword]);
+        return hideInitialPlaceholder
+            ? filtered.filter((message) => message.id !== 'init')
+            : filtered;
+    }, [messages, normalizedKeyword, hideInitialPlaceholder]);
 
     const scrollOuterToBottom = useCallback((behavior = 'smooth') => {
         if (!outerRef.current) {
@@ -144,6 +146,12 @@ export default function ChatList() {
     }, []);
 
     useEffect(() => {
+        sizeMapRef.current = {};
+        hasInitializedScrollRef.current = false;
+        listRef.current?.resetAfterIndex(0, true);
+    }, [currentSessionId, normalizedKeyword, hideInitialPlaceholder]);
+
+    useEffect(() => {
         if (!listRef.current || displayedMessages.length === 0) {
             return;
         }
@@ -158,12 +166,7 @@ export default function ChatList() {
         if (isNearBottomRef.current && outerRef.current) {
             scrollOuterToBottom('smooth');
         }
-    }, [displayedMessages]);
-
-    useEffect(() => {
-        sizeMapRef.current = {};
-        hasInitializedScrollRef.current = false;
-    }, [currentSessionId]);
+    }, [displayedMessages, updateNearBottom, scrollOuterToBottom]);
 
     const setSize = useCallback((index, size) => {
         const prev = sizeMapRef.current[index];
@@ -210,7 +213,7 @@ export default function ChatList() {
     }, [listHeight]);
 
     return (
-        <div ref={containerRef} className="relative h-full w-full overflow-hidden">
+        <div ref={containerRef} className="chat-list-surface relative h-full w-full overflow-hidden">
             {isSessionLoading && (
                 <div className="absolute inset-0 z-10 space-y-3 bg-[var(--app-bg)]/90 px-6 py-5 backdrop-blur-[2px]">
                     {[1, 2, 3, 4].map((item) => (
@@ -238,7 +241,7 @@ export default function ChatList() {
                 </List>
             )}
 
-            {displayedMessages.length === 0 && !isSessionLoading && (
+            {displayedMessages.length === 0 && normalizedKeyword && !isSessionLoading && (
                 <div className="absolute inset-0 flex items-center justify-center px-4 text-center text-sm text-[var(--text-muted)]">
                     当前筛选条件下没有匹配消息。
                 </div>

@@ -10,6 +10,7 @@
 import crypto from "crypto";
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, AIMessage, AIMessageChunk, SystemMessage, ToolMessage } from "@langchain/core/messages";
+import { DynamicStructuredTool } from "@langchain/core/tools";
 import { StateGraph, START, END, Annotation, addMessages, MemorySaver, Send } from "@langchain/langgraph";
 import { saveMessage, getHistoryMessages } from "../db/index.js";
 import { agentTools, consumePendingQuestion, cancelAllPendingQuestions, setMemoryToolContext } from "../mcp/tools.js";
@@ -66,8 +67,18 @@ function mapIntentToNode(intent) {
     // 1. 已知 Agent 节点（有特殊逻辑的，直接映射）
     if (AGENT_NODE_MAP[intent]) return AGENT_NODE_MAP[intent];
 
-    // 2. ToolRegistry 中有对应工具类别 → 路由到 tool_executor
-    if (toolRegistry.hasToolCategory(intent)) return "tool_executor";
+    // 2. ToolRegistry 中有对应工具类别（动态 MCP 意图，如 filesystem/amap）
+    if (toolRegistry.hasToolCategory(intent)) {
+        const category = toolRegistry.getToolCategories().find(c => c.category === intent);
+        const toolCount = category?.tools?.length || 0;
+        // 多工具类别（如 amap 12 个工具）需要 LLM 做「工具选择 + 参数构造」，
+        // tool_executor 的 auto-constructed 降级只取第一个工具 + 传原始问题，不适用 → 走 general_chat ReAct 循环
+        if (toolCount > 1) {
+            console.log(`[graph][route] multi-tool MCP category "${intent}" (${toolCount} tools) → general_chat (needs tool selection)`);
+            return "general_chat";
+        }
+        return "tool_executor";
+    }
 
     // 3. Fallback
     console.log(`[graph][route] unknown intent "${intent}", falling back to general_chat`);
@@ -981,18 +992,17 @@ ${hasTools ? `\n你可以使用以下系统工具：memory（记忆管理）、g
                 round++;
                 const isFirstRound = round === 1;
 
-                // 首轮使用流式 → 文本逐字推送到前端；后续轮用 invoke（更快）
+                // 每一轮都使用流式：避免工具结果回传后的非流式请求长时间无反馈，
+                // 同时让客户端能持续收到模型的后续文本/工具决策。
+                console.log(`[graph][general] round ${round} LLM request${isFirstRound ? " (initial)" : " (after tools)"}`);
                 let response;
-                if (isFirstRound) {
-                    const stream = await tooledLlm.stream(conversation, { signal });
-                    for await (const chunk of stream) {
-                        response = response ? response.concat(chunk) : chunk;
-                        const text = normalizeChunkContent(chunk?.content);
-                        if (text && sse) sse.textChunk(text);
-                    }
-                } else {
-                    response = await tooledLlm.invoke(conversation, { signal });
+                const stream = await tooledLlm.stream(conversation, { signal });
+                for await (const chunk of stream) {
+                    response = response ? response.concat(chunk) : chunk;
+                    const text = normalizeChunkContent(chunk?.content);
+                    if (text && sse) sse.textChunk(text);
                 }
+                console.log(`[graph][general] round ${round} LLM response received`);
                 addUsage(extractUsageFromChunk(response));
 
                 const toolCalls = response?.tool_calls || response?.additional_kwargs?.tool_calls || [];
@@ -1023,18 +1033,20 @@ ${hasTools ? `\n你可以使用以下系统工具：memory（记忆管理）、g
                             ? JSON.parse(tc.function.arguments)
                             : tc.function.arguments)
                         : {});
-                    // LangChain DynamicTool 把参数包在 input 字段里:
-                    //   tc.args = { input: '{"action":"add",...}' }
-                    // 需要取出 input 值作为 tool.invoke() 的实际参数
-                    const toolInputStr = rawArgs?.input != null
-                        ? (typeof rawArgs.input === "string" ? rawArgs.input : JSON.stringify(rawArgs.input))
-                        : JSON.stringify(rawArgs);
+                    // 本地 DynamicTool 的参数包在 input 字段里；结构化工具直接使用对象参数。
+                    const isStructuredTool = systemTools.find(t => t.name === toolName) instanceof DynamicStructuredTool;
+                    const toolInput = isStructuredTool
+                        ? rawArgs
+                        : (rawArgs?.input != null
+                            ? (typeof rawArgs.input === "string" ? rawArgs.input : JSON.stringify(rawArgs.input))
+                            : JSON.stringify(rawArgs));
+                    const toolInputForSse = typeof toolInput === "string" ? toolInput : JSON.stringify(toolInput);
                     const tool = systemTools.find(t => t.name === toolName);
                     if (tool) {
                         const toolCallId = tc.id || crypto.randomUUID();
-                        sse?.toolStart(toolCallId, toolName, toolInputStr, "general");
+                        sse?.toolStart(toolCallId, toolName, toolInputForSse, "general");
                         try {
-                            const result = await tool.invoke(toolInputStr);
+                            const result = await tool.invoke(toolInput);
                             const resultStr = typeof result === "string" ? result : JSON.stringify(result);
                             sse?.toolEnd(toolCallId, toolName, resultStr, "general");
                             conversation.push(new ToolMessage({ content: resultStr, tool_call_id: tc.id || toolCallId, name: toolName }));
@@ -1993,7 +2005,9 @@ async function toolExecutorNode(state, config) {
     let result;
     let hasError = false;
     try {
-        const toolResult = await tool.invoke(toolInput);
+        const toolResult = typeof toolRegistry.invokeTool === "function"
+            ? await toolRegistry.invokeTool(subTask.toolName, toolInput)
+            : await tool.invoke(toolInput);
         result = normalizeChunkContent(toolResult);
 
         // 智能截断：按工具类型限制输出长度

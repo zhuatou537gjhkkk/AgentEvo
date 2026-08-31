@@ -12,7 +12,16 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { DynamicTool } from '@langchain/core/tools';
+import { DynamicStructuredTool, DynamicTool } from '@langchain/core/tools';
+
+const { connectToMCPServerMock } = vi.hoisted(() => ({
+    connectToMCPServerMock: vi.fn(),
+}));
+
+vi.mock('./client.js', () => ({
+    connectToMCPServer: connectToMCPServerMock,
+}));
+
 import { ToolRegistry } from './registry.js';
 
 // ── 测试辅助：构造 mock DynamicTool ──
@@ -42,6 +51,102 @@ describe('ToolRegistry', () => {
 
     beforeEach(() => {
         registry = new ToolRegistry();
+        connectToMCPServerMock.mockReset();
+    });
+
+    // ═══════════════════════════════════════════════════════
+    // registerMCPServer — structured wrappers
+    // ═══════════════════════════════════════════════════════
+
+    describe('registerMCPServer — 结构化工具', () => {
+        it('保留 inputSchema 并以对象参数调用 MCP Server', async () => {
+            const client = makeMockMCPClient([
+                {
+                    name: 'around_search',
+                    description: 'Search nearby places',
+                    inputSchema: {
+                        type: 'object',
+                        properties: {
+                            keywords: { type: 'string' },
+                            location: { type: 'string' },
+                            radius: { type: 'number' },
+                        },
+                        required: ['keywords', 'location'],
+                    },
+                },
+            ]);
+            connectToMCPServerMock.mockResolvedValue(client);
+
+            await registry.registerMCPServer({ name: 'amap', command: 'mock' });
+
+            const tool = registry.getTool('amap/around_search');
+            expect(tool).toBeInstanceOf(DynamicStructuredTool);
+            expect(tool.schema.properties).toEqual(expect.objectContaining({
+                keywords: { type: 'string' },
+                location: { type: 'string' },
+            }));
+            await tool.invoke({ keywords: '咖啡', location: '北京', radius: 5 });
+            expect(client.callTool).toHaveBeenCalledWith({
+                name: 'around_search',
+                arguments: { keywords: '咖啡', location: '北京', radius: 5 },
+            });
+        });
+
+        it('缺失 schema 时仍注册宽松结构化工具', async () => {
+            const client = makeMockMCPClient([{ name: 'ping', description: 'Ping' }]);
+            connectToMCPServerMock.mockResolvedValue(client);
+
+            await registry.registerMCPServer({ name: 'demo', command: 'mock' });
+
+            const tool = registry.getTool('demo/ping');
+            expect(tool).toBeInstanceOf(DynamicStructuredTool);
+            expect(tool.schema.type).toBe('object');
+            await tool.invoke({ value: 'ok' });
+            expect(client.callTool).toHaveBeenCalledWith({
+                name: 'ping',
+                arguments: { value: 'ok' },
+            });
+        });
+
+        it('旧字符串调用通过 invokeTool 按 schema 做确定性兼容转换', async () => {
+            const client = makeMockMCPClient([{
+                name: 'around_search',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        keywords: { type: 'string' },
+                        location: { type: 'string' },
+                        radius: { type: 'string' },
+                    },
+                    required: ['keywords'],
+                },
+            }]);
+            connectToMCPServerMock.mockResolvedValue(client);
+
+            await registry.registerMCPServer({ name: 'amap', command: 'mock' });
+            await registry.invokeTool('amap/around_search', '咖啡|北京|5');
+
+            expect(client.callTool).toHaveBeenCalledWith({
+                name: 'around_search',
+                arguments: { keywords: '咖啡', location: '北京', radius: '5' },
+            });
+        });
+
+        it('结构化参数缺少必填字段时在调用前失败', async () => {
+            const client = makeMockMCPClient([{
+                name: 'read_file',
+                inputSchema: {
+                    type: 'object',
+                    properties: { path: { type: 'string' } },
+                    required: ['path'],
+                },
+            }]);
+            connectToMCPServerMock.mockResolvedValue(client);
+
+            await registry.registerMCPServer({ name: 'filesystem', command: 'mock' });
+            await expect(registry.getTool('filesystem/read_file').invoke({})).rejects.toThrow();
+            expect(client.callTool).not.toHaveBeenCalled();
+        });
     });
 
     // ═══════════════════════════════════════════════════════

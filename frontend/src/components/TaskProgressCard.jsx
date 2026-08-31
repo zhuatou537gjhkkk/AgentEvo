@@ -2,10 +2,10 @@ import { memo, useState } from 'react';
 
 // ── 状态元数据 ──────────────────────────────────────────────
 const STATUS_META = {
-  pending: { icon: '⏳', text: '等待中', border: 'border-l-slate-400', bg: 'bg-slate-500/5', textColor: 'text-slate-400' },
-  in_progress: { icon: '🔄', text: '执行中', border: 'border-l-blue-400', bg: 'bg-blue-500/5', textColor: 'text-blue-300', pulse: true },
-  completed: { icon: '✅', text: '完成', border: 'border-l-emerald-400', bg: 'bg-emerald-500/5', textColor: 'text-emerald-300' },
-  error: { icon: '❌', text: '失败', border: 'border-l-red-400', bg: 'bg-red-500/5', textColor: 'text-red-300' },
+  pending: { icon: '⏳', text: '等待中', border: 'border-l-slate-400', bg: 'bg-[var(--status-neutral-soft)]', textColor: 'text-[var(--status-neutral)]' },
+  in_progress: { icon: '🔄', text: '执行中', border: 'border-l-indigo-400', bg: 'bg-[var(--status-info-soft)]', textColor: 'text-[var(--status-info)]', pulse: true },
+  completed: { icon: '✅', text: '完成', border: 'border-l-emerald-500', bg: 'bg-[var(--status-success-soft)]', textColor: 'text-[var(--status-success)]' },
+  error: { icon: '❌', text: '失败', border: 'border-l-red-500', bg: 'bg-[var(--status-danger-soft)]', textColor: 'text-[var(--status-danger)]' },
 };
 
 function TaskProgressCard({ progress }) {
@@ -19,7 +19,7 @@ function TaskProgressCard({ progress }) {
   const allDone = progress.every((t) => t.status === 'completed');
 
   return (
-    <div className="mb-2 rounded-lg border border-[var(--panel-border)] bg-[var(--panel-soft)] overflow-hidden">
+    <div className="surface-subtle mb-2 overflow-hidden">
       {/* ── Header ──────────────────────────────────────── */}
       <button
         type="button"

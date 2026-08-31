@@ -48,7 +48,7 @@ export function traceLatencyBarColor(latencyMs) {
 
 /** 递归渲染 Span 树 */
 export function SpanTree({ span, depth = 0 }) {
-    const typeBadge = SPAN_TYPE_COLORS[span.type] || "bg-slate-400";
+    const typeBadge = SPAN_TYPE_COLORS[span.type] || "bg-[var(--status-neutral)]";
     const durationSec = span.durationMs ? (span.durationMs / 1000).toFixed(1) + "s" : "-";
     const barColor = spanDurationBarColor(span.durationMs);
 
@@ -97,14 +97,15 @@ export function TraceTreeView({ rootSpan }) {
         return <p className="py-4 text-center text-xs text-[var(--text-muted)]">无 Span 数据</p>;
     }
     return (
-        <div className="rounded-lg border border-[var(--panel-border)] bg-[var(--panel-soft)] p-3">
+        <div className="surface-subtle rounded-lg p-3">
             <SpanTree span={rootSpan} depth={0} />
         </div>
     );
 }
 
-export default function ObservabilityPanel() {
+export default function ObservabilityPanel({ embedded = false, onBack }) {
     const isOpen = useChatStore((s) => s.isObservabilityOpen);
+    const isVisible = embedded || isOpen;
     const toggleObservability = useChatStore((s) => s.toggleObservability);
     const traces = useChatStore((s) => s.observabilityTraces);
     const tracesLoading = useChatStore((s) => s.observabilityTracesLoading);
@@ -131,26 +132,26 @@ export default function ObservabilityPanel() {
 
     // 初始加载
     useEffect(() => {
-        if (!isOpen) return;
+        if (!isVisible) return;
         fetchObservabilityTraces(30);
         fetchObservabilityMetrics(metricsWindow);
-    }, [isOpen]);
+    }, [isVisible]);
 
     // 切换 metrics window
     useEffect(() => {
-        if (!isOpen) return;
+        if (!isVisible) return;
         fetchObservabilityMetrics(metricsWindow);
-    }, [metricsWindow]);
+    }, [isVisible, metricsWindow]);
 
     // ESC dismiss
     useEffect(() => {
-        if (!isOpen) return;
+        if (!isVisible) return;
         const handleKey = (e) => {
             if (e.key === "Escape") toggleObservability();
         };
         window.addEventListener("keydown", handleKey);
         return () => window.removeEventListener("keydown", handleKey);
-    }, [isOpen]);
+    }, [isVisible]);
 
     const handleExpandTrace = useCallback(async (traceId) => {
         if (expandedTrace === traceId) {
@@ -194,7 +195,7 @@ export default function ObservabilityPanel() {
         }
     }, [otelInput, importOtelTrace, fetchObservabilityTraces]);
 
-    if (!isOpen) return null;
+    if (!isVisible) return null;
 
     const latencyMs = metrics?.latency || {};
     const tokenDist = metrics?.tokens || {};
@@ -202,18 +203,14 @@ export default function ObservabilityPanel() {
     const agentPaths = metrics?.agentPaths || {};
     const trendData = metrics?.trend || [];
 
-    return (
-        <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-3"
-            onClick={(e) => { if (e.target === e.currentTarget) toggleObservability(); }}
-        >
-            <div className="max-h-[90vh] w-full max-w-3xl overflow-auto rounded-3xl border border-[var(--panel-border)] bg-[var(--panel-bg)] p-6 shadow-2xl">
+    const content = (
+            <div className={embedded ? 'tool-page-surface' : 'max-h-[90vh] w-full max-w-3xl overflow-auto rounded-3xl surface-card p-6 shadow-2xl'}>
                 {/* Header */}
                 <div className="mb-5 flex items-center justify-between">
                     <h2 className="text-lg font-bold text-[var(--text-main)]">🔭 观测面板</h2>
                     <button
                         type="button"
-                        onClick={toggleObservability}
+                        onClick={embedded ? onBack : toggleObservability}
                         className="rounded-lg p-1 text-[var(--text-muted)] hover:text-[var(--text-main)] transition"
                     >
                         <svg className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -225,22 +222,22 @@ export default function ObservabilityPanel() {
                 {/* ── Metric 卡片 ── */}
                 {metrics && (
                     <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
-                        <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-3">
+                        <div className="surface-subtle rounded-2xl p-3">
                             <p className="text-[10px] text-[var(--text-muted)]">P50 延迟</p>
                             <p className="mt-0.5 text-xl font-bold text-[var(--text-main)]">{latencyMs.p50 ?? "-"}<span className="text-xs font-normal text-[var(--text-muted)]">ms</span></p>
                             <p className="text-[10px] text-[var(--text-muted)]">P90: {latencyMs.p90 ?? "-"}ms · P99: {latencyMs.p99 ?? "-"}ms</p>
                         </div>
-                        <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-3">
+                        <div className="surface-subtle rounded-2xl p-3">
                             <p className="text-[10px] text-[var(--text-muted)]">成功率</p>
                             <p className="mt-0.5 text-xl font-bold text-[var(--text-main)]">{((successRate.successRate || 0) * 100).toFixed(0)}%</p>
                             <p className="text-[10px] text-[var(--text-muted)]">{successRate.succeeded ?? 0} / {successRate.total ?? 0} 请求成功</p>
                         </div>
-                        <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-3">
+                        <div className="surface-subtle rounded-2xl p-3">
                             <p className="text-[10px] text-[var(--text-muted)]">平均 Token</p>
                             <p className="mt-0.5 text-xl font-bold text-[var(--text-main)]">{tokenDist.total?.avg ?? "-"}</p>
                             <p className="text-[10px] text-[var(--text-muted)]">Prompt {tokenDist.prompt?.avg ?? "-"} · Completion {tokenDist.completion?.avg ?? "-"}</p>
                         </div>
-                        <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-3">
+                        <div className="surface-subtle rounded-2xl p-3">
                             <p className="text-[10px] text-[var(--text-muted)]">样本数</p>
                             <p className="mt-0.5 text-xl font-bold text-[var(--text-main)]">{metricsWindow === "all" ? "全量" : metricsWindow}</p>
                             <p className="text-[10px] text-[var(--text-muted)]">延迟 {latencyMs.sampleSize ?? 0} · Token {tokenDist.sampleSize ?? 0}</p>
@@ -323,7 +320,7 @@ export default function ObservabilityPanel() {
                                         <div className="flex items-center gap-2">
                                             {/* type badge */}
                                             <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium text-white ${
-                                                TRACE_TYPE_COLORS[t.trace_type] || "bg-slate-500"
+                                                TRACE_TYPE_COLORS[t.trace_type] || "bg-[var(--status-neutral)]"
                                             }`}>
                                                 {t.trace_type}
                                             </span>
@@ -429,7 +426,7 @@ export default function ObservabilityPanel() {
                 {activeTab === "overview" && (
                     <div className="space-y-4">
                         {/* Agent 路径 Top 10 */}
-                        <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                        <div className="surface-subtle rounded-2xl p-4">
                             <h3 className="mb-3 text-sm font-semibold text-[var(--text-main)]">Agent 路径 Top 10</h3>
                             {(agentPaths.topPaths || []).length === 0 ? (
                                 <p className="py-2 text-center text-xs text-[var(--text-muted)]">暂无数据</p>
@@ -447,7 +444,7 @@ export default function ObservabilityPanel() {
                         </div>
 
                         {/* Token 分布 */}
-                        <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                        <div className="surface-subtle rounded-2xl p-4">
                             <h3 className="mb-3 text-sm font-semibold text-[var(--text-main)]">Token 分布</h3>
                             <div className="grid grid-cols-3 gap-3">
                                 <div className="rounded-lg bg-[var(--panel-bg)] p-3 text-center">
@@ -479,7 +476,7 @@ export default function ObservabilityPanel() {
                         </div>
 
                         {/* Agent 频次 */}
-                        <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                        <div className="surface-subtle rounded-2xl p-4">
                             <h3 className="mb-3 text-sm font-semibold text-[var(--text-main)]">Agent 调用频次</h3>
                             {(agentPaths.topAgents || []).length === 0 ? (
                                 <p className="py-2 text-center text-xs text-[var(--text-muted)]">暂无数据</p>
@@ -511,7 +508,7 @@ export default function ObservabilityPanel() {
                 {activeTab === "otel-import" && (
                     <div className="space-y-4">
                         {/* 导入区域 */}
-                        <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                        <div className="surface-subtle rounded-2xl p-4">
                             <h3 className="mb-3 text-sm font-semibold text-[var(--text-main)]">📥 导入外部 OpenTelemetry Trace</h3>
                             <p className="mb-3 text-xs text-[var(--text-muted)]">
                                 粘贴标准 OTLP/JSON 格式的 Trace 数据。支持 LangChain、AutoGen、CrewAI 等框架按 OTel 规范导出的 Trace。
@@ -521,7 +518,7 @@ export default function ObservabilityPanel() {
                                 onChange={(e) => { setOtelInput(e.target.value); setOtelImportError(null); setOtelImportResult(null); }}
                                 placeholder={`{\n  "resourceSpans": [{\n    "resource": { "attributes": [...] },\n    "scopeSpans": [{\n      "scope": { "name": "..." },\n      "spans": [...]\n    }]\n  }]\n}`}
                                 rows={8}
-                                className="w-full rounded-lg border border-[var(--panel-border)] bg-[var(--panel-bg)] px-3 py-2 text-xs font-mono text-[var(--text-main)] placeholder:text-[var(--text-muted)] resize-y"
+                                className="w-full rounded-lg surface-card px-3 py-2 text-xs font-mono text-[var(--text-main)] placeholder:text-[var(--text-muted)] resize-y"
                             />
                             <div className="mt-3 flex items-center gap-3">
                                 <button
@@ -556,7 +553,7 @@ export default function ObservabilityPanel() {
                         </div>
 
                         {/* 说明卡片 */}
-                        <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                        <div className="surface-subtle rounded-2xl p-4">
                             <h3 className="mb-2 text-sm font-semibold text-[var(--text-main)]">格式说明</h3>
                             <div className="space-y-2 text-xs text-[var(--text-muted)]">
                                 <p>• 支持的格式：<code className="rounded bg-[var(--panel-bg)] px-1 py-0.5 text-[11px]">OTLP/JSON</code>（OpenTelemetry Protocol JSON）</p>
@@ -568,7 +565,24 @@ export default function ObservabilityPanel() {
                         </div>
                     </div>
                 )}
+                {embedded && (
+                    <button type="button" onClick={onBack} className="tool-page-back-link">
+                        ← 返回聊天工作区
+                    </button>
+                )}
             </div>
+    );
+
+    if (embedded) {
+        return content;
+    }
+
+    return (
+        <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-3"
+            onClick={(e) => { if (e.target === e.currentTarget) toggleObservability(); }}
+        >
+            {content}
         </div>
     );
 }

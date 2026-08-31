@@ -5,7 +5,27 @@ import SettingsModal from './components/SettingsModal';
 import Sidebar from './components/Sidebar';
 import EvalDashboard from './components/EvalDashboard';
 import ObservabilityPanel from './components/ObservabilityPanel';
+import WelcomePanel from './components/WelcomePanel';
 import { useChatStore } from './store/chatStore';
+
+function AmbientBackground() {
+    return (
+        <div className="pointer-events-none fixed inset-0 z-0 overflow-hidden" aria-hidden="true">
+            <div
+                className="ambient-blob -left-[12%] -top-[16%] h-[46vmax] w-[46vmax] animate-blob-drift"
+                style={{ background: 'var(--blob-1)' }}
+            />
+            <div
+                className="ambient-blob -right-[14%] top-[16%] h-[38vmax] w-[38vmax] animate-blob-drift [animation-delay:-7s]"
+                style={{ background: 'var(--blob-2)' }}
+            />
+            <div
+                className="ambient-blob -bottom-[20%] left-[18%] h-[42vmax] w-[42vmax] animate-blob-drift [animation-delay:-13s]"
+                style={{ background: 'var(--blob-3)' }}
+            />
+        </div>
+    );
+}
 
 export default function App() {
     const initSessions = useChatStore((state) => state.initSessions);
@@ -18,8 +38,14 @@ export default function App() {
     const authError = useChatStore((state) => state.authError);
     const user = useChatStore((state) => state.user);
     const themeMode = useChatStore((state) => state.themeMode);
+    const sessions = useChatStore((state) => state.sessions);
+    const currentSessionId = useChatStore((state) => state.currentSessionId);
+    const messages = useChatStore((state) => state.messages);
+    const isSessionLoading = useChatStore((state) => state.isSessionLoading);
     const [sidebarOpen, setSidebarOpen] = useState(false);
     const [showShortcuts, setShowShortcuts] = useState(false);
+    const [activeView, setActiveView] = useState('chat');
+    const [suggestedPrompt, setSuggestedPrompt] = useState('');
     const [authMode, setAuthMode] = useState('login');
     const [username, setUsername] = useState('');
     const [password, setPassword] = useState('');
@@ -62,7 +88,9 @@ export default function App() {
 
     useEffect(() => {
         const root = document.documentElement;
-        const media = window.matchMedia('(prefers-color-scheme: dark)');
+        const media = typeof window.matchMedia === 'function'
+            ? window.matchMedia('(prefers-color-scheme: dark)')
+            : { matches: false };
 
         const applyTheme = () => {
             const resolved = themeMode === 'system'
@@ -73,16 +101,49 @@ export default function App() {
         };
 
         applyTheme();
-        media.addEventListener('change', applyTheme);
+        if (typeof media.addEventListener === 'function') {
+            media.addEventListener('change', applyTheme);
+        } else if (typeof media.addListener === 'function') {
+            media.addListener(applyTheme);
+        }
 
         return () => {
-            media.removeEventListener('change', applyTheme);
+            if (typeof media.removeEventListener === 'function') {
+                media.removeEventListener('change', applyTheme);
+            } else if (typeof media.removeListener === 'function') {
+                media.removeListener(applyTheme);
+            }
         };
     }, [themeMode]);
 
+    const currentSession = sessions.find((session) => session.id === currentSessionId);
+    const messageSearchKeyword = useChatStore((state) => state.messageSearchKeyword);
+    const hasConversation = messages.some((message) => message.id !== 'init');
+    const showWelcome = activeView === 'chat'
+        && !hasConversation
+        && !isSessionLoading
+        && !String(messageSearchKeyword || '').trim();
+    const viewTitle = activeView === 'eval'
+        ? '评估与优化'
+        : activeView === 'observability'
+            ? '运行观测'
+            : currentSession?.title || '新对话';
+
+    if (isAuthLoading) {
+        return (
+            <div className="flex h-screen items-center justify-center px-4">
+                <AmbientBackground />
+                <div className="glass glass-fade-in relative z-10 rounded-3xl px-6 py-5 text-sm text-[var(--text-muted)]">
+                    正在检查登录状态...
+                </div>
+            </div>
+        );
+    }
+
     if (!isAuthenticated) {
         return (
-            <div className="flex h-screen items-center justify-center bg-[var(--app-bg)] px-4">
+            <div className="flex h-screen items-center justify-center px-4">
+                <AmbientBackground />
                 <form
                     onSubmit={async (event) => {
                         event.preventDefault();
@@ -96,23 +157,25 @@ export default function App() {
                             await register(username, password);
                         }
                     }}
-                    className="w-full max-w-sm rounded-3xl border border-[var(--panel-border)] bg-[var(--panel-bg)] p-5 shadow-lg"
+                    className="glass glass-fade-in relative z-10 w-full max-w-sm rounded-3xl p-6"
                 >
-                    <h1 className="text-lg font-semibold text-[var(--text-main)]">AgentEvo 登录</h1>
-                    <p className="mt-1 text-xs text-[var(--text-muted)]">登录后可同步你的会话和设置。</p>
+                    <h1 className="gradient-text text-xl font-extrabold">AgentEvo</h1>
+                    <p className="mt-1 text-xs text-[var(--text-muted)]">
+                        {authMode === 'login' ? '登录后可同步你的会话和设置。' : '创建账号并开始使用 AgentEvo。'}
+                    </p>
 
                     <input
                         value={username}
                         onChange={(event) => setUsername(event.target.value)}
                         placeholder="用户名"
-                        className="mt-4 w-full rounded-xl border border-[var(--panel-border)] bg-[var(--panel-soft)] px-3 py-2 text-sm outline-none"
+                        className="mt-4 w-full rounded-xl border border-[var(--glass-border)] bg-[var(--glass-bg-strong)] px-3 py-2 text-sm text-[var(--text-main)] outline-none transition focus:border-[var(--glass-border-active)]"
                     />
                     <input
                         type="password"
                         value={password}
                         onChange={(event) => setPassword(event.target.value)}
                         placeholder="密码"
-                        className="mt-2 w-full rounded-xl border border-[var(--panel-border)] bg-[var(--panel-soft)] px-3 py-2 text-sm outline-none"
+                        className="mt-2 w-full rounded-xl border border-[var(--glass-border)] bg-[var(--glass-bg-strong)] px-3 py-2 text-sm text-[var(--text-main)] outline-none transition focus:border-[var(--glass-border-active)]"
                     />
 
                     {authError && <p className="mt-2 text-xs text-red-500">{authError}</p>}
@@ -120,7 +183,7 @@ export default function App() {
                     <button
                         type="submit"
                         disabled={isAuthLoading}
-                        className="mt-4 w-full rounded-xl bg-[#111827] px-3 py-2 text-sm font-semibold text-white disabled:opacity-60"
+                        className="btn-gradient mt-4 w-full rounded-xl px-3 py-2 text-sm font-semibold disabled:opacity-60"
                     >
                         {isAuthLoading ? '处理中...' : authMode === 'login' ? '登录' : '注册并登录'}
                     </button>
@@ -128,7 +191,7 @@ export default function App() {
                     <button
                         type="button"
                         onClick={() => setAuthMode((prev) => (prev === 'login' ? 'register' : 'login'))}
-                        className="mt-2 w-full text-xs text-[var(--text-muted)]"
+                        className="mt-2 w-full text-xs text-[var(--text-muted)] transition hover:text-[var(--text-main)]"
                     >
                         {authMode === 'login' ? '没有账号？去注册' : '已有账号？去登录'}
                     </button>
@@ -137,73 +200,105 @@ export default function App() {
         );
     }
 
+    const changeView = (nextView) => {
+        setActiveView(nextView);
+        setSuggestedPrompt('');
+        setSidebarOpen(false);
+    };
+
     return (
-        <div className="flex h-screen overflow-hidden bg-[var(--app-bg)] text-[var(--text-main)] transition-colors">
+        <div className="app-shell text-[var(--text-main)] transition-colors">
+            <AmbientBackground />
             <SettingsModal />
-            <EvalDashboard />
-            <ObservabilityPanel />
-            <Sidebar className="hidden md:flex" />
+            <Sidebar
+                activeView={activeView}
+                onViewChange={changeView}
+                className="relative z-10 hidden md:flex"
+            />
 
             {sidebarOpen && (
                 <div className="fixed inset-0 z-40 md:hidden">
                     <div
-                        className="absolute inset-0 bg-black/45"
+                        className="absolute inset-0 bg-black/40 backdrop-blur-sm"
                         onClick={() => setSidebarOpen(false)}
                     />
                     <Sidebar
+                        activeView={activeView}
+                        onViewChange={changeView}
                         className="relative z-50 h-full"
                         onAfterSelect={() => setSidebarOpen(false)}
                     />
                 </div>
             )}
 
-            <section className="relative flex min-w-0 flex-1 flex-col">
-                <header className="border-b border-[var(--panel-border)] bg-[var(--app-bg)]/90 px-3 py-3 backdrop-blur sm:px-6">
-                    <div className="mx-auto flex w-full max-w-5xl items-center justify-between gap-3 text-sm">
-                        <button
-                            type="button"
-                            onClick={() => setSidebarOpen(true)}
-                            className="rounded-xl border border-[var(--panel-border)] bg-[var(--panel-bg)] px-3 py-1.5 text-xs font-semibold text-[var(--text-main)] shadow-sm md:hidden"
-                        >
-                            会话
-                        </button>
-                        <span className="font-semibold tracking-wide text-[var(--brand)]">AgentEvo</span>
-                        <div className="hidden items-center gap-3 sm:flex">
+            <section className="workspace relative z-10">
+                <header className="workspace-header">
+                    <div className="workspace-header-inner">
+                        <div className="flex min-w-0 items-center gap-2">
+                            <button
+                                type="button"
+                                onClick={() => setSidebarOpen(true)}
+                                className="icon-button md:hidden"
+                                aria-label="打开导航"
+                            >
+                                <span aria-hidden="true">☰</span>
+                            </button>
+                            <div className="hidden items-center gap-2 md:flex">
+                                <span className="brand-dot" aria-hidden="true">✦</span>
+                                <span className="text-sm font-extrabold tracking-tight">AgentEvo</span>
+                            </div>
+                            <span className="header-divider hidden md:block" aria-hidden="true" />
+                            <span className="truncate text-sm font-semibold text-[var(--text-main)]">{viewTitle}</span>
+                        </div>
+                        <div className="flex items-center gap-2 sm:gap-3">
                             <button
                                 type="button"
                                 onClick={() => setShowShortcuts(true)}
-                                className="text-xs text-[var(--text-muted)]"
+                                className="header-link hidden sm:inline-flex"
                                 aria-keyshortcuts="Control+Slash Meta+Slash"
                             >
                                 快捷键
                             </button>
-                            <span className="text-xs text-[var(--text-muted)]">{user?.username}</span>
-                            <button
-                                type="button"
-                                onClick={logout}
-                                className="rounded-lg border border-[var(--panel-border)] px-2 py-1 text-xs text-[var(--text-muted)]"
-                            >
-                                退出
-                            </button>
+                            <span className="user-chip">
+                                <span className="status-dot" aria-hidden="true" />
+                                <span className="hidden sm:inline">{user?.username}</span>
+                            </span>
+                            <button type="button" onClick={logout} className="header-link">退出</button>
                         </div>
                     </div>
                 </header>
 
-                <main className="flex-1 overflow-hidden px-2 pb-3 pt-4 sm:px-6">
-                    <ChatList />
-                </main>
-
-                <ChatInput />
+                {activeView === 'chat' ? (
+                    <>
+                        <main className="chat-main">
+                            {!hasConversation && !isSessionLoading && (
+                                <WelcomePanel
+                                    userName={user?.username}
+                                    onSuggestion={setSuggestedPrompt}
+                                />
+                            )}
+                            <ChatList hideInitialPlaceholder={showWelcome} />
+                        </main>
+                        <ChatInput
+                            suggestedPrompt={suggestedPrompt}
+                            onSuggestedPromptConsumed={() => setSuggestedPrompt('')}
+                        />
+                    </>
+                ) : activeView === 'eval' ? (
+                    <main className="tool-workspace"><EvalDashboard embedded onBack={() => changeView('chat')} /></main>
+                ) : (
+                    <main className="tool-workspace"><ObservabilityPanel embedded onBack={() => changeView('chat')} /></main>
+                )}
             </section>
 
             {showShortcuts && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-3" onClick={(event) => {
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-3 backdrop-blur-sm" onClick={(event) => {
                     if (event.target === event.currentTarget) {
                         setShowShortcuts(false);
                     }
                 }}>
-                    <div className="w-full max-w-md rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-bg)] p-4">
-                        <h3 className="text-sm font-semibold">快捷键</h3>
+                    <div className="glass glass-fade-in w-full max-w-md rounded-2xl p-4">
+                        <h3 className="text-sm font-semibold text-[var(--text-main)]">快捷键</h3>
                         <ul className="mt-3 space-y-2 text-xs text-[var(--text-muted)]">
                             <li>Ctrl/⌘ + K: 聚焦输入框</li>
                             <li>Ctrl/⌘ + /: 打开快捷键面板</li>
@@ -214,7 +309,7 @@ export default function App() {
                         <button
                             type="button"
                             onClick={() => setShowShortcuts(false)}
-                            className="mt-4 rounded-lg bg-[#111827] px-3 py-1.5 text-xs font-semibold text-white"
+                            className="btn-gradient mt-4 rounded-lg px-3 py-1.5 text-xs font-semibold"
                         >
                             我知道了
                         </button>

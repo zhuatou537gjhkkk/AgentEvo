@@ -10,30 +10,30 @@ import { memo } from 'react';
 const STATUS_CONFIG = {
     connected: {
         border: 'border-l-emerald-400',
-        bg: 'bg-emerald-500/5',
-        text: 'text-emerald-300',
+        bg: 'bg-[var(--status-success-soft)]',
+        text: 'text-[var(--status-success)]',
         label: '已连接',
         dot: 'bg-emerald-400',
     },
     connecting: {
-        border: 'border-l-blue-400',
-        bg: 'bg-blue-500/5',
-        text: 'text-blue-300',
+        border: 'border-l-indigo-400',
+        bg: 'bg-[var(--status-info-soft)]',
+        text: 'text-[var(--status-info)]',
         label: '连接中',
-        dot: 'bg-blue-400',
+        dot: 'bg-indigo-500',
         pulse: true,
     },
     disconnected: {
-        border: 'border-l-red-400',
-        bg: 'bg-red-500/5',
-        text: 'text-red-300',
+        border: 'border-l-red-500',
+        bg: 'bg-[var(--status-danger-soft)]',
+        text: 'text-[var(--status-danger)]',
         label: '已断开',
         dot: 'bg-red-400',
     },
     error: {
-        border: 'border-l-amber-400',
-        bg: 'bg-amber-500/5',
-        text: 'text-amber-300',
+        border: 'border-l-amber-500',
+        bg: 'bg-[var(--status-warning-soft)]',
+        text: 'text-[var(--status-warning)]',
         label: '错误',
         dot: 'bg-amber-400',
     },
@@ -41,7 +41,7 @@ const STATUS_CONFIG = {
 
 function CollapsibleOutput({ text, maxLength = 120 }) {
     if (!text || text.length <= maxLength) {
-        return <pre className="mt-1 max-h-40 overflow-auto rounded-md bg-[var(--panel-bg)] px-2 py-1 text-[11px] leading-relaxed text-[var(--text-muted)] whitespace-pre-wrap break-all">{text}</pre>;
+        return <pre className="code-surface mt-1 max-h-40 overflow-auto px-2 py-1 text-[11px] leading-relaxed whitespace-pre-wrap break-all">{text}</pre>;
     }
 
     // Simple always-expanded display since this is used in settings context
@@ -50,7 +50,7 @@ function CollapsibleOutput({ text, maxLength = 120 }) {
             <summary className="cursor-pointer text-[11px] text-blue-500 hover:text-blue-400">
                 {text.slice(0, maxLength)}...
             </summary>
-            <pre className="mt-1 max-h-40 overflow-auto rounded-md bg-[var(--panel-bg)] px-2 py-1 text-[11px] leading-relaxed text-[var(--text-muted)] whitespace-pre-wrap break-all">{text}</pre>
+            <pre className="code-surface mt-1 max-h-40 overflow-auto px-2 py-1 text-[11px] leading-relaxed whitespace-pre-wrap break-all">{text}</pre>
         </details>
     );
 }

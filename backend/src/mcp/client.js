@@ -23,13 +23,19 @@ const BACKEND_ROOT = path.resolve(__dirname, "..", "..");
  * @returns {Promise<import("@modelcontextprotocol/sdk/client/index.js").Client>}
  */
 export async function connectToMCPServer(config) {
-    const { command, args = [], cwd } = config;
+    const { command, args = [], cwd, env } = config;
+
+    // Windows 下 npx 是 npx.cmd 批处理脚本，StdioClientTransport shell:false 直接 spawn "npx" 会 ENOENT
+    const resolvedCommand =
+        process.platform === "win32" && command === "npx" ? "npx.cmd" : command;
 
     const transport = new StdioClientTransport({
-        command,
+        command: resolvedCommand,
         args,
         cwd: cwd || BACKEND_ROOT,
         stderr: "pipe",
+        // SDK 的 getDefaultEnvironment() 只继承白名单系统变量，自定义 env（如 API key）必须显式传入
+        env,
     });
 
     const client = new Client(

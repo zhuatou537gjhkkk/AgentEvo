@@ -35,11 +35,11 @@ function UserQuestionCard({ questionLog }) {
       : String(submittedAnswer ?? '');
 
     return (
-      <div className="animate-tool-fade-in border-l-4 border-l-emerald-400 bg-emerald-500/5 rounded-r-md px-3 py-2.5 my-1.5">
+      <div className="animate-tool-fade-in border-l-4 border-l-emerald-500 bg-[var(--status-success-soft)] rounded-r-md px-3 py-2.5 my-1.5">
         <div className="flex items-center gap-2 text-xs">
-          <span className="text-emerald-300">{meta.icon}</span>
-          <span className="text-emerald-300 font-medium">{question}</span>
-          <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-[10px] text-emerald-400 ml-auto">
+          <span className="text-[var(--status-success)]">{meta.icon}</span>
+          <span className="text-[var(--status-success)] font-medium">{question}</span>
+          <span className="status-badge-success ml-auto">
             已提交
           </span>
         </div>
@@ -96,7 +96,7 @@ function UserQuestionCard({ questionLog }) {
                 type="button"
                 onClick={() => handleSubmitSingle(option)}
                 disabled={!isTyping}
-                className="block w-full text-left rounded-md border border-[var(--panel-border)] bg-[var(--panel-bg)] px-3 py-1.5 text-xs text-[var(--text-main)] hover:bg-[var(--panel-soft)] transition disabled:opacity-50 disabled:cursor-not-allowed"
+                className="ui-button-secondary block w-full text-left px-3 py-1.5 text-xs transition disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {option}
               </button>
@@ -117,7 +117,7 @@ function UserQuestionCard({ questionLog }) {
                   checked={selectedOptions.has(option)}
                   onChange={() => handleToggleMulti(option)}
                   disabled={!isTyping}
-                  className="rounded accent-blue-500"
+                  className="rounded accent-[var(--brand-start)]"
                 />
                 {option}
               </label>
@@ -126,7 +126,7 @@ function UserQuestionCard({ questionLog }) {
               type="button"
               onClick={handleSubmitMulti}
               disabled={!isTyping || selectedOptions.size === 0}
-              className="mt-2 rounded-md bg-blue-600 px-4 py-1.5 text-xs font-medium text-white hover:bg-blue-700 transition disabled:opacity-50 disabled:cursor-not-allowed"
+              className="ui-button-primary mt-2 px-4 py-1.5 text-xs transition disabled:opacity-50 disabled:cursor-not-allowed"
             >
               提交 ({selectedOptions.size} 项)
             </button>
@@ -145,13 +145,13 @@ function UserQuestionCard({ questionLog }) {
               }}
               disabled={!isTyping}
               placeholder="输入你的回答..."
-              className="w-full rounded-md border border-[var(--panel-border)] bg-[var(--panel-bg)] px-3 py-1.5 text-xs text-[var(--text-main)] placeholder-[var(--text-muted)] outline-none focus:border-blue-400 transition disabled:opacity-50"
+              className="ui-input w-full px-3 py-1.5 text-xs transition disabled:opacity-50"
             />
             <button
               type="button"
               onClick={handleSubmitText}
               disabled={!isTyping || !textValue.trim()}
-              className="rounded-md bg-blue-600 px-4 py-1.5 text-xs font-medium text-white hover:bg-blue-700 transition disabled:opacity-50 disabled:cursor-not-allowed"
+              className="ui-button-primary px-4 py-1.5 text-xs transition disabled:opacity-50 disabled:cursor-not-allowed"
             >
               提交
             </button>
@@ -164,11 +164,11 @@ function UserQuestionCard({ questionLog }) {
   };
 
   return (
-    <div className="animate-tool-fade-in border-l-4 border-l-amber-400 bg-amber-500/5 rounded-r-md px-3 py-2.5 my-1.5">
+    <div className="animate-tool-fade-in border-l-4 border-l-amber-500 bg-[var(--status-warning-soft)] rounded-r-md px-3 py-2.5 my-1.5">
       <div className="flex items-center gap-2 text-xs">
-        <span className="text-amber-300">{meta.icon}</span>
-        <span className="text-amber-300 font-medium">{question}</span>
-        <span className="rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-400 ml-auto">
+        <span className="text-[var(--status-warning)]">{meta.icon}</span>
+        <span className="text-[var(--status-warning)] font-medium">{question}</span>
+        <span className="status-badge-warning ml-auto">
           {meta.label}
         </span>
       </div>

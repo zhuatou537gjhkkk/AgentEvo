@@ -156,8 +156,11 @@ describe('mapIntentToNode — 动态路由映射', () => {
     });
 
     // M1.5 KEY
-    it('dynamic intent — MCP category exists -> "tool_executor"', () => {
+    it('dynamic intent — 单工具 MCP 类别 -> "tool_executor"', () => {
         toolRegistry.hasToolCategory.mockReturnValue(true);
+        toolRegistry.getToolCategories.mockReturnValue([
+            { category: 'filesystem', tools: [{ name: 'read_file' }] },
+        ]);
         expect(mapIntentToNode('filesystem')).toBe('tool_executor');
     });
 
@@ -171,6 +174,15 @@ describe('mapIntentToNode — 动态路由映射', () => {
     it('已知 intent 不走 hasToolCategory 检查', () => {
         const result = mapIntentToNode('search');
         expect(result).toBe('search_agent');
+    });
+
+    // M1.8 KEY（多工具 MCP 类别需要 LLM 工具选择，不能盲目取第一个工具）
+    it('dynamic intent — 多工具 MCP 类别 -> "general_chat"', () => {
+        toolRegistry.hasToolCategory.mockReturnValue(true);
+        toolRegistry.getToolCategories.mockReturnValue([
+            { category: 'amap', tools: [{ name: 'maps_geo' }, { name: 'maps_direction_transit_integrated' }] },
+        ]);
+        expect(mapIntentToNode('amap')).toBe('general_chat');
     });
 });
 

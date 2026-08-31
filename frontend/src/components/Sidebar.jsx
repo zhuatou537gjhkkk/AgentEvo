@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useChatStore } from '../store/chatStore';
 
-export default function Sidebar({ className = '', onAfterSelect }) {
+export default function Sidebar({ className = '', onAfterSelect, activeView = 'chat', onViewChange }) {
     const [keyword, setKeyword] = useState('');
     const [renameTarget, setRenameTarget] = useState(null);
     const [renameValue, setRenameValue] = useState('');
@@ -90,147 +90,98 @@ export default function Sidebar({ className = '', onAfterSelect }) {
 
     return (
         <>
-            <aside className={`flex h-full w-[280px] max-w-[88vw] flex-col border-r border-slate-800 bg-[#17191c] text-slate-100 ${className}`}>
-                <div className="border-b border-slate-800 p-4">
-                    <button
-                        type="button"
-                        onClick={handleCreate}
-                        disabled={isCreatingSession}
-                        className="w-full rounded-xl border border-slate-700 bg-slate-800/80 px-3 py-2.5 text-sm font-semibold text-slate-100 transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                        {isCreatingSession ? '创建中...' : '+ 新建聊天'}
+            <aside className={`app-sidebar ${className}`}>
+                <div className="sidebar-brand">
+                    <div className="brand-lockup">
+                        <span className="brand-dot" aria-hidden="true">✦</span>
+                        <span>AgentEvo</span>
+                    </div>
+                    <span className="sidebar-version">workspace</span>
+                </div>
+
+                <div className="sidebar-actions">
+                    <button type="button" onClick={handleCreate} disabled={isCreatingSession} className="new-chat-button">
+                        <span aria-hidden="true">＋</span>
+                        {isCreatingSession ? '创建中...' : '新建聊天'}
                     </button>
+                    <label className="sidebar-search">
+                        <span aria-hidden="true">⌕</span>
+                        <input value={keyword} onChange={(event) => setKeyword(event.target.value)} placeholder="搜索会话" />
+                    </label>
+                </div>
 
-                    <input
-                        value={keyword}
-                        onChange={(event) => setKeyword(event.target.value)}
-                        placeholder="搜索会话"
-                        className="mt-3 w-full rounded-xl border border-slate-700 bg-[#1f2329] px-3 py-2 text-xs text-slate-200 outline-none placeholder:text-slate-500 focus:border-slate-500"
-                    />
+                <nav className="sidebar-nav" aria-label="工作区导航">
+                    <p className="sidebar-section-label">工作台</p>
+                    <button type="button" onClick={() => onViewChange?.('chat')} className={`sidebar-nav-item ${activeView === 'chat' ? 'is-active' : ''}`}>
+                        <span aria-hidden="true">◎</span><span>聊天工作区</span>
+                    </button>
+                    <button type="button" onClick={() => onViewChange?.('eval')} className={`sidebar-nav-item ${activeView === 'eval' ? 'is-active' : ''}`}>
+                        <span aria-hidden="true">◈</span><span>评估与优化</span>
+                    </button>
+                    <button type="button" onClick={() => onViewChange?.('observability')} className={`sidebar-nav-item ${activeView === 'observability' ? 'is-active' : ''}`}>
+                        <span aria-hidden="true">⌁</span><span>运行观测</span>
+                    </button>
+                </nav>
 
+                {sessionError && (
+                    <div className="sidebar-error">
+                        <p>{sessionError}</p>
+                        <button type="button" onClick={initSessions}>重试初始化</button>
+                    </div>
+                )}
+
+                <div className="sidebar-recent">
+                    <div className="sidebar-section-heading">
+                        <p className="sidebar-section-label">最近对话</p>
+                        <span>{filteredSessions.length}</span>
+                    </div>
                     <input
                         value={messageSearchKeyword}
                         onChange={(event) => setMessageSearchKeyword(event.target.value)}
                         placeholder="筛选当前会话消息"
-                        className="mt-2 w-full rounded-xl border border-slate-700 bg-[#1f2329] px-3 py-2 text-xs text-slate-200 outline-none placeholder:text-slate-500 focus:border-slate-500"
+                        className="sidebar-message-filter"
                     />
-                </div>
-
-                {sessionError && (
-                    <div className="mx-3 mt-3 rounded-xl border border-red-400/30 bg-red-500/10 px-3 py-2 text-xs text-red-200">
-                        <p>{sessionError}</p>
-                        <button
-                            type="button"
-                            onClick={initSessions}
-                            className="mt-2 rounded bg-red-500/20 px-2 py-1 text-[11px] text-red-100 transition hover:bg-red-500/30"
-                        >
-                            重试初始化
-                        </button>
-                    </div>
-                )}
-
-                <div className="flex-1 overflow-y-auto p-3">
-                    <ul className="space-y-2">
+                    <ul className="session-list">
                         {filteredSessions.map((session) => {
                             const active = session.id === currentSessionId;
-
                             return (
-                                <li key={session.id}>
-                                    <button
-                                        type="button"
-                                        onClick={() => handleSwitch(session.id)}
-                                        aria-label={`切换到会话 ${session.title || '未命名会话'}`}
-                                        className={[
-                                            'group w-full rounded-xl px-3 py-2.5 text-left text-sm transition',
-                                            active
-                                                ? 'bg-slate-700 text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.08)]'
-                                                : 'bg-transparent text-slate-300 hover:bg-slate-800/70',
-                                        ].join(' ')}
-                                    >
-                                        <div className="flex items-start justify-between gap-2">
-                                            <p className="truncate font-medium">{session.title || '未命名会话'}</p>
-                                            <div className="flex shrink-0 items-center gap-1 opacity-100 md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 transition-opacity">
-                                                <button
-                                                    type="button"
-                                                    onClick={(event) => handlePin(event, session.id)}
-                                                    aria-label={session.pinned ? '取消置顶会话' : '置顶会话'}
-                                                    className="rounded px-1 text-[10px] text-amber-300 hover:bg-amber-500/20"
-                                                >
-                                                    {session.pinned ? '取消顶' : '置顶'}
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    onClick={(event) => handleRename(event, session)}
-                                                    aria-label="重命名会话"
-                                                    className="rounded px-1 text-[10px] text-slate-300 hover:bg-slate-600/60"
-                                                >
-                                                    改
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    onClick={(event) => handleDelete(event, session.id)}
-                                                    aria-label="删除会话"
-                                                    className="rounded px-1 text-[10px] text-red-300 hover:bg-red-500/20"
-                                                >
-                                                    删
-                                                </button>
-                                            </div>
-                                        </div>
-                                        <p className="mt-1 truncate text-xs text-gray-400">
-                                            {session.pinned ? '📌 置顶 · ' : ''}
-                                            {new Date(session.updated_at || session.created_at).toLocaleString()}
-                                        </p>
+                                <li key={session.id} className={`session-row ${active ? 'is-active' : ''}`}>
+                                    <button type="button" onClick={() => handleSwitch(session.id)} aria-label={`切换到会话 ${session.title || '未命名会话'}`} className="session-select">
+                                        <span className="session-icon" aria-hidden="true">{session.pinned ? '●' : '○'}</span>
+                                        <span className="min-w-0 flex-1">
+                                            <span className="session-title">{session.title || '未命名会话'}</span>
+                                            <span className="session-time">{new Date(session.updated_at || session.created_at).toLocaleDateString()}</span>
+                                        </span>
                                     </button>
+                                    <div className="session-actions">
+                                        <button type="button" onClick={(event) => handlePin(event, session.id)} aria-label={session.pinned ? '取消置顶会话' : '置顶会话'} title={session.pinned ? '取消置顶' : '置顶'}>⌃</button>
+                                        <button type="button" onClick={(event) => handleRename(event, session)} aria-label="重命名会话" title="重命名">⋯</button>
+                                        <button type="button" onClick={(event) => handleDelete(event, session.id)} aria-label="删除会话" title="删除">×</button>
+                                    </div>
                                 </li>
                             );
                         })}
-
-                        {filteredSessions.length === 0 && (
-                            <li className="rounded-xl bg-slate-800/40 px-3 py-2 text-xs text-slate-400">
-                                未找到匹配会话
-                            </li>
-                        )}
+                        {filteredSessions.length === 0 && <li className="session-empty">未找到匹配会话</li>}
                     </ul>
                 </div>
 
-                <div className="border-t border-slate-800 p-3">
-                    <div className="grid grid-cols-4 gap-2">
-                        <button
-                            type="button"
-                            onClick={toggleSettings}
-                            className="rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm font-medium text-slate-100 transition hover:bg-slate-700"
-                        >
-                            设置
-                        </button>
-                        <button
-                            type="button"
-                            onClick={toggleEvalDashboard}
-                            className="rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm font-medium text-slate-100 transition hover:bg-slate-700"
-                        >
-                            评估
-                        </button>
-                        <button
-                            type="button"
-                            onClick={toggleObservability}
-                            className="rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm font-medium text-slate-100 transition hover:bg-slate-700"
-                        >
-                            观测
-                        </button>
-                        <button
-                            type="button"
-                            onClick={exportCurrentSessionMarkdown}
-                            disabled={isExporting}
-                            className="rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm font-medium text-slate-100 transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
-                        >
-                            {isExporting ? '导出中...' : '导出 MD'}
-                        </button>
+                <div className="sidebar-footer">
+                    <div className="upgrade-card">
+                        <span className="upgrade-kicker">AgentEvo Pro</span>
+                        <strong>解锁更强的工作流</strong>
+                        <small>更多文件、记忆与模型能力</small>
+                        <span className="upgrade-link">了解更多 ↗</span>
+                    </div>
+                    <div className="sidebar-footer-actions">
+                        <button type="button" onClick={toggleSettings}><span aria-hidden="true">⚙</span>设置</button>
+                        <button type="button" onClick={exportCurrentSessionMarkdown} disabled={isExporting}><span aria-hidden="true">⇩</span>{isExporting ? '导出中' : '导出'}</button>
                     </div>
                 </div>
             </aside>
 
             {renameTarget && (
                 <div
-                    className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-3"
+                    className="ui-modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-3"
                     onClick={(event) => {
                         if (event.target === event.currentTarget) {
                             setRenameTarget(null);
@@ -238,13 +189,13 @@ export default function Sidebar({ className = '', onAfterSelect }) {
                         }
                     }}
                 >
-                    <div role="dialog" aria-modal="true" aria-label="重命名会话" className="w-full max-w-md rounded-2xl border border-slate-700 bg-[#17191c] p-4 text-slate-100 shadow-2xl">
+                    <div role="dialog" aria-modal="true" aria-label="重命名会话" className="w-full max-w-md rounded-2xl ui-modal w-full max-w-md p-4 text-[var(--text-main)]">
                         <h3 className="text-sm font-semibold">重命名会话</h3>
                         <input
                             autoFocus
                             value={renameValue}
                             onChange={(event) => setRenameValue(event.target.value)}
-                            className="mt-3 w-full rounded-lg border border-slate-700 bg-[#1f2329] px-3 py-2 text-sm text-slate-200 outline-none focus:border-slate-500"
+                            className="mt-3 w-full rounded-lg ui-input w-full px-3 py-2 text-sm"
                         />
                         <div className="mt-4 flex justify-end gap-2">
                             <button
@@ -253,7 +204,7 @@ export default function Sidebar({ className = '', onAfterSelect }) {
                                     setRenameTarget(null);
                                     setRenameValue('');
                                 }}
-                                className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs"
+                                className="ui-button-secondary px-3 py-1.5 text-xs"
                             >
                                 取消
                             </button>
@@ -269,7 +220,7 @@ export default function Sidebar({ className = '', onAfterSelect }) {
                                     setRenameTarget(null);
                                     setRenameValue('');
                                 }}
-                                className="rounded-lg bg-slate-100 px-3 py-1.5 text-xs font-semibold text-slate-900"
+                                className="ui-button-primary px-3 py-1.5 text-xs"
                             >
                                 保存
                             </button>
@@ -280,21 +231,21 @@ export default function Sidebar({ className = '', onAfterSelect }) {
 
             {deleteTarget && (
                 <div
-                    className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-3"
+                    className="ui-modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-3"
                     onClick={(event) => {
                         if (event.target === event.currentTarget) {
                             setDeleteTarget(null);
                         }
                     }}
                 >
-                    <div role="dialog" aria-modal="true" aria-label="删除会话确认" className="w-full max-w-md rounded-2xl border border-slate-700 bg-[#17191c] p-4 text-slate-100 shadow-2xl">
+                    <div role="dialog" aria-modal="true" aria-label="删除会话确认" className="w-full max-w-md rounded-2xl ui-modal w-full max-w-md p-4 text-[var(--text-main)]">
                         <h3 className="text-sm font-semibold">确认删除会话</h3>
                         <p className="mt-2 text-xs text-slate-300">将删除“{deleteTarget.title || '未命名会话'}”及其全部消息，此操作不可恢复。</p>
                         <div className="mt-4 flex justify-end gap-2">
                             <button
                                 type="button"
                                 onClick={() => setDeleteTarget(null)}
-                                className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs"
+                                className="ui-button-secondary px-3 py-1.5 text-xs"
                             >
                                 取消
                             </button>
@@ -304,7 +255,7 @@ export default function Sidebar({ className = '', onAfterSelect }) {
                                     await deleteSession(deleteTarget.id);
                                     setDeleteTarget(null);
                                 }}
-                                className="rounded-lg bg-red-500 px-3 py-1.5 text-xs font-semibold text-white"
+                                className="ui-button-primary bg-[var(--status-danger)] px-3 py-1.5 text-xs"
                             >
                                 删除
                             </button>

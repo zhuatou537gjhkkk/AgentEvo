@@ -22,6 +22,12 @@ import { createToolExecutionStateMachine, ToolStatus } from '../utils/toolExecut
 // 模块级 Map：存储活跃 FSM 及其 syncToolLogs，用于 stop 时立即取消工具
 // 不能放 Zustand state（非序列化对象会被 persist 中间件丢弃）
 const activeToolCleanupMap = new Map();
+let contextUsageRequestVersion = 0;
+
+function invalidateContextUsage() {
+    contextUsageRequestVersion += 1;
+    return { contextUsage: null };
+}
 
 const initialMessage = {
     id: 'init',
@@ -524,14 +530,27 @@ export const useChatStore = create(persist((set, get) => ({
     },
     // 上下文窗口管理
     fetchContextUsage: async (sessionId) => {
-        if (!sessionId) return;
+        const targetSessionId = Number(sessionId);
+        if (!Number.isInteger(targetSessionId) || targetSessionId <= 0) return;
+
+        const state = get();
+        if (Number(state.currentSessionId) !== targetSessionId) return;
+
+        const requestVersion = ++contextUsageRequestVersion;
         try {
-            const data = await fetchContextUsage(sessionId);
-            if (data?.ok) {
-                set({ contextUsage: data.data });
+            const data = await fetchContextUsage(targetSessionId);
+            const usage = data?.data;
+            const latest = get();
+            if (
+                data?.ok
+                && requestVersion === contextUsageRequestVersion
+                && Number(latest.currentSessionId) === targetSessionId
+                && Number(usage?.sessionId) === targetSessionId
+            ) {
+                set({ contextUsage: usage });
             }
         } catch (err) {
-            // 静默失败，不阻塞用户操作
+            // 静默失败，不阻塞用户操作；过期请求不得影响当前会话快照。
             console.error("[store] fetchContextUsage failed:", err);
         }
     },
@@ -873,28 +892,31 @@ export const useChatStore = create(persist((set, get) => ({
 
         if (!token) {
             setAuthToken('');
-            set({
+            set((state) => ({
+                ...invalidateContextUsage(),
                 user: null,
                 isAuthenticated: false,
                 isAuthLoading: false,
-            });
+            }));
             return;
         }
 
-        set({ isAuthLoading: true, authError: '' });
+        set((state) => ({ ...invalidateContextUsage(), isAuthLoading: true, authError: '' }));
         setAuthToken(token);
 
         try {
             const data = await fetchMe();
-            set({
+            set((state) => ({
+                ...invalidateContextUsage(),
                 user: data?.user || null,
                 isAuthenticated: Boolean(data?.user),
                 isAuthLoading: false,
                 authError: '',
-            });
+            }));
         } catch (error) {
             setAuthToken('');
-            set({
+            set((state) => ({
+                ...invalidateContextUsage(),
                 authToken: '',
                 user: null,
                 isAuthenticated: false,
@@ -904,7 +926,7 @@ export const useChatStore = create(persist((set, get) => ({
                 currentSessionId: null,
                 hasInitializedSessions: false,
                 messages: [initialMessage],
-            });
+            }));
         }
     },
     register: async (username, password) => {
@@ -916,14 +938,15 @@ export const useChatStore = create(persist((set, get) => ({
             return false;
         }
 
-        set({ isAuthLoading: true, authError: '' });
+        set((state) => ({ ...invalidateContextUsage(), isAuthLoading: true, authError: '' }));
 
         try {
             const data = await registerAuth(safeUsername, safePassword);
             const token = String(data?.token || '');
             setAuthToken(token);
 
-            set({
+            set((state) => ({
+                ...invalidateContextUsage(),
                 authToken: token,
                 user: data?.user || null,
                 isAuthenticated: Boolean(data?.user),
@@ -933,7 +956,7 @@ export const useChatStore = create(persist((set, get) => ({
                 sessions: [],
                 currentSessionId: null,
                 messages: [initialMessage],
-            });
+            }));
             return true;
         } catch (error) {
             set({
@@ -952,14 +975,15 @@ export const useChatStore = create(persist((set, get) => ({
             return false;
         }
 
-        set({ isAuthLoading: true, authError: '' });
+        set((state) => ({ ...invalidateContextUsage(), isAuthLoading: true, authError: '' }));
 
         try {
             const data = await loginAuth(safeUsername, safePassword);
             const token = String(data?.token || '');
             setAuthToken(token);
 
-            set({
+            set((state) => ({
+                ...invalidateContextUsage(),
                 authToken: token,
                 user: data?.user || null,
                 isAuthenticated: Boolean(data?.user),
@@ -969,7 +993,7 @@ export const useChatStore = create(persist((set, get) => ({
                 sessions: [],
                 currentSessionId: null,
                 messages: [initialMessage],
-            });
+            }));
             return true;
         } catch (error) {
             set({
@@ -982,7 +1006,8 @@ export const useChatStore = create(persist((set, get) => ({
     logout: () => {
         setAuthToken('');
 
-        set({
+        set((state) => ({
+            ...invalidateContextUsage(),
             authToken: '',
             user: null,
             isAuthenticated: false,
@@ -992,7 +1017,7 @@ export const useChatStore = create(persist((set, get) => ({
             messages: [initialMessage],
             sessionError: '',
             authError: '',
-        });
+        }));
     },
     getCurrentDraft: () => {
         const state = get();
@@ -1081,10 +1106,11 @@ export const useChatStore = create(persist((set, get) => ({
             return;
         }
 
-        set({
+        set((state) => ({
+            ...invalidateContextUsage(),
             isSessionLoading: true,
             sessionError: '',
-        });
+        }));
 
         try {
             const list = await fetchSessions();
@@ -1100,7 +1126,8 @@ export const useChatStore = create(persist((set, get) => ({
 
                 const initialSettings = createDefaultAgentSettings();
 
-                set({
+                set((state) => ({
+                    ...invalidateContextUsage(),
                     hasInitializedSessions: true,
                     sessions: [session],
                     currentSessionId: id,
@@ -1108,11 +1135,12 @@ export const useChatStore = create(persist((set, get) => ({
                     systemPrompt: initialSettings.systemPrompt,
                     temperature: initialSettings.temperature,
                     sessionAgentSettings: {
-                        ...get().sessionAgentSettings,
+                        ...state.sessionAgentSettings,
                         [id]: initialSettings,
                     },
                     sessionError: '',
-                });
+                }));
+                get().fetchContextUsage(id);
                 return;
             }
 
@@ -1128,7 +1156,8 @@ export const useChatStore = create(persist((set, get) => ({
 
             const currentAgentSettings = nextAgentSettings[currentId] || createDefaultAgentSettings();
 
-            set({
+            set((state) => ({
+                ...invalidateContextUsage(),
                 hasInitializedSessions: true,
                 sessions: list,
                 currentSessionId: currentId,
@@ -1137,15 +1166,17 @@ export const useChatStore = create(persist((set, get) => ({
                 temperature: currentAgentSettings.temperature,
                 sessionAgentSettings: nextAgentSettings,
                 sessionError: '',
-            });
+            }));
+            get().fetchContextUsage(currentId);
         } catch (error) {
-            set({
+            set((state) => ({
+                ...invalidateContextUsage(),
                 hasInitializedSessions: false,
                 sessions: [],
                 currentSessionId: null,
                 messages: [initialMessage],
                 sessionError: '初始化会话失败，请点击重试。',
-            });
+            }));
         } finally {
             set({ isSessionLoading: false });
         }
@@ -1153,14 +1184,15 @@ export const useChatStore = create(persist((set, get) => ({
     switchSession: async (id) => {
         const requestId = `${id}-${Date.now()}`;
 
-        set({
+        set((state) => ({
+            ...invalidateContextUsage(),
             currentSessionId: id,
             activeSessionRequestId: requestId,
             isSessionLoading: true,
             isTyping: false,
             messageSearchKeyword: '',
             sessionError: '',
-        });
+        }));
 
         try {
             const history = await fetchMessagesBySession(id);
@@ -1241,6 +1273,7 @@ export const useChatStore = create(persist((set, get) => ({
             const defaultSettings = createDefaultAgentSettings();
 
             set((state) => ({
+                ...invalidateContextUsage(),
                 systemPrompt: defaultSettings.systemPrompt,
                 temperature: defaultSettings.temperature,
                 hasInitializedSessions: true,
@@ -1254,6 +1287,7 @@ export const useChatStore = create(persist((set, get) => ({
                 },
                 sessionError: '',
             }));
+            get().fetchContextUsage(id);
         } catch (error) {
             set({
                 sessionError: '新建会话失败，请稍后重试。',
@@ -1349,6 +1383,7 @@ export const useChatStore = create(persist((set, get) => ({
                 nextSettingsMap[newId] = defaultSettings;
 
                 set({
+                    ...invalidateContextUsage(),
                     sessions: [fallbackSession],
                     currentSessionId: newId,
                     messages: [initialMessage],
@@ -1358,6 +1393,7 @@ export const useChatStore = create(persist((set, get) => ({
                     sessionDrafts: nextDrafts,
                     sessionError: '',
                 });
+                get().fetchContextUsage(newId);
                 return;
             }
 

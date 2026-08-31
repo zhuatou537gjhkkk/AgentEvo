@@ -37,6 +37,19 @@
         "@modelcontextprotocol/server-filesystem",
         "d:/AgentEvo"
       ]
+    },
+    {
+      "name": "amap",
+      "type": "mcp",
+      "enabled": true,
+      "command": "npx",
+      "args": [
+        "-y",
+        "@amap/amap-maps-mcp-server"
+      ],
+      "env": {
+        "AMAP_MAPS_API_KEY": "env:AMAP_MAPS_API_KEY"
+      }
     }
   ]
 }

@@ -30,7 +30,8 @@ import {
     getFeedbackByMessage,
     deleteFeedback,
 } from "./db/index.js";
-import { chatWithStream, estimateTokens, resolveModelName, getModelContextWindow } from "./services/chat.js";
+import { chatWithStream, estimateTokens, resolveModelName } from "./services/chat.js";
+import { calculateContextUsage } from "./services/contextUsage.js";
 import { chatWithGraph } from "./services/chatGraph.js";
 import { resolveUserQuestion } from "./mcp/tools.js";
 import { toolRegistry } from "./mcp/registry.js";
@@ -536,39 +537,10 @@ app.get("/sessions/:id/context-usage", requireAuth, (req, res) => {
 
     try {
         const history = getHistoryMessages(req.user.id, sessionId, 200);
-        // 从最新向最旧遍历，遇到压缩摘要标记即停止——被压缩替换的消息不再计入
-        let totalTokens = 0;
-        for (let i = history.length - 1; i >= 0; i--) {
-            const msg = history[i];
-            // 压缩摘要替代了所有更早的消息，遇到后停止遍历
-            if (msg.role === "system" && String(msg.content || "").startsWith("[上下文压缩摘要")) {
-                totalTokens += msg.metrics?.total_tokens || estimateTokens(String(msg.content || ""));
-                break;
-            }
-            if (msg.metrics && typeof msg.metrics.total_tokens === "number") {
-                totalTokens += msg.metrics.total_tokens;
-            } else {
-                totalTokens += estimateTokens(String(msg.content || ""));
-            }
-        }
-        // 预留 ~2000 tokens 给系统提示词 + 工具定义
-        const overheadTokens = 2000;
-        const usedTokens = totalTokens + overheadTokens;
-
-        // 从当前模型配置读取上下文窗口上限
         const modelName = resolveModelName(false);
-        const maxTokens = getModelContextWindow(modelName);
-
         return res.json({
             ok: true,
-            data: {
-                sessionId,
-                usedTokens,
-                maxTokens,
-                ratio: Math.round((usedTokens / maxTokens) * 100),
-                messageCount: history.length,
-                modelName,
-            },
+            data: calculateContextUsage(history, modelName, sessionId),
         });
     } catch (err) {
         console.error("[context-usage] GET failed:", err.message);
@@ -1551,6 +1523,20 @@ app.post("/chat/answer", requireAuth, async (req, res) => {
 // MCP Server 管理 API (Phase 3)
 // ═══════════════════════════════════════════════════════
 
+// 解析 MCP Server 配置里的 env 字段：值形如 "env:VAR_NAME" 时从 process.env 取值，
+// 避免把 API key 明文写进 servers.json（servers.json 进 git，key 放 .env 才安全）。
+function resolveMCPEnv(envConfig) {
+    if (!envConfig || typeof envConfig !== "object") return undefined;
+    const resolved = {};
+    for (const [key, value] of Object.entries(envConfig)) {
+        resolved[key] =
+            typeof value === "string" && value.startsWith("env:")
+                ? process.env[value.slice(4)] ?? value
+                : value;
+    }
+    return Object.keys(resolved).length > 0 ? resolved : undefined;
+}
+
 // 列出所有已注册的 MCP Server
 app.get("/mcp/servers", requireAuth, (req, res) => {
     const activeNames = toolRegistry.getMCPServerNames();
@@ -1591,7 +1577,7 @@ app.post("/mcp/servers", requireAuth, async (req, res) => {
     }
 
     try {
-        await toolRegistry.registerMCPServer({ name, command, args });
+        await toolRegistry.registerMCPServer({ name, command, args, env: resolveMCPEnv(req.body?.env) });
 
         // 持久化到 servers.json：重启后配置不丢失
         const configPath = path.join(import.meta.dirname, "mcp", "servers.json");
@@ -1667,6 +1653,7 @@ app.post("/mcp/servers/:name/connect", requireAuth, async (req, res) => {
             name,
             command: serverConfig.command,
             args: serverConfig.args || [],
+            env: resolveMCPEnv(serverConfig.env),
         });
 
         // 更新 enabled 标记
@@ -1795,6 +1782,7 @@ app.listen(PORT, async () => {
                 name: server.name,
                 command: server.command,
                 args: server.args || [],
+                env: resolveMCPEnv(server.env),
             });
         } catch (err) {
             console.warn(`[mcp] auto-connect "${server.name}" failed: ${err.message}`);

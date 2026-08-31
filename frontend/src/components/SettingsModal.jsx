@@ -100,7 +100,7 @@ export default function SettingsModal() {
 
     return (
         <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-3 sm:p-4"
+            className="ui-modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4"
             onClick={(event) => {
                 if (event.target === event.currentTarget) {
                     toggleSettings();
@@ -113,7 +113,7 @@ export default function SettingsModal() {
                 aria-modal="true"
                 aria-label="Agent 设定"
                 tabIndex={-1}
-                className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-3xl border border-[var(--panel-border)] bg-[var(--panel-bg)] p-4 shadow-2xl outline-none sm:p-6"
+                className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-3xl surface-card p-4 shadow-2xl outline-none sm:p-6"
             >
                 <h2 className="text-xl font-semibold text-[var(--text-main)]">Agent 设定</h2>
                 <p className="mt-1 text-xs text-[var(--text-muted)]">当前会话独立保存此处配置，切换会话不会互相影响。</p>
@@ -125,7 +125,7 @@ export default function SettingsModal() {
                             value={systemPrompt}
                             onChange={(event) => setSystemPrompt(event.target.value)}
                             rows={6}
-                            className="w-full rounded-xl border border-[var(--panel-border)] bg-[var(--panel-soft)] px-3 py-2 text-sm text-[var(--text-main)] outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200 dark:focus:border-slate-500 dark:focus:ring-slate-700"
+                            className="ui-textarea w-full px-3 py-2 text-sm"
                             placeholder="请输入系统提示词"
                         />
                     </label>
@@ -133,7 +133,7 @@ export default function SettingsModal() {
                     <label className="block">
                         <div className="mb-2 flex items-center justify-between">
                             <span className="text-sm font-medium text-[var(--text-main)]">Temperature</span>
-                            <span className="text-sm font-semibold text-blue-600">{Number(temperature).toFixed(1)}</span>
+                            <span className="text-sm font-semibold text-[var(--brand-start)]">{Number(temperature).toFixed(1)}</span>
                         </div>
                         <input
                             type="range"
@@ -142,7 +142,7 @@ export default function SettingsModal() {
                             step="0.1"
                             value={temperature}
                             onChange={(event) => setTemperature(Number(event.target.value))}
-                            className="w-full accent-blue-600"
+                            className="w-full accent-[var(--brand-start)]"
                         />
                     </label>
 
@@ -152,14 +152,14 @@ export default function SettingsModal() {
                             type="checkbox"
                             checked={isVoiceEnabled}
                             onChange={toggleVoice}
-                            className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                            className="h-4 w-4 rounded border-slate-300 text-[var(--brand-start)] focus:ring-[var(--focus-ring)]"
                         />
                     </label>
 
                     <label className="block rounded-xl border border-[var(--panel-border)] bg-[var(--panel-soft)] px-3 py-2">
                         <div className="mb-2 flex items-center justify-between">
                             <span className="text-sm font-medium text-[var(--text-main)]">语速</span>
-                            <span className="text-sm font-semibold text-blue-600">{Number(voiceRate).toFixed(1)}</span>
+                            <span className="text-sm font-semibold text-[var(--brand-start)]">{Number(voiceRate).toFixed(1)}</span>
                         </div>
                         <input
                             type="range"
@@ -168,14 +168,14 @@ export default function SettingsModal() {
                             step="0.1"
                             value={voiceRate}
                             onChange={(event) => setVoiceRate(Number(event.target.value))}
-                            className="w-full accent-blue-600"
+                            className="w-full accent-[var(--brand-start)]"
                         />
                     </label>
 
                     <label className="block rounded-xl border border-[var(--panel-border)] bg-[var(--panel-soft)] px-3 py-2">
                         <div className="mb-2 flex items-center justify-between">
                             <span className="text-sm font-medium text-[var(--text-main)]">音量</span>
-                            <span className="text-sm font-semibold text-blue-600">{Math.round(Number(voiceVolume) * 100)}%</span>
+                            <span className="text-sm font-semibold text-[var(--brand-start)]">{Math.round(Number(voiceVolume) * 100)}%</span>
                         </div>
                         <input
                             type="range"
@@ -184,7 +184,7 @@ export default function SettingsModal() {
                             step="0.1"
                             value={voiceVolume}
                             onChange={(event) => setVoiceVolume(Number(event.target.value))}
-                            className="w-full accent-blue-600"
+                            className="w-full accent-[var(--brand-start)]"
                         />
                     </label>
 
@@ -193,7 +193,7 @@ export default function SettingsModal() {
                         <select
                             value={voiceName}
                             onChange={(event) => setVoiceName(event.target.value)}
-                            className="w-full rounded-lg border border-[var(--panel-border)] bg-[var(--panel-bg)] px-2 py-1.5 text-sm text-[var(--text-main)] outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200 dark:focus:border-slate-500 dark:focus:ring-slate-700"
+                            className="ui-select w-full px-2 py-1.5 text-sm"
                         >
                             <option value="">系统默认（自动优先中文）</option>
                             {voices.map((voice) => (
@@ -209,7 +209,7 @@ export default function SettingsModal() {
                         <select
                             value={themeMode}
                             onChange={(event) => setThemeMode(event.target.value)}
-                            className="w-full rounded-lg border border-[var(--panel-border)] bg-[var(--panel-bg)] px-2 py-1.5 text-sm text-[var(--text-main)] outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200 dark:focus:border-slate-500 dark:focus:ring-slate-700"
+                            className="ui-select w-full px-2 py-1.5 text-sm"
                         >
                             <option value="system">跟随系统</option>
                             <option value="light">浅色</option>
@@ -237,19 +237,19 @@ export default function SettingsModal() {
                                 value={mcpFormName}
                                 onChange={(e) => setMcpFormName(e.target.value)}
                                 placeholder="服务器名称"
-                                className="w-full rounded-lg border border-[var(--panel-border)] bg-[var(--panel-bg)] px-2 py-1 text-xs text-[var(--text-main)] outline-none"
+                                className="w-full rounded-lg surface-card px-2 py-1 text-xs text-[var(--text-main)] outline-none"
                             />
                             <input
                                 value={mcpFormCommand}
                                 onChange={(e) => setMcpFormCommand(e.target.value)}
                                 placeholder="命令 (如 npx 或 python)"
-                                className="w-full rounded-lg border border-[var(--panel-border)] bg-[var(--panel-bg)] px-2 py-1 text-xs text-[var(--text-main)] outline-none"
+                                className="w-full rounded-lg surface-card px-2 py-1 text-xs text-[var(--text-main)] outline-none"
                             />
                             <input
                                 value={mcpFormArgs}
                                 onChange={(e) => setMcpFormArgs(e.target.value)}
                                 placeholder="参数 (空格分隔, 可选)"
-                                className="w-full rounded-lg border border-[var(--panel-border)] bg-[var(--panel-bg)] px-2 py-1 text-xs text-[var(--text-main)] outline-none"
+                                className="w-full rounded-lg surface-card px-2 py-1 text-xs text-[var(--text-main)] outline-none"
                             />
                             <button
                                 type="button"
@@ -272,7 +272,7 @@ export default function SettingsModal() {
                                         setMcpConnecting(false);
                                     }
                                 }}
-                                className="w-full rounded-lg bg-[#111827] px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-[#0b1220] disabled:opacity-40"
+                                className="w-full rounded-lg bg-[var(--brand-start)] px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-[var(--brand-mid)] disabled:opacity-40"
                             >
                                 {mcpConnecting ? '连接中...' : '连接'}
                             </button>
@@ -368,14 +368,14 @@ export default function SettingsModal() {
                     <button
                         type="button"
                         onClick={resetCurrentSessionSettings}
-                        className="rounded-xl border border-[var(--panel-border)] bg-[var(--panel-bg)] px-4 py-2 text-sm font-medium text-[var(--text-main)] transition hover:opacity-95"
+                        className="surface-card rounded-xl px-4 py-2 text-sm font-medium text-[var(--text-main)] transition hover:opacity-95"
                     >
                         恢复默认
                     </button>
                     <button
                         type="button"
                         onClick={toggleSettings}
-                        className="rounded-xl bg-[#111827] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[#0b1220]"
+                        className="rounded-xl bg-[var(--brand-start)] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[var(--brand-mid)]"
                     >
                         保存并关闭
                     </button>
@@ -486,7 +486,7 @@ function AgentTuningSection() {
                         </button>
 
                         {showVersions && (
-                            <div className="mt-2 max-h-48 overflow-auto rounded-lg border border-[var(--panel-border)] bg-[var(--panel-bg)]">
+                            <div className="mt-2 max-h-48 overflow-auto rounded-lg surface-card">
                                 {agentConfigVersions.length === 0 && (
                                     <p className="px-3 py-2 text-[var(--text-muted)]">暂无版本记录（修改配置后自动生成）</p>
                                 )}
@@ -586,7 +586,7 @@ function ConfigRow({ config, editing, setEditing, saving, onSave, numeric }) {
     const label = config.key.replace(/^(tool|agent|memory)\./, "").replace(/\./g, " › ");
 
     return (
-        <div className="mb-2 rounded-lg border border-[var(--panel-border)] bg-[var(--panel-bg)] p-2">
+        <div className="mb-2 rounded-lg surface-card p-2">
             <div className="flex items-start justify-between gap-2">
                 <span className="font-mono text-[var(--text-main)] break-all">{label}</span>
                 {!isEditing && (
@@ -609,14 +609,14 @@ function ConfigRow({ config, editing, setEditing, saving, onSave, numeric }) {
                             max="1"
                             value={editing.value}
                             onChange={(e) => setEditing({ ...editing, value: e.target.value })}
-                            className="w-full rounded border border-[var(--panel-border)] bg-[var(--bg)] px-2 py-1 text-xs text-[var(--text-main)]"
+                            className="w-full rounded border border-[var(--panel-border)] bg-[var(--panel-soft)] px-2 py-1 text-xs text-[var(--text-main)]"
                             autoFocus
                         />
                     ) : (
                         <textarea
                             value={editing.value}
                             onChange={(e) => setEditing({ ...editing, value: e.target.value })}
-                            className="w-full rounded border border-[var(--panel-border)] bg-[var(--bg)] px-2 py-1 text-xs text-[var(--text-main)]"
+                            className="w-full rounded border border-[var(--panel-border)] bg-[var(--panel-soft)] px-2 py-1 text-xs text-[var(--text-main)]"
                             rows={3}
                             autoFocus
                         />
@@ -626,7 +626,7 @@ function ConfigRow({ config, editing, setEditing, saving, onSave, numeric }) {
                             type="button"
                             onClick={() => onSave(config.key, editing.value)}
                             disabled={saving}
-                            className="rounded bg-[#111827] px-3 py-1 text-xs text-white hover:bg-[#0b1220] disabled:opacity-50"
+                            className="rounded bg-[var(--brand-start)] px-3 py-1 text-xs text-white hover:bg-[var(--brand-mid)] disabled:opacity-50"
                         >
                             {saving ? "保存中..." : "保存"}
                         </button>

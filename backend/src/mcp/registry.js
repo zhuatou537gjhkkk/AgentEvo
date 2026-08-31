@@ -1,21 +1,89 @@
 /**
  * ToolRegistry — 统一工具注册中心
  *
- * Phase 3 核心：合并本地 DynamicTool + MCP 远程发现的工具，
- * 始终返回 DynamicTool 实例，下游 LangChain API 零感知。
+ * 合并本地 DynamicTool 与 MCP 远程发现的结构化工具，
+ * 保持下游 LangChain API 对工具来源零感知。
  *
  * 对应 Hello-Agents: Ch10 MCP 工具发现 + 注册机制
  */
 
-import { DynamicTool } from "@langchain/core/tools";
+import { DynamicStructuredTool, DynamicTool } from "@langchain/core/tools";
 import { connectToMCPServer } from "./client.js";
+
+/**
+ * MCP Server 的 schema 以 JSON Schema 形式返回，直接交给
+ * DynamicStructuredTool，让模型看到真实的字段名、类型和 required 约束。
+ * 缺失 schema 时仍注册一个宽松 object schema，避免单个工具阻断整个 Server。
+ */
+function normalizeMCPInputSchema(inputSchema, serverName, toolName) {
+    if (inputSchema && typeof inputSchema === "object" && inputSchema.type === "object") {
+        return {
+            ...inputSchema,
+            properties: inputSchema.properties && typeof inputSchema.properties === "object"
+                ? inputSchema.properties
+                : {},
+        };
+    }
+
+    if (inputSchema) {
+        console.warn(`[registry] MCP tool "${serverName}/${toolName}" has unsupported inputSchema; using permissive object schema`);
+    }
+
+    return {
+        type: "object",
+        properties: {},
+        additionalProperties: true,
+    };
+}
+
+/**
+ * 兼容旧的直接调用方：结构化 MCP 工具现在应接收对象，
+ * 但旧的 Plan/tool_executor 路径可能仍传入字符串。
+ * 这里只做确定性的格式转换，不根据语义猜测多个字段的含义。
+ */
+function normalizeLegacyStructuredInput(tool, input) {
+    if (input !== null && typeof input === "object") return input;
+    if (input === undefined || input === null) return {};
+    if (typeof input !== "string") return input;
+
+    const schema = tool?.schema || {};
+    const properties = schema.properties && typeof schema.properties === "object"
+        ? schema.properties
+        : {};
+    const propKeys = Object.keys(properties);
+
+    // JSON 对象是最可靠的 legacy 格式，先解析再过滤 schema 合法字段。
+    try {
+        const parsed = JSON.parse(input);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            if (propKeys.length === 0) return parsed;
+            return Object.fromEntries(Object.entries(parsed).filter(([key]) => propKeys.includes(key)));
+        }
+    } catch { /* 不是 JSON，继续处理旧字符串格式 */ }
+
+    if (propKeys.length === 1) return { [propKeys[0]]: input };
+    if (propKeys.includes("path")) return { path: input };
+
+    if (input.includes("|")) {
+        const parts = input.split("|");
+        const assigned = {};
+        propKeys.forEach((key, index) => {
+            const value = parts[index]?.trim();
+            if (value) assigned[key] = value;
+        });
+        return assigned;
+    }
+
+    const required = Array.isArray(schema.required) ? schema.required : [];
+    return { [required[0] || propKeys[0] || "input"]: input };
+}
 
 class ToolRegistry {
     constructor() {
         /** @type {import("@langchain/core/tools").DynamicTool[]} */
         this._localTools = [];
 
-        /** @type {Map<string, { client: import("@modelcontextprotocol/sdk/client/index.js").Client, tools: import("@langchain/core/tools").DynamicTool[] }>} */
+        /** @type {Map<string, { client: import("@modelcontextprotocol/sdk/client/index.js").Client, tools: import("@langchain/core/tools").StructuredToolInterface[] }>} */
         this._mcpWrappers = new Map();
 
         /** @type {Map<string, Promise>} 连接进行中，防止并发重复连接 */
@@ -45,7 +113,7 @@ class ToolRegistry {
     }
 
     /**
-     * 连接外部 MCP Server，发现其工具并包装为 DynamicTool 注册。
+     * 连接外部 MCP Server，发现其工具并包装为结构化工具注册。
      * @param {{ name: string, command: string, args?: string[] }} config
      */
     async registerMCPServer(config) {
@@ -86,61 +154,25 @@ class ToolRegistry {
 
         console.log(`[registry] discovered ${remoteTools.length} tool(s) from "${config.name}"`);
 
-        // 将每个远程工具包装为 DynamicTool — 保持 LangChain 接口一致性
-        // Phase 4: 同时注册裸名和命名空间前缀名（serverName/toolName），
+        // 将每个远程工具包装为结构化工具，让模型直接看到 MCP inputSchema。
+        // 同时注册裸名和命名空间前缀名（serverName/toolName），
         // 命名空间前缀避免与本地工具重名遮蔽。
         const wrappers = [];
         for (const rt of remoteTools) {
             const toolName = rt.name;
             const toolDesc = rt.description || `MCP tool from ${config.name}: ${toolName}`;
             const prefixedName = `${config.name}/${toolName}`;
-            const inputSchema = rt.inputSchema || null;
+            const schema = normalizeMCPInputSchema(rt.inputSchema, config.name, toolName);
 
-            const makeTool = (name) => new DynamicTool({
+            const makeTool = (name) => new DynamicStructuredTool({
                 name,
                 description: `[${config.name}] ${toolDesc}`,
+                schema,
                 func: async (input) => {
                     try {
-                        // Phase 4: 根据 inputSchema 映射参数，避免 MCP -32602
-                        let callArgs;
-                        if (typeof input === "string") {
-                            callArgs = { input };
-                        } else {
-                            callArgs = { ...input };
-                        }
-                        // Phase 4: inputSchema 驱动的参数映射，避免 MCP -32602
-                        //
-                        // 场景：
-                        //   1. string input → { input } → 映射到 schema 期望的属性名
-                        //   2. object input 但 key 名不匹配 schema → 自动纠正
-                        //   3. object input 且 key 名匹配 schema → 直接透传
-                        if (inputSchema?.properties) {
-                            const propKeys = Object.keys(inputSchema.properties);
-                            const inputVal = callArgs.input;
-
-                            // 场景 1a: 单属性工具 + string input → 直接映射
-                            if (propKeys.length === 1 && inputVal !== undefined) {
-                                callArgs = { [propKeys[0]]: inputVal };
-                            }
-                            // 场景 1b: 多属性工具 + input 值 + path 属性 → 优先映射到 path
-                            else if (propKeys.includes("path") && inputVal !== undefined) {
-                                callArgs.path = inputVal;
-                                delete callArgs.input;
-                            }
-                            // 场景 2: object input 的 key 不在 schema 中 → 自动纠正
-                            // 例如 Planner 输出 { file_path: "..." } 但 schema 期望 { path: "..." }
-                            else if (inputVal === undefined) {
-                                const callKeys = Object.keys(callArgs);
-                                const extraKeys = callKeys.filter(k => !propKeys.includes(k));
-                                if (extraKeys.length === 1 && typeof callArgs[extraKeys[0]] === "string") {
-                                    // 将多余的 key 映射到 schema 的第一个属性
-                                    callArgs = { [propKeys[0]]: callArgs[extraKeys[0]] };
-                                }
-                            }
-                        }
                         const result = await client.callTool({
                             name: toolName,
-                            arguments: callArgs,
+                            arguments: input && typeof input === "object" ? input : {},
                         });
                         const content = result?.content || [];
                         const textParts = content
@@ -169,9 +201,9 @@ class ToolRegistry {
     }
 
     /**
-     * 返回所有已注册工具的 DynamicTool[]。
+     * 返回所有已注册工具（本地 DynamicTool + MCP 结构化工具）。
      * 本地工具在前，MCP 工具在后。
-     * @returns {import("@langchain/core/tools").DynamicTool[]}
+     * @returns {import("@langchain/core/tools").StructuredToolInterface[]}
      */
     getAllTools() {
         const mcpTools = [];
@@ -189,7 +221,7 @@ class ToolRegistry {
      * - 不含 "/" → 本地工具优先，MCP fallback（向后兼容）
      *
      * @param {string} name
-     * @returns {import("@langchain/core/tools").DynamicTool | undefined}
+     * @returns {import("@langchain/core/tools").StructuredToolInterface | undefined}
      */
     getTool(name) {
         // Phase 4: 命名空间格式 "serverName/toolName"
@@ -215,6 +247,23 @@ class ToolRegistry {
         }
 
         return undefined;
+    }
+
+    /**
+     * 以兼容方式调用工具：结构化 MCP 工具接收对象，
+     * 本地 DynamicTool 保持原有字符串调用语义。
+     * @param {string} name
+     * @param {unknown} input
+     * @param {object} [config]
+     * @returns {Promise<unknown>}
+     */
+    async invokeTool(name, input, config) {
+        const tool = this.getTool(name);
+        if (!tool) throw new Error(`工具 "${name}" 不可用`);
+        const normalizedInput = tool instanceof DynamicStructuredTool
+            ? normalizeLegacyStructuredInput(tool, input)
+            : input;
+        return tool.invoke(normalizedInput, config);
     }
 
     /**
@@ -315,7 +364,7 @@ class ToolRegistry {
     }
 
     /**
-     * 获取指定类别的所有工具（DynamicTool 数组）。
+     * 获取指定类别的所有工具（本地 DynamicTool 或远程结构化工具）。
      * @param {string} categoryName
      * @returns {Array}
      */

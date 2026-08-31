@@ -29,46 +29,46 @@ const AGENT_LABELS = {
 // ── 状态配置 ───────────────────────────────────────────────
 const STATUS_CONFIG = {
   [ToolStatus.PENDING]: {
-    border: 'border-l-blue-400',
-    bg: 'bg-blue-500/5',
-    text: 'text-blue-300',
+    border: 'border-l-slate-400',
+    bg: 'bg-[var(--status-neutral-soft)]',
+    text: 'text-[var(--status-neutral)]',
     label: '等待中',
   },
   [ToolStatus.EXECUTING]: {
-    border: 'border-l-blue-400',
-    bg: 'bg-blue-500/5',
-    text: 'text-blue-300',
+    border: 'border-l-indigo-400',
+    bg: 'bg-[var(--status-info-soft)]',
+    text: 'text-[var(--status-info)]',
     label: '执行中',
     pulse: true,
   },
   [ToolStatus.SUCCESS]: {
-    border: 'border-l-emerald-400',
-    bg: 'bg-emerald-500/5',
-    text: 'text-emerald-300',
+    border: 'border-l-emerald-500',
+    bg: 'bg-[var(--status-success-soft)]',
+    text: 'text-[var(--status-success)]',
     label: '成功',
   },
   [ToolStatus.ERROR]: {
-    border: 'border-l-red-400',
-    bg: 'bg-red-500/5',
-    text: 'text-red-300',
+    border: 'border-l-red-500',
+    bg: 'bg-[var(--status-danger-soft)]',
+    text: 'text-[var(--status-danger)]',
     label: '失败',
   },
   [ToolStatus.TIMEOUT]: {
-    border: 'border-l-amber-400',
-    bg: 'bg-amber-500/5',
-    text: 'text-amber-300',
+    border: 'border-l-amber-500',
+    bg: 'bg-[var(--status-warning-soft)]',
+    text: 'text-[var(--status-warning)]',
     label: '超时',
   },
   [ToolStatus.CANCELLED]: {
-    border: 'border-l-slate-500',
-    bg: 'bg-slate-500/5',
-    text: 'text-slate-400',
+    border: 'border-l-slate-400',
+    bg: 'bg-[var(--status-neutral-soft)]',
+    text: 'text-[var(--status-neutral)]',
     label: '已取消',
   },
   [ToolStatus.WAITING_USER]: {
-    border: 'border-l-amber-400',
-    bg: 'bg-amber-500/5',
-    text: 'text-amber-300',
+    border: 'border-l-amber-500',
+    bg: 'bg-[var(--status-warning-soft)]',
+    text: 'text-[var(--status-warning)]',
     label: '等待回答',
     pulse: true,
   },
@@ -77,37 +77,37 @@ const STATUS_CONFIG = {
 // ── 工具组聚合状态配置 ────────────────────────────────────
 const GROUP_STATUS_CONFIG = {
   [ToolStatus.EXECUTING]: {
-    border: 'border-l-blue-400',
-    bg: 'bg-blue-500/5',
-    text: 'text-blue-300',
+    border: 'border-l-indigo-400',
+    bg: 'bg-[var(--status-info-soft)]',
+    text: 'text-[var(--status-info)]',
     label: '正在执行',
     pulse: true,
   },
   [ToolStatus.SUCCESS]: {
-    border: 'border-l-emerald-400',
-    bg: 'bg-emerald-500/5',
-    text: 'text-emerald-300',
+    border: 'border-l-emerald-500',
+    bg: 'bg-[var(--status-success-soft)]',
+    text: 'text-[var(--status-success)]',
     label: '执行完成',
     pulse: false,
   },
   [ToolStatus.ERROR]: {
-    border: 'border-l-red-400',
-    bg: 'bg-red-500/5',
-    text: 'text-red-300',
+    border: 'border-l-red-500',
+    bg: 'bg-[var(--status-danger-soft)]',
+    text: 'text-[var(--status-danger)]',
     label: '部分失败',
     pulse: false,
   },
   [ToolStatus.PENDING]: {
     border: 'border-l-slate-500',
-    bg: 'bg-slate-500/5',
-    text: 'text-slate-400',
+    bg: 'bg-[var(--status-neutral-soft)]',
+    text: 'text-[var(--status-neutral)]',
     label: '等待中',
     pulse: false,
   },
   [ToolStatus.WAITING_USER]: {
     border: 'border-l-amber-400',
-    bg: 'bg-amber-500/5',
-    text: 'text-amber-300',
+    bg: 'bg-[var(--status-warning-soft)]',
+    text: 'text-[var(--status-warning)]',
     label: '等待用户回答',
     pulse: true,
   },
@@ -128,14 +128,14 @@ function CollapsibleOutput({ output }) {
 
   return (
     <div className="mt-1.5">
-      <pre className="whitespace-pre-wrap break-all rounded bg-black/20 px-2.5 py-1.5 text-[11px] leading-relaxed text-slate-300">
+      <pre className="code-surface whitespace-pre-wrap break-all px-2.5 py-1.5 text-[11px] leading-relaxed">
         {shouldCollapse && !expanded ? `${text.slice(0, COLLAPSED_MAX_CHARS)}...` : text}
       </pre>
       {shouldCollapse && (
         <button
           type="button"
           onClick={() => setExpanded((prev) => !prev)}
-          className="mt-1 text-[11px] text-blue-400 hover:text-blue-300 transition"
+          className="ui-button-ghost mt-1 px-1 text-[11px] transition"
         >
           {expanded ? '收起' : '展开全部'}
         </button>

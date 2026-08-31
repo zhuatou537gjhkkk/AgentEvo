@@ -1,5 +1,11 @@
 import { useChatStore } from "../store/chatStore";
 
+export function isContextUsageVisible(currentSessionId, contextUsage) {
+    if (!currentSessionId || !contextUsage) return false;
+    if (Number(contextUsage.sessionId) !== Number(currentSessionId)) return false;
+    return Number(contextUsage.messageCount) > 0;
+}
+
 export default function ContextIndicator() {
     const contextUsage = useChatStore((s) => s.contextUsage);
     const isCompacting = useChatStore((s) => s.isCompacting);
@@ -7,7 +13,7 @@ export default function ContextIndicator() {
     const compactContext = useChatStore((s) => s.compactContext);
     const isTyping = useChatStore((s) => s.isTyping);
 
-    if (!currentSessionId || !contextUsage) return null;
+    if (!isContextUsageVisible(currentSessionId, contextUsage)) return null;
 
     const { usedTokens, maxTokens, ratio } = contextUsage;
     const usagePercent = Math.min(100, Math.max(0, ratio ?? 0));
@@ -20,9 +26,9 @@ export default function ContextIndicator() {
 
     // Color thresholds: green < 50%, amber 50-85%, red >= 85%
     const strokeColor =
-        usagePercent >= 85 ? "#ef4444" :
-        usagePercent >= 50 ? "#f59e0b" :
-        "#22c55e";
+        usagePercent >= 85 ? "var(--status-danger)" :
+        usagePercent >= 50 ? "var(--status-warning)" :
+        "var(--status-success)";
 
     const formatTokens = (n) => {
         if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;

@@ -55,7 +55,7 @@ async function compressImageIfNeeded(file) {
     return new File([blob], `${fallbackName}.jpg`, { type: 'image/jpeg' });
 }
 
-export default function ChatInput() {
+export default function ChatInput({ suggestedPrompt = '', onSuggestedPromptConsumed }) {
     const [value, setValue] = useState('');
     const [uploadStatus, setUploadStatus] = useState('');
     const [uploadProgress, setUploadProgress] = useState(null);
@@ -88,6 +88,16 @@ export default function ChatInput() {
     useEffect(() => {
         setValue(getCurrentDraft());
     }, [currentSessionId, getCurrentDraft]);
+
+    useEffect(() => {
+        if (!suggestedPrompt) {
+            return;
+        }
+
+        setValue(suggestedPrompt);
+        onSuggestedPromptConsumed?.();
+        requestAnimationFrame(() => textareaRef.current?.focus());
+    }, [suggestedPrompt, onSuggestedPromptConsumed]);
 
     useEffect(() => {
         if (!currentSessionId) {
@@ -329,8 +339,8 @@ export default function ChatInput() {
     };
 
     return (
-        <div className="border-t border-[var(--panel-border)] bg-[var(--app-bg)]/95 px-2 pb-3 pt-3 backdrop-blur sm:px-4 sm:pb-4">
-            <div className="mx-auto w-full max-w-4xl">
+        <div className="composer-dock">
+            <div className="composer-wrap">
                 {isTyping && (
                     <div className="mb-2 inline-flex items-center gap-2 rounded-full border border-[var(--panel-border)] bg-[var(--panel-bg)] px-3 py-1 text-xs text-[var(--text-muted)]">
                         <span>AI 正在思考</span>
@@ -343,12 +353,12 @@ export default function ChatInput() {
                 )}
 
                 {!isTyping && lastFailedUserMessage && (
-                    <div className="mb-2 inline-flex items-center gap-2 rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs text-amber-700 dark:border-amber-800 dark:bg-amber-900/30 dark:text-amber-200">
+                    <div className="status-badge-warning mb-2 rounded-full px-3 py-1 text-xs">
                         <span>上次发送失败</span>
                         <button
                             type="button"
                             onClick={retryLastFailedMessage}
-                            className="rounded bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-800 hover:bg-amber-200"
+                            className="ui-button-ghost px-2 py-0.5 text-[11px] font-medium"
                         >
                             立即重试
                         </button>
@@ -378,13 +388,13 @@ export default function ChatInput() {
                     </div>
                 )}
 
-                <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-bg)] p-2.5 shadow-[0_12px_30px_rgba(15,23,42,0.06)] dark:shadow-[0_12px_30px_rgba(0,0,0,0.35)]">
-                    <p className="mb-2 text-[11px] text-[var(--text-muted)]">快捷键: Ctrl/⌘+K 聚焦输入, Ctrl/⌘+/ 查看帮助</p>
+                <div className="composer-card">
+                    <p className="composer-hint">Enter 发送 · Shift + Enter 换行</p>
                     <div className="mb-2 flex flex-wrap items-center gap-2">
                         <button
                             type="button"
                             onClick={handleUploadClick}
-                            className="h-9 w-9 shrink-0 rounded-lg border border-[var(--panel-border)] bg-[var(--panel-soft)] text-base text-[var(--text-main)] transition hover:opacity-95"
+                            className="composer-icon-button"
                             title="上传 txt 或 md 文档"
                         >
                             <svg viewBox="0 0 24 24" className="mx-auto h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
@@ -403,7 +413,7 @@ export default function ChatInput() {
                         <button
                             type="button"
                             onClick={handleImageUploadClick}
-                            className="h-9 w-9 shrink-0 rounded-lg border border-[var(--panel-border)] bg-[var(--panel-soft)] text-base text-[var(--text-main)] transition hover:opacity-95"
+                            className="composer-icon-button"
                             title="上传图片"
                         >
                             <svg viewBox="0 0 24 24" className="mx-auto h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
@@ -424,7 +434,7 @@ export default function ChatInput() {
                         <button
                             type="button"
                             onClick={handleVoiceInput}
-                            className={`h-9 w-9 shrink-0 rounded-lg border border-[var(--panel-border)] bg-[var(--panel-soft)] text-base text-[var(--text-main)] transition hover:opacity-95 ${isListening ? 'animate-pulse text-red-500' : ''}`}
+                            className={`composer-icon-button ${isListening ? 'animate-pulse text-[var(--status-danger)]' : ''}`}
                             title="语音输入"
                         >
                             <svg viewBox="0 0 24 24" className="mx-auto h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
@@ -437,8 +447,8 @@ export default function ChatInput() {
                         <button
                             type="button"
                             onClick={() => setEnableWebSearch(!enableWebSearch)}
-                            className={`h-9 rounded-lg border px-3 text-xs font-semibold transition outline-none ${enableWebSearch
-                                ? 'border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-100'
+                            className={`composer-chip ${enableWebSearch
+                                ? 'border-[var(--status-success)] bg-[var(--status-success-soft)] text-[var(--status-success)]'
                                 : 'border-[var(--panel-border)] bg-[var(--panel-soft)] text-[var(--text-muted)]'
                                 }`}
                             title="是否启用联网搜索"
@@ -449,8 +459,8 @@ export default function ChatInput() {
                         <button
                             type="button"
                             onClick={() => setPlanMode(!planMode)}
-                            className={`h-9 rounded-lg border px-3 text-xs font-semibold transition outline-none ${planMode
-                                ? 'border-violet-300 bg-violet-50 text-violet-700 dark:border-violet-700 dark:bg-violet-900/30 dark:text-violet-100'
+                            className={`composer-chip ${planMode
+                                ? 'border-[var(--brand-mid)] bg-[var(--accent-soft)] text-[var(--brand-start)]'
                                 : 'border-[var(--panel-border)] bg-[var(--panel-soft)] text-[var(--text-muted)]'
                                 }`}
                             title="先列出计划再执行"
@@ -461,8 +471,8 @@ export default function ChatInput() {
                         <button
                             type="button"
                             onClick={() => setEnableMemory(!enableMemory)}
-                            className={`h-9 rounded-lg border px-3 text-xs font-semibold transition outline-none ${enableMemory
-                                ? 'border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-700 dark:bg-amber-900/30 dark:text-amber-100'
+                            className={`composer-chip ${enableMemory
+                                ? 'border-[var(--status-warning)] bg-[var(--status-warning-soft)] text-[var(--status-warning)]'
                                 : 'border-[var(--panel-border)] bg-[var(--panel-soft)] text-[var(--text-muted)]'
                                 }`}
                             title="是否启用长期记忆（跨会话信息提取与召回）"
@@ -476,8 +486,8 @@ export default function ChatInput() {
                         <textarea
                             id="chat-input-textarea"
                             ref={textareaRef}
-                            className="min-h-12 max-h-40 flex-1 resize-none rounded-xl border border-[var(--panel-border)] bg-[var(--panel-bg)] px-3 py-2 text-sm text-[var(--text-main)] outline-none focus:border-slate-400 focus:ring-2 focus:ring-slate-200 dark:focus:border-slate-500 dark:focus:ring-slate-700"
-                            placeholder="给 AI 发送消息，Enter 发送，Shift+Enter 换行"
+                            className="composer-textarea"
+                            placeholder="给 AgentEvo 发送消息..."
                             value={value}
                             onChange={(event) => {
                                 setValue(event.target.value);
@@ -489,16 +499,18 @@ export default function ChatInput() {
                             type="button"
                             disabled={isTyping}
                             onClick={handleSend}
-                            className="h-11 rounded-xl bg-[#111827] px-4 text-sm font-semibold text-white transition hover:bg-[#0b1220] disabled:cursor-not-allowed disabled:bg-slate-400"
+                            className="send-button"
+                            aria-label={isTyping ? '正在生成' : '发送消息'}
                         >
-                            {isTyping ? '思考中...' : '发送'}
+                            <span aria-hidden="true">↑</span>
+                            <span className="sr-only">{isTyping ? '思考中...' : '发送'}</span>
                         </button>
 
                         {isTyping && (
                             <button
                                 type="button"
                                 onClick={stopMessageStream}
-                                className="h-11 rounded-xl border border-[var(--panel-border)] bg-[var(--panel-bg)] px-3 text-sm font-medium text-[var(--text-main)] transition hover:opacity-95"
+                                className="stop-button"
                             >
                                 停止
                             </button>

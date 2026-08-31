@@ -5,7 +5,7 @@
  * 用法: node src/mcp/run-server.js
  *
  * 此脚本通过 stdin/stdout 与 MCP Client 通信，
- * 将 AgentEvo 的 6 个 DynamicTool 对外暴露为 MCP 协议服务。
+ * 将 AgentEvo 的 6 个本地工具（当前为 DynamicTool）对外暴露为 MCP 协议服务。
  *
  * 对应 Hello-Agents: Ch10 04_MCPTransport.py
  */

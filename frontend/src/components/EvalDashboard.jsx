@@ -57,7 +57,7 @@ function CompareResults({ data }) {
             </h3>
 
             {/* 叠加雷达图 */}
-            <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+            <div className="surface-subtle rounded-2xl p-4">
                 <div className="flex flex-col items-center">
                     <svg width="260" height="260" viewBox="0 0 260 260" className="overflow-visible">
                         {/* 网格 */}
@@ -144,7 +144,7 @@ function CompareResults({ data }) {
                     <tbody>
                         {dims.map((dim, i) => (
                             <tr key={dim} className={`border-b border-[var(--panel-border)] ${
-                                regressedDims.includes(dim) ? "bg-red-50 dark:bg-red-950/20" : ""
+                                regressedDims.includes(dim) ? "bg-[var(--status-danger-soft)]" : ""
                             }`}>
                                 <td className={`px-3 py-2 font-medium ${
                                     regressedDims.includes(dim) ? "text-red-600 dark:text-red-400" : "text-[var(--text-main)]"
@@ -190,8 +190,9 @@ function CompareResults({ data }) {
     );
 }
 
-export default function EvalDashboard() {
+export default function EvalDashboard({ embedded = false, onBack }) {
     const isOpen = useChatStore((s) => s.isEvalDashboardOpen);
+    const isVisible = embedded || isOpen;
     const toggleEvalDashboard = useChatStore((s) => s.toggleEvalDashboard);
     const evalReportData = useChatStore((s) => s.evalReportData);
     const fetchEvalReport = useChatStore((s) => s.fetchEvalReport);
@@ -259,7 +260,7 @@ export default function EvalDashboard() {
 
     // 加载 run 列表 + 报告
     useEffect(() => {
-        if (!isOpen) return;
+        if (!isVisible) return;
         setLoading(true);
         (async () => {
             try {
@@ -270,16 +271,16 @@ export default function EvalDashboard() {
             await fetchEvalReport(selectedRunId || null);
             setLoading(false);
         })();
-    }, [isOpen]);
+    }, [isVisible]);
 
     // G7: 切换到生成 tab 时加载生成用例列表
     useEffect(() => {
-        if (!isOpen || evalMode !== "generator") return;
+        if (!isVisible || evalMode !== "generator") return;
         fetchGeneratedCases({
             category: genFilterCategory || null,
             reviewed: genFilterReviewed,
         });
-    }, [isOpen, evalMode, genFilterCategory, genFilterReviewed]);
+    }, [isVisible, evalMode, genFilterCategory, genFilterReviewed]);
 
     // 切换 runId 时重新加载报告
     const handleRunChange = async (runId) => {
@@ -291,15 +292,15 @@ export default function EvalDashboard() {
 
     // ESC dismiss
     useEffect(() => {
-        if (!isOpen) return;
+        if (!isVisible) return;
         const handleKey = (e) => {
             if (e.key === "Escape") toggleEvalDashboard();
         };
         window.addEventListener("keydown", handleKey);
         return () => window.removeEventListener("keydown", handleKey);
-    }, [isOpen]);
+    }, [isVisible]);
 
-    if (!isOpen) return null;
+    if (!isVisible) return null;
 
     const trendData = (evalReportData?.trendData || []).filter(d => d.score_type === evalMode || !d.score_type);
     const feedbackStats = evalReportData?.feedbackStats || { thumbs_up: 0, thumbs_down: 0, total: 0 };
@@ -628,7 +629,7 @@ export default function EvalDashboard() {
 
         const dimLabels = ["正确性", "工具选择", "工具质量", "简洁度", "安全性"];
         const dimColors = ["text-blue-600", "text-green-600", "text-teal-600", "text-amber-600", "text-purple-600"];
-        const dimBgColors = ["bg-blue-50 dark:bg-blue-900/20", "bg-green-50 dark:bg-green-900/20", "bg-teal-50 dark:bg-teal-900/20", "bg-amber-50 dark:bg-amber-900/20", "bg-purple-50 dark:bg-purple-900/20"];
+        const dimBgColors = ["bg-blue-50 dark:bg-blue-900/20", "bg-[var(--status-success-soft)]", "bg-teal-50 dark:bg-teal-900/20", "bg-amber-50 dark:bg-amber-900/20", "bg-[var(--accent-soft)]"];
         const dims = ["correctness", "tool_usage", "tool_quality", "conciseness", "safety"];
 
         const stepActive = (step) => {
@@ -643,7 +644,7 @@ export default function EvalDashboard() {
         return (
             <div className="space-y-4">
                 {/* Step 1: 选择 Run */}
-                <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                <div className="surface-subtle rounded-2xl p-4">
                     <h3 className="mb-3 text-sm font-semibold text-[var(--text-main)]">
                         ① 选择评估 Run
                     </h3>
@@ -658,7 +659,7 @@ export default function EvalDashboard() {
                                 setOptReevalResult(null);
                                 setOptCompareResult(null);
                             }}
-                            className="flex-1 rounded-xl border border-[var(--panel-border)] bg-[var(--panel-bg)] px-3 py-2 text-sm text-[var(--text-main)] outline-none focus:border-[var(--brand)]"
+                            className="flex-1 surface-card rounded-xl px-3 py-2 text-sm text-[var(--text-main)] outline-none focus:border-[var(--brand)]"
                         >
                             <option value="">选择评估 Run...</option>
                             {runs.map((r) => (
@@ -680,7 +681,7 @@ export default function EvalDashboard() {
 
                 {/* Loading indicator */}
                 {optLoading && (
-                    <div className="rounded-xl border border-[var(--brand)] bg-indigo-50 dark:bg-indigo-900/10 px-4 py-3 text-sm text-[var(--brand)] flex items-center gap-2">
+                    <div className="rounded-xl border border-[var(--brand)] bg-[var(--status-info-soft)] px-4 py-3 text-sm text-[var(--brand)] flex items-center gap-2">
                         <svg className="h-4 w-4 animate-spin" fill="none" viewBox="0 0 24 24">
                             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
@@ -691,13 +692,13 @@ export default function EvalDashboard() {
 
                 {/* 分析结果：错误 / 空 / 成功 */}
                 {optBadCases && !optBadCases.ok && (
-                    <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
+                    <div className="rounded-xl border status-badge-danger rounded-xl px-4 py-3 text-xs">
                         ❌ 分析失败: {optBadCases.error || "未知错误"}
                     </div>
                 )}
 
                 {optBadCases?.ok && optBadCases.badCases?.length === 0 && (
-                    <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-700 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-400">
+                    <div className="rounded-xl border status-badge-warning rounded-xl px-4 py-3 text-xs">
                         📭 该 run 未发现 BadCase（所有用例加权分均 ≥ 3.0），无需优化。
                         {optBadCases.summary && (
                             <span className="ml-1 text-[var(--text-muted)]">
@@ -709,7 +710,7 @@ export default function EvalDashboard() {
 
                 {/* Step 2: BadCase 列表 */}
                 {optBadCases?.ok && optBadCases.badCases?.length > 0 && (
-                    <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                    <div className="surface-subtle rounded-2xl p-4">
                         <div className="flex items-center justify-between mb-3">
                             <h3 className="text-sm font-semibold text-[var(--text-main)]">
                                 ② BadCase 分析
@@ -721,7 +722,7 @@ export default function EvalDashboard() {
                                 type="button"
                                 onClick={handleSuggest}
                                 disabled={optLoading}
-                                className="shrink-0 rounded-xl bg-[#111827] px-4 py-1.5 text-xs font-semibold text-white hover:bg-[#0b1220] disabled:opacity-50 transition"
+                                className="shrink-0 rounded-xl bg-[var(--brand-start)] px-4 py-1.5 text-xs font-semibold text-white hover:bg-[var(--brand-mid)] disabled:opacity-50 transition"
                             >
                                 {optLoading && optLoadingMsg.includes("建议") ? "生成中..." : "③ 生成优化建议"}
                             </button>
@@ -740,7 +741,7 @@ export default function EvalDashboard() {
 
                         <div className="max-h-[40vh] space-y-1.5 overflow-auto">
                             {optBadCases.badCases.map((bc, i) => (
-                                <div key={bc.testCaseId} className="rounded-lg border border-[var(--panel-border)] bg-[var(--panel-bg)] p-2.5 text-xs">
+                                <div key={bc.testCaseId} className="rounded-lg surface-card p-2.5 text-xs">
                                     <div className="flex items-center justify-between gap-2 mb-1">
                                         <span className="font-mono text-[var(--text-muted)]">{bc.testCaseId}</span>
                                         <span className="rounded bg-red-100 px-1.5 py-0.5 font-semibold text-red-700 dark:bg-red-900/30 dark:text-red-400">
@@ -772,7 +773,7 @@ export default function EvalDashboard() {
 
                 {/* Step 3: LLM 优化建议 */}
                 {optSuggestions?.ok && optSuggestions.suggestions?.length > 0 && (
-                    <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                    <div className="surface-subtle rounded-2xl p-4">
                         <h3 className="mb-3 text-sm font-semibold text-[var(--text-main)]">
                             ③ 优化建议
                             {optSuggestions.summary && (
@@ -790,7 +791,7 @@ export default function EvalDashboard() {
                                         key={i}
                                         className={`rounded-xl border p-3 text-xs cursor-pointer transition ${
                                             isSelected
-                                                ? "border-[var(--brand)] bg-indigo-50 dark:bg-indigo-900/10"
+                                                ? "border-[var(--brand)] bg-[var(--status-info-soft)]"
                                                 : "border-[var(--panel-border)] bg-[var(--panel-bg)] opacity-70"
                                         }`}
                                         onClick={() => {
@@ -841,7 +842,7 @@ export default function EvalDashboard() {
                                 value={optLabel}
                                 onChange={(e) => setOptLabel(e.target.value)}
                                 placeholder={'优化标签（可选，如“修复 knowledge correctness”）'}
-                                className="flex-1 rounded-xl border border-[var(--panel-border)] bg-[var(--panel-bg)] px-3 py-2 text-xs text-[var(--text-main)] outline-none focus:border-[var(--brand)]"
+                                className="flex-1 surface-card rounded-xl px-3 py-2 text-xs text-[var(--text-main)] outline-none focus:border-[var(--brand)]"
                             />
                             <button
                                 type="button"
@@ -866,7 +867,7 @@ export default function EvalDashboard() {
 
                 {/* Step ⑤: 重评 */}
                 {optResult?.ok && (
-                    <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                    <div className="surface-subtle rounded-2xl p-4">
                         <h3 className="mb-3 text-sm font-semibold text-[var(--text-main)]">
                             ⑤ 重评验证
                         </h3>
@@ -877,7 +878,7 @@ export default function EvalDashboard() {
                             type="button"
                             onClick={handleReevaluate}
                             disabled={optLoading}
-                            className="rounded-xl bg-[#111827] px-4 py-2 text-sm font-semibold text-white hover:bg-[#0b1220] disabled:opacity-50 transition"
+                            className="rounded-xl bg-[var(--brand-start)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--brand-mid)] disabled:opacity-50 transition"
                         >
                             {optLoading && optLoadingMsg.includes("评估") ? "评估中..." : "🔄 重评 BadCase"}
                         </button>
@@ -886,7 +887,7 @@ export default function EvalDashboard() {
 
                 {/* Step ⑥: 对比结果 */}
                 {optCompareResult && (
-                    <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                    <div className="surface-subtle rounded-2xl p-4">
                         <h3 className="mb-3 text-sm font-semibold text-[var(--text-main)]">
                             ⑥ 优化对比
                             {optReevalResult?.scoreAfter && (
@@ -1093,7 +1094,7 @@ export default function EvalDashboard() {
         return (
             <div className="space-y-4">
                 {/* 生成配置 */}
-                <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                <div className="surface-subtle rounded-2xl p-4">
                     <h3 className="mb-3 text-sm font-semibold text-[var(--text-main)]">生成配置</h3>
 
                     <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -1103,7 +1104,7 @@ export default function EvalDashboard() {
                             <select
                                 value={genCategory}
                                 onChange={(e) => setGenCategory(e.target.value)}
-                                className="w-full rounded-lg border border-[var(--panel-border)] bg-[var(--panel-bg)] px-2.5 py-1.5 text-xs text-[var(--text-main)] outline-none"
+                                className="w-full rounded-lg surface-card px-2.5 py-1.5 text-xs text-[var(--text-main)] outline-none"
                             >
                                 {CATEGORIES.map(c => (
                                     <option key={c} value={c}>{c}</option>
@@ -1142,7 +1143,7 @@ export default function EvalDashboard() {
                                             <input
                                                 type="number" min="0" max="50" value={val}
                                                 onChange={(e) => setVal(Math.max(0, Number(e.target.value)))}
-                                                className="w-14 rounded border border-[var(--panel-border)] bg-[var(--panel-bg)] px-1.5 py-0.5 text-xs text-[var(--text-main)] outline-none"
+                                                className="w-14 rounded surface-card px-1.5 py-0.5 text-xs text-[var(--text-main)] outline-none"
                                             />
                                         </label>
                                     );
@@ -1233,7 +1234,7 @@ export default function EvalDashboard() {
                                             <select
                                                 value={editForm.difficulty}
                                                 onChange={(e) => setEditForm({ ...editForm, difficulty: e.target.value })}
-                                                className="rounded border border-[var(--panel-border)] bg-[var(--panel-bg)] px-1.5 py-0.5 text-xs"
+                                                className="rounded surface-card px-1.5 py-0.5 text-xs"
                                             >
                                                 {DIFFICULTIES.map(d => <option key={d} value={d}>{d}</option>)}
                                             </select>
@@ -1244,14 +1245,14 @@ export default function EvalDashboard() {
                                         <textarea
                                             value={editForm.input}
                                             onChange={(e) => setEditForm({ ...editForm, input: e.target.value })}
-                                            className="w-full rounded border border-[var(--panel-border)] bg-[var(--panel-bg)] px-2 py-1 text-xs text-[var(--text-main)] outline-none"
+                                            className="w-full rounded surface-card px-2 py-1 text-xs text-[var(--text-main)] outline-none"
                                             rows={2}
                                             placeholder="用户输入..."
                                         />
                                         <textarea
                                             value={editForm.expectedBehavior}
                                             onChange={(e) => setEditForm({ ...editForm, expectedBehavior: e.target.value })}
-                                            className="w-full rounded border border-[var(--panel-border)] bg-[var(--panel-bg)] px-2 py-1 text-xs text-[var(--text-main)] outline-none"
+                                            className="w-full rounded surface-card px-2 py-1 text-xs text-[var(--text-main)] outline-none"
                                             rows={2}
                                             placeholder="期望行为..."
                                         />
@@ -1377,12 +1378,8 @@ export default function EvalDashboard() {
         );
     };
 
-    return (
-        <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-3"
-            onClick={(e) => { if (e.target === e.currentTarget) toggleEvalDashboard(); }}
-        >
-            <div className="max-h-[90vh] w-full max-w-3xl overflow-auto rounded-3xl border border-[var(--panel-border)] bg-[var(--panel-bg)] p-6 shadow-2xl">
+    const content = (
+            <div className={embedded ? 'tool-page-surface' : 'max-h-[90vh] w-full max-w-3xl overflow-auto rounded-3xl surface-card p-6 shadow-2xl'}>
                 {/* Header */}
                 <div className="mb-6 space-y-3">
                     {/* Row 1: 标题 + 右侧按钮组 */}
@@ -1431,13 +1428,13 @@ export default function EvalDashboard() {
                             <button
                                 type="button"
                                 onClick={() => setShowRunner(!showRunner)}
-                                className="shrink-0 whitespace-nowrap rounded-xl bg-[#111827] px-4 py-1.5 text-xs font-semibold text-white hover:bg-[#0b1220] transition"
+                                className="shrink-0 whitespace-nowrap rounded-xl bg-[var(--brand-start)] px-4 py-1.5 text-xs font-semibold text-white hover:bg-[var(--brand-mid)] transition"
                             >
                                 {showRunner ? "隐藏运行器" : "运行评估"}
                             </button>
                             <button
                                 type="button"
-                                onClick={toggleEvalDashboard}
+                                onClick={embedded ? onBack : toggleEvalDashboard}
                                 className="shrink-0 rounded-lg p-1 text-[var(--text-muted)] hover:text-[var(--text-main)] transition"
                             >
                                 <svg className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
@@ -1462,7 +1459,7 @@ export default function EvalDashboard() {
                                     }}
                                     className={`shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1 text-xs font-medium transition ${
                                         isCompareMode
-                                            ? "bg-[var(--brand)] text-white"
+                                            ? "bg-[var(--brand-start)] text-white"
                                             : "border border-[var(--panel-border)] bg-[var(--panel-soft)] text-[var(--text-main)]"
                                     }`}
                                 >
@@ -1493,7 +1490,7 @@ export default function EvalDashboard() {
                                                     }}
                                                     className={`shrink-0 whitespace-nowrap rounded-lg px-2 py-0.5 text-[10px] font-mono transition ${
                                                         isSelected
-                                                            ? "bg-[var(--brand)] text-white"
+                                                            ? "bg-[var(--brand-start)] text-white"
                                                             : "border border-[var(--panel-border)] bg-[var(--panel-soft)] text-[var(--text-muted)] hover:text-[var(--text-main)]"
                                                     }`}
                                                 >
@@ -1511,7 +1508,7 @@ export default function EvalDashboard() {
                                             setComparingLoading(false);
                                         }}
                                         disabled={compareRunIds.length < 2 || comparingLoading}
-                                        className="shrink-0 whitespace-nowrap rounded-lg bg-[#111827] px-3 py-1 text-xs font-semibold text-white hover:bg-[#0b1220] disabled:opacity-50 transition"
+                                        className="shrink-0 whitespace-nowrap rounded-lg bg-[var(--brand-start)] px-3 py-1 text-xs font-semibold text-white hover:bg-[var(--brand-mid)] disabled:opacity-50 transition"
                                     >
                                         {comparingLoading ? "对比中..." : "开始对比"}
                                     </button>
@@ -1569,11 +1566,11 @@ export default function EvalDashboard() {
                 {evalMode !== "generator" && evalMode !== "optimizer" && (
                 <>
                 <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
-                    <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                    <div className="surface-subtle rounded-2xl p-4">
                         <p className="text-xs text-[var(--text-muted)]">总测试用例</p>
                         <p className="mt-1 text-2xl font-bold text-[var(--text-main)]">{evalReportData?.totalTestCases || 0}</p>
                     </div>
-                    <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                    <div className="surface-subtle rounded-2xl p-4">
                         <p className="text-xs text-[var(--text-muted)]">用户反馈总数</p>
                         <p className="mt-1 text-2xl font-bold text-[var(--text-main)]">{feedbackStats.total}</p>
                     </div>
@@ -1596,7 +1593,7 @@ export default function EvalDashboard() {
                                 ({evalMode === "online" ? "在线采样" : "离线评估"} · {trendData[0]?.date || "最新"})
                             </span>
                         </h3>
-                        <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                        <div className="surface-subtle rounded-2xl p-4">
                             {renderRadarChart()}
                         </div>
                     </div>
@@ -1605,7 +1602,7 @@ export default function EvalDashboard() {
                 {/* Trend chart */}
                 <div className="mb-6">
                     <h3 className="mb-3 text-sm font-semibold text-[var(--text-main)]">评分趋势</h3>
-                    <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+                    <div className="surface-subtle rounded-2xl p-4">
                         {/* Legend */}
                         <div className="mb-3 flex gap-4 text-xs text-[var(--text-muted)]">
                             <span className="flex items-center gap-1"><span className="inline-block h-2.5 w-2.5 rounded-sm bg-blue-500" />正确性</span>
@@ -1634,7 +1631,24 @@ export default function EvalDashboard() {
                 )}
                 </>
                 )}{/* end evalMode !== "generator" && evalMode !== "optimizer" */}
+                {embedded && (
+                    <button type="button" onClick={onBack} className="tool-page-back-link">
+                        ← 返回聊天工作区
+                    </button>
+                )}
             </div>
+    );
+
+    if (embedded) {
+        return content;
+    }
+
+    return (
+        <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-3"
+            onClick={(e) => { if (e.target === e.currentTarget) toggleEvalDashboard(); }}
+        >
+            {content}
         </div>
     );
 }

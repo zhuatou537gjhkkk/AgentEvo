@@ -59,7 +59,7 @@ export default function EvalRunner() {
     };
 
     return (
-        <div className="rounded-2xl border border-[var(--panel-border)] bg-[var(--panel-soft)] p-4">
+        <div className="surface-subtle rounded-2xl p-4">
             <h3 className="mb-3 text-sm font-semibold text-[var(--text-main)]">运行评估</h3>
 
             {/* Category picker */}
@@ -79,7 +79,7 @@ export default function EvalRunner() {
                             onClick={() => toggleCategory(cat.key)}
                             className={`rounded-lg px-2 py-1 text-xs transition ${
                                 selectedCategories.includes(cat.key)
-                                    ? "bg-[#111827] text-white"
+                                    ? "bg-[var(--brand-start)] text-white"
                                     : "border border-[var(--panel-border)] text-[var(--text-muted)] hover:text-[var(--text-main)]"
                             }`}
                         >
@@ -94,7 +94,7 @@ export default function EvalRunner() {
                 type="button"
                 onClick={handleRun}
                 disabled={running || selectedCategories.length === 0}
-                className="rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:opacity-50"
+                className="ui-button-primary rounded-xl px-4 py-2 text-sm transition disabled:opacity-50"
             >
                 {running ? "运行中..." : `运行评估 (${selectedCategories.length > 0 ? selectedCategories.length + " 类" : "请选择分类"})`}
             </button>
@@ -107,7 +107,7 @@ export default function EvalRunner() {
             {result && !running && (
                 <div className="mt-4 space-y-2">
                     {result.error ? (
-                        <div className="rounded-xl bg-red-50 p-3 text-sm text-red-700 dark:bg-red-900/20 dark:text-red-400">
+                        <div className="status-badge-danger rounded-xl p-3 text-sm">
                             错误: {result.error}
                         </div>
                     ) : (
@@ -116,18 +116,18 @@ export default function EvalRunner() {
                                 <span className="text-[var(--text-main)]">
                                     总计: <strong>{result.total}</strong>
                                 </span>
-                                <span className="text-green-600">
+                                <span className="text-[var(--status-success)]">
                                     通过: <strong>{result.passed}</strong>
                                 </span>
-                                <span className="text-red-600">
+                                <span className="text-[var(--status-danger)]">
                                     失败: <strong>{result.failed}</strong>
                                 </span>
                             </div>
                             {/* Average scores */}
                             {result.avgScores && (
-                                <div className="grid grid-cols-4 gap-2 text-xs">
+                                <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
                                     {Object.entries(result.avgScores).map(([key, val]) => (
-                                        <div key={key} className="rounded-lg border border-[var(--panel-border)] bg-[var(--panel-bg)] px-2 py-1 text-center">
+                                        <div key={key} className="rounded-lg surface-card px-2 py-1 text-center">
                                             <span className="block text-[var(--text-muted)]">{key}</span>
                                             <span className="font-bold text-[var(--text-main)]">{val}</span>
                                         </div>
@@ -136,12 +136,12 @@ export default function EvalRunner() {
                             )}
                             {/* Result list (top 10) */}
                             {result.results && result.results.length > 0 && (
-                                <div className="max-h-60 overflow-auto rounded-xl border border-[var(--panel-border)] bg-[var(--panel-bg)]">
+                                <div className="max-h-60 overflow-auto surface-card rounded-xl">
                                     {result.results.slice(0, 10).map((r) => (
                                         <div
                                             key={r.testCaseId}
                                             className={`border-b border-[var(--panel-border)] px-3 py-2 text-xs last:border-b-0 ${
-                                                r.passed ? "text-[var(--text-main)]" : "text-red-600"
+                                                r.passed ? "text-[var(--text-main)]" : "text-[var(--status-danger)]"
                                             }`}
                                         >
                                             <div className="flex items-center justify-between">
