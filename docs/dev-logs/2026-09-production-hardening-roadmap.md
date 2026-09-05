@@ -134,7 +134,7 @@
 
 1. 阅读本文件和 `2026-09-production-hardening.md`，以主日志最新验证记录为准。
 2. 执行 `git status --short`，确认当前修改不被覆盖；本轮所有代码仍为未提交工作树变更。
-3. durable quota 生产写入验收 + migrate `--apply` 真实落地已完成（**A1+A2**，见 §18）。下一候选波次：durable **同 key 跨进程锁**（需分布式锁服务），或完整 HTTP 双用户/并发矩阵（eval 维度待 D2 深度注入后补）。
+3. durable quota 生产写入验收 + migrate `--apply` 真实落地（**A1+A2**，§18）与完整 HTTP 双用户/并发隔离矩阵（**A3**，§19，真实 DB 版）均已完成。下一候选波次：durable **同 key 跨进程锁**（需分布式锁服务），或 **W4 统一重试/SSE 可靠性**（doD 要求半开连接/Abort/429 矩阵，可建在已隔离的 db 测试上），或把软点（跨 owner 读 200 空）改 404 的行为收紧（涉及 FE 兼容评估，优先级低）。
 4. 为 durable quota 做 additive migration 前，先备份 SQLite/WAL、执行 integrity/orphan audit；默认只报告未知 orphan，不自动删除。
 5. 补 native HTTP contract、双用户隔离和并发测试，再运行 backend/frontend 完整测试与 build；不能用 unit test 代替矩阵验收。
 6. 当前 personal `tenant_id=user:<id>` 不代表组织 tenant/RBAC；不要先做 Skills Runtime、代码沙箱或 remote MCP。
@@ -267,5 +267,15 @@
 - [x] 新增 `src/services/uploadQuotaDurable.test.js` 8 个（durable adapter on per-worker 临时库）+ `scripts/quota-worker.mjs` 子进程 harness：restart 持久化、跨进程记账、PK 复用×2、usage_day 跨 UTC 日、expiry cleanup、settle/release 记账。全量 backend **33 files / 511 tests 绿**；`check:syntax` 纳入被改生产文件与两个新 scripts。
 - [x] **HTTP durable 生产写入 smoke** `scripts/durable-upload-smoke.mjs`（真实 `/upload`、隔离临时库、`DURABLE_UPLOAD_QUOTA=true`、内置 embedding stub）：http 200 / committedBytes=194 / 0 active 残留，exit 0。
 - [x] **真实 dev 库 `migrate-db.mjs --apply` 首次落地**：备份 `backend/backups/agent_data-2026-09-05T15-56-52-057Z.db`、WAL 折叠、ledger +1（`migrate-db:apply:2026-09-05T15-56-52-073Z`）、integrity 复检 ok、quota 表仍 0 active reservations、`destructiveActions:false`。runbook §6 全勾并新增 §7 执行记录。`backups/*.db` 已被 gitignore，不污染工作树。
-- [ ] **残余（本轮不宣称解决）**：durable **同 key 跨进程锁** 需分布式锁服务（SQLite 只串行化记账事务；in-process `withUploadLock` 是唯一同 key 锁，adapter 注释已声明）。其余未变：eval 深度注入（D2，low ROI）、完整 HTTP 双用户/并发矩阵（eval 维度待 D2）、组织 RBAC、多实例 RAG、W4-W8/P2。
+- [ ] **残余（本轮不宣称解决）**：durable **同 key 跨进程锁** 需分布式锁服务（SQLite 只串行化记账事务；in-process `withUploadLock` 是唯一同 key 锁，adapter 注释已声明）。其余未变：eval 深度注入（D2，low ROI）、组织 RBAC、多实例 RAG、W4-W8/P2。
+
+## 19. A3：完整 HTTP 双用户/并发隔离矩阵（真实 DB 版）（2026-09-06）
+
+关闭历波反复出现的 "完整 HTTP 双用户/并发矩阵 仍未完成"（eval 深度维度除外）。完整记录见主日志 `2026-09-production-hardening.md` A3 段。
+
+- [x] 3 路只读侦察：全部 owner-scoped 端点 owner 检查位置与跨 owner 返回码；既有 10 组测试的端点×双用户断言缺口表；运行时路由归属（factory 先于 inline）。静态审计：**无裸读/改/删他人数据端点**。
+- [x] 软点清单（"缺 404 的静默成功"、零内容泄露）：messages/context-usage 跨 owner 200 空、compact 200 noop、feedback 200 不落库、eval generated 非本人 200 ok:false、observability/recent trace 补查无 user 过滤（低危）。
+- [x] 新增 `src/httpIsolationMatrix.test.js`（真实 DB + `createApp()` 模块默认 + 原生 HTTP + 真实 JWT，A=admin/B=normal，fixtures 走 db API）：sessions CRUD 跨 owner 404 + 读路径 200 空零泄露、extension pair/branch/compact 无副作用、memory 隔离、feedback 跨 owner 不落库 vs 本人落库、obs trace 跨 owner 404 + admin 门禁 403/200、并发混合操作互斥。定向 6/6。
+- [x] 全量 backend **34 files / 517 tests 绿**；**零生产代码改动**（矩阵锁定既有语义，无真越权可修）。
+- [ ] **残余/候选**：eval 深矩阵（admin-only 树，现只到 admin 门禁层；补全待 D2）、durable 同 key 跨进程锁（需分布式锁）、软点改 404 属 FE 兼容评估（低优先）、组织 RBAC、多实例 RAG、W4-W8/P2。
 

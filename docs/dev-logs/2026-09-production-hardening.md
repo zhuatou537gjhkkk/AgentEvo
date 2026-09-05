@@ -268,6 +268,23 @@
   - 复检：dry-run ledger 现 2 行（W3.1-S1 + apply 条目）；`-wal` 折叠为 0、主库 5,337,088 B；`audit-db` `activeReservations:[]`、integrity ok。`backups/*.db` 被根 `.gitignore` 的 `*.db*` 忽略，不污染 git 工作树（已验证 `git status --short` 仅源码改动）。
 - **残余（写入 roadmap §18）**：durable **同 key 跨进程锁** 仍需分布式锁服务 —— SQLite 只串行化记账事务，in-process `withUploadLock` 仍是唯一同 key 锁（adapter 注释 232-236 已声明）；eval 深度注入（D2）继续延后（admin-only + 离线，low ROI）；组织 RBAC、多实例 RAG、W4-W8/P2 未宣称。
 
+### A3：完整 HTTP 双用户/并发隔离矩阵（2026-09-06）
+
+关闭 §13/§14/§18 反复出现的 "完整 HTTP 双用户/并发矩阵 仍未完成"。**纯测试加固波：未发现需产品修复的真越权，零生产行为改动。**
+
+- **盘点（3 路只读侦察）**：(a) 全部 owner-scoped 端点逐条 owner 检查位置与跨 owner 返回码（db 层 `WHERE user_id`/`owner_user_id`）；(b) 既有 10 组测试文件的端点×双用户断言缺口表；(c) 运行时路由归属（factory registrar 先于 inline 生效；/chat、/upload*、/mcp/* 仍 inline，eval 双挂同实现）。静态审计结论：**无裸读/改/删他人数据端点**——写路径全落 owner 化 WHERE/upsert，路由层仅透传 `req.user.id`。
+- **软点清单（"缺 404 的静默成功"，均无内容泄露）**：`GET /sessions/:id/messages`、`GET /sessions/:id/context-usage` 跨 owner = **200 空**（无 owner 预检）；`POST /sessions/:id/compact` 跨 owner = **200 noop**（B 只见 0 条历史）；`POST /chat/feedback` 非本人消息 = **200 但不落库**；`DELETE /eval/generated/:id` 非本人 = 200 `ok:false`。`GET /observability/recent` 内 per-message trace 补查不带 user/tenant 过滤（message 属本人故低危）。
+- **交付**：新增 `backend/src/httpIsolationMatrix.test.js` —— 真实 DB（per-worker 临时库）+ 真实 app（`createApp()` 模块默认 = 真实 db/auth/services）+ 原生 HTTP + 真实 JWT（`issueAuthToken`），A=admin/B=normal 两真实用户，fixtures 经 db API seed（session/8 条消息/memory/trace/feedback）。6 例：
+  1. sessions CRUD 写路径跨 owner 404（rename/pin/delete `SESSION_NOT_FOUND`）+ 读路径 200 空且响应不含 A 私有内容；A 本人 200、会话完好。
+  2. session 扩展：pair 删除 400 历史不变、branch 400 B 会话不增、compact 200 noop（`messageCount:0`）A 历史不变。
+  3. memory：列表/统计隔离、删他人记忆 404 数据完好。
+  4. feedback：B 评 A 消息 200 但两 scope 均无行；A 本人正常落库。
+  5. observability trace 跨 owner 404（detail+otel）+ admin 门禁（B：agent-config/eval-report/mcp 403；A 200）。
+  6. 并发混合操作：并行 A/B 建会话各自列表互斥、并发跨 owner 改名/删除全 404、A 本人改名生效。
+- **结果**：定向 6/6；全量 backend **34 files / 517 tests 全绿**（原 33/511）。error envelope 顶层字段为 `errorCode`（非 `code`）。
+- **非目标（已在别处覆盖，注明防重复）**：upload/upload-image caller 注入 → registrarBagIsolation；/chat owner 404 + 双 factory 并发 → registrarServiceIsolation/Bag；eval 深矩阵（admin-only 树）→ 各表 scope 列 + 本波 admin 门禁；durable 跨进程记账 → uploadQuotaDurable。
+- **残余候选（写入 roadmap §5/§19）**：eval 深度注入 D2（low ROI）→ 矩阵对 eval 只到 admin 门禁层；durable 同 key 跨进程锁；软点改 404 属 API 行为变更，FE 兼容优先故保持现状、以测试锁定。
+
 ## 回滚与遗留风险
 
 - 所有新增行为使用环境变量或兼容 fallback；必要时可关闭新开关并保留旧数据。
