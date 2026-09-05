@@ -301,6 +301,20 @@ W4-R 全貌（withRetry 全链路 + 可靠性矩阵）拆 2 小波；本段 = **
 - **明确不改 / 延后（R2 清单）**：LangChain 内建 `maxRetries` 与 withRetry 叠加的预算协调（共享 `buildChatOpenAIConfig` 被 legacy 路径复用，牵一发动全身）；rag 全链路 / eval judge·generator·reflection / mcp connect·listTools / bocha fetch 接线；**graph 可靠性矩阵**（fake makeLlm 按次抛 429/5xx/timeout/ABORT 驱动真实节点 + HTTP `reader.cancel` 半开 abort + "B 用户不受 A 取消影响"）。`requestContext` 保持无 signal（身份 vs 传输分离，abort 走 `config`）。
 - **验证**：`node --check` ×3 OK；定向 resilience **11/11**；全量 backend **34 files / 524 tests 全绿**（原 34/517，+7）；`git diff --check` OK（仅预期 LF/CRLF 警告）；dev `agent_data.db` 不被触碰（W3.3-J per-worker 临时库）。
 
+### W4-R2：graph 可靠性矩阵 — fake makeLlm 驱动真实节点 + HTTP 半开 abort（2026-09-06）
+
+关闭 §20 的 R2 项：W4-R1 只证明 withRetry/classifyError 纯语义，**此前无任何测试真正跑过 LangGraph 节点**（chatGraph 测试全是纯路由/源码不变量；fake makeLlm 只测解析优先级；deterministicExecutor 只兼容 legacy `streamEvents` v2）。本段用**全图集成验收**证明 R1 接线在真实 graph + 真实 HTTP `/chat` 下成立。纯测试波，**零生产代码改动**。
+
+- **关键核验（本人读码）**：注入缝 `chatGraph.js:2208 options?.deps?.services?.makeLlm` → `config.configurable.makeLlm`(:2388) → 节点 `resolveMakeLlm(config)(opts)`(:483)；路由 `instanceDeps=getDependencies(req)`(:1727) → `chatImpl(...,{deps:instanceDeps})`(:1840-1841)。`_useLangGraph` 在 /chat handler **请求时**读 `process.env.USE_LANGGRAPH==='true'`(app.js:1836) → 测试运行时置 env 即可。graph SSE 用 `createSSEEmitter`(:2234) 委托 `services/sse.js`：帧 `data:{json}\n\n`（metadata on 附 id/seq/request_id），成功 `data:[DONE]`，错误 = toPublicError envelope。abort：`res.on('close')`→`abortController.abort()`(:2236-2246)，abort = **静默收尾**（无 error/done 终态、不落 assistant），非 abort bubble → `sse.error`(:2505)。generalChat：hasTools→`bindTools` ReAct(:1026/1039)，**withRetry 包 `stream()` 调用而非 for-await 迭代** → fake 须在 `stream()` 被调时抛。隔离：vitest per-worker 临时 DB 自动生效；`ONLINE_EVAL_ENABLED` 未置位 → OnlineEvaluator disabled；测试置 `CONTEXT_BUILDER_ENABLED=false` + body `enable_memory:false` 消 contextBuilder/记忆变量。
+- **harness**（新建 `backend/src/services/chatGraphReliability.test.js`，real DB + issueAuthToken + `createApp({dependencies:{services:{makeLlm}}})` + listen(0)）：`makeLlm(opts)` 按 `opts.streaming` 分流 —— 非 streaming（router）返回 invoke fake（固定 `{"intents":["general"]}` 分类 JSON）；streaming（generalChat）返回同含 `.stream`+`.bindTools()→{stream}` 的对象，闭包 attempt 计数、按末条 HumanMessage content 的 marker 选 scenario（同服 AB 并发请求靠内容分流、无共享可变状态）。mode：ok（单 chunk，可带 delayMs）/ flaky（attempt1 抛可重试 503 且 secret 入 error.message，之后成功）/ exhaust（恒抛 503）。hooks 暴露 attempt 日志与 onFirstFail 信号。
+- **矩阵（4 用例）**：
+  1. **flaky→成功**：SSE 含文本 + `[DONE]` + `"request_id"`；streaming `attempt==2`（withRetry 真重试一次）；DB assistant 落库。
+  2. **耗尽→公开错误**：`attempt>=3`（retries:2 预算耗尽；hasTools 下 tooled+fallback 实际 6 次）；body 含 `"type":"error"`/`"errorCode":"UPSTREAM_UNAVAILABLE"`/`"retryable":true`/`"request_id"`，**不含** secret、无 `[DONE]`、DB 无 assistant。
+  3. **退避中半开 abort**：等 onFirstFail 后 `reader.read()` 首帧（确认 SSE 已建立）→ `reader.cancel()` → sleep 400ms（> 最大退避 ~240ms）→ `attempt==1`（未进 attempt2）+ DB 仅 user —— 判别式确定性：若 abort 未唤醒退避，attempt2 会在 ~200ms 内成功落库而失败。
+  4. **单服务器双用户并发**：A(flaky，退避中 cancel)+B(ok 且 delayMs 800ms 保活并发窗口)；B 完成 `[DONE]`+文本+assistant、`attemptB==1`；A `attempt==1` 无 assistant。证明 A 断连不取消 B。
+- **验证**：`node --check` OK；定向 **4/4**（一次通过，~12.6s）；全量 backend **35 files / 528 tests 全绿**（原 34/524，+1 文件/+4）；`git diff --check` exit=0；dev `agent_data.db` 不被触碰（sha/mtime 不变）。
+- **未覆盖/残余（下波候选，见 roadmap §21）**：真实工具侧（web_search/search_knowledge_base/registry MCP func）无法经 makeLlm seam 注入 flaky，工具 `invoke` 的 withRetry 退避只在纯语义单测覆盖（同 signal 机制，无独立集成缝）；LangChain `maxRetries` 与 withRetry 预算协调仍未做（共享 `buildChatOpenAIConfig`）；rag/eval/mcp-connect/bocha fetch 接线未做；SSE 错误字段审计 = 独立 W4-SSE 波。
+
 ## 回滚与遗留风险
 
 - 所有新增行为使用环境变量或兼容 fallback；必要时可关闭新开关并保留旧数据。

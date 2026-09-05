@@ -134,7 +134,7 @@
 
 1. 阅读本文件和 `2026-09-production-hardening.md`，以主日志最新验证记录为准。
 2. 执行 `git status --short`，确认当前修改不被覆盖；本轮所有代码仍为未提交工作树变更。
-3. durable quota 生产写入验收 + migrate `--apply` 真实落地（**A1+A2**，§18）、完整 HTTP 双用户/并发隔离矩阵（**A3**，§19，真实 DB 版）与 **W4-R1 统一重试接入**（§20，分类修复 + graph 工具/流裸点接线 + toolExecutor bug）均已完成。下一候选：**W4-R2 可靠性矩阵**（fake makeLlm 注入 flaky + HTTP `reader.cancel` 半开 abort + B 用户不受 A 取消影响；需新建 fake-LLM 节点 harness 与 reader 级消费方式），或 durable **同 key 跨进程锁**（需分布式锁服务），或把软点（跨 owner 读 200 空）改 404 的行为收紧（涉及 FE 兼容评估，优先级低）。
+3. durable quota 生产写入验收 + migrate `--apply` 真实落地（**A1+A2**，§18）、完整 HTTP 双用户/并发隔离矩阵（**A3**，§19，真实 DB 版）、**W4-R1 统一重试接入**（§20，分类修复 + graph 工具/流裸点接线 + toolExecutor bug）与 **W4-R2 graph 可靠性矩阵**（§21，fake makeLlm 驱动真实节点 + HTTP 半开 abort，纯测试零生产改动）均已完成。下一候选（按价值×耦合度）：**W4-SSE 错误字段审计**（独立小波，工作量小），LangChain `maxRetries:0` 与 withRetry 预算协调，rag/eval/mcp/bocha 余下接线，真实工具侧 flaky 集成缝，或 durable **同 key 跨进程锁**（需分布式锁服务）；软点→404 涉及 FE 兼容评估，优先级低。
 4. 为 durable quota 做 additive migration 前，先备份 SQLite/WAL、执行 integrity/orphan audit；默认只报告未知 orphan，不自动删除。
 5. 补 native HTTP contract、双用户隔离和并发测试，再运行 backend/frontend 完整测试与 build；不能用 unit test 代替矩阵验收。
 6. 当前 personal `tenant_id=user:<id>` 不代表组织 tenant/RBAC；不要先做 Skills Runtime、代码沙箱或 remote MCP。
@@ -287,6 +287,15 @@
 - [x] `services/resilience.js` `classifyError`：有 HTTP status 时 status 优先（4xx 保持不可重试）；无 status 时兜底 = 顶层网络码 / SDK Timeout name / `cause` 链（≤5 层）找网络码。向后兼容。
 - [x] `services/chatGraph.js`：toolExecutorNode 补 `signal = config?.configurable?.abortSignal`（bug 修复）+ catch abort rethrow；`executeToolCalls` 加 signal 参并由 knowledgeAgentNode 传 config 真实 signal；三处裸点（generalChat 工具循环 / searchAgent webSearch / knowledge solo 流）包 `withRetry`（工具 retries:1、流 retries:2）+ abort rethrow。SSE/FSM/HTTP 契约零改动。
 - [x] 测试：`services/resilience.test.js` +7 纯语义单测（classify SDK Timeout / cause 链单层与嵌套 / 400 隐藏网络 cause 仍不可重试 / 429+retryAfter 咨询 / 5xx 耗尽 rethrow / deadline → `RETRY_DEADLINE_EXCEEDED`）。定向 **11/11**；全量 backend **34 files / 524 tests 绿**（原 34/517，+7）；`node --check` ×3 OK。
-- [ ] **R2（下波）**：graph 可靠性矩阵 —— 需新建 fake makeLlm（实现 invoke/stream/bindTools，按次抛 429/5xx/timeout/ABORT，经 `createApp({dependencies:{services:{makeLlm}}})` + `USE_LANGGRAPH=true` 注入真实节点）与 HTTP `reader.cancel` 半开 abort 消费方式；断言工具退避 abort、"B 用户不受 A 取消影响"。
-- [ ] **仍延后**：LangChain `maxRetries` 与 withRetry 叠加的预算协调（共享 `buildChatOpenAIConfig`，牵 legacy 路径，并入接线时统一置 0）；rag 全链路 / eval judge·generator·reflection / mcp connect·listTools / bocha fetch 接线；SSE 错误字段审计（独立 W4-SSE 波）。W4 §2 清单以本段 + R2 为准逐步勾选。
+- [x] **R2（本段 §20 已完成）**：graph 可靠性矩阵 —— fake makeLlm（实现 invoke/stream/bindTools，按次抛 flaky/exhaust，经 `createApp({dependencies:{services:{makeLlm}}})` + `USE_LANGGRAPH=true` 驱动真实节点）+ HTTP `reader.cancel` 半开 abort；4 用例全绿（重试→成功 / 耗尽→公开错误 / 退避中 abort 唤醒 attempt==1 / B 不受 A 取消）。详见 §21。纯测试波，零生产改动。
+- [ ] **仍延后**：LangChain `maxRetries` 与 withRetry 叠加的预算协调（共享 `buildChatOpenAIConfig`，牵 legacy 路径，并入接线时统一置 0）；rag 全链路 / eval judge·generator·reflection / mcp connect·listTools / bocha fetch 接线；SSE 错误字段审计（独立 W4-SSE 波）。真实工具 `invoke` 侧无法经 makeLlm seam 注入 flaky（工具退避 abort 只在纯语义单测覆盖）。W4 §2 清单以 §20+§21 为准逐步勾选。
+
+## 21. W4-R2：graph 可靠性矩阵（2026-09-06）
+
+关闭 §20 的 R2：此前无任何测试真正跑过 LangGraph 节点，R1 接线（withRetry + config.abortSignal）缺全图集成验收。完整记录见主日志 `2026-09-production-hardening.md` W4-R2 段。
+
+- [x] 侦察（2 路 Explore + 本人读码核验注入缝/SSE/abort 链/generalChat ReAct/router JSON 契约）：注入缝 `options?.deps?.services?.makeLlm`；`_useLangGraph` 请求时读 env；graph SSE = services/sse.js writer（error=toPublicError envelope、done=[DONE]）；abort = res close→controller.abort→静默收尾；withRetry 包 `stream()` 调用而非 for-await 迭代。
+- [x] 新建 `backend/src/services/chatGraphReliability.test.js`（real DB + `createApp({services:{makeLlm}})` + `USE_LANGGRAPH=true` + native HTTP）：fake makeLlm 按 `opts.streaming` 分流 router/generalChat；streaming fake 闭包 attempt、按末条消息 marker 分流 scenario（AB 并发同服无共享可变态）。4 用例：flaky→成功(attempt==2)、耗尽→公开错误 envelope(attempt>=3、无 secret、无 [DONE])、退避中 `reader.cancel`→abort 唤醒(attempt==1、无假 assistant)、A 取消不影响 B(单服务器双用户并发)。
+- [x] 验证：定向 **4/4**（一次通过）；全量 backend **35 files / 528 tests 全绿**（原 34/524，+1/+4）；`node --check` + `git diff --check` OK；dev 库不被触碰。零生产代码改动。
+- [ ] **残余/候选**：真实工具侧 flaky 集成缝（工具退避 abort 无独立集成测试）；LangChain `maxRetries:0` 与 withRetry 协调；rag/eval/mcp/bocha 余下接线；**W4-SSE 错误字段审计**（独立小波）；durable 同 key 跨进程锁（需分布式锁）、软点→404、组织 RBAC、多实例 RAG、W5-W8/P2 继续延后。
 
