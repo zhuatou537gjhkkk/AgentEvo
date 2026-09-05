@@ -43,6 +43,13 @@ const DEFAULT_VOICE_VOLUME = 1;
 const DEFAULT_THEME_MODE = 'system';
 const AUTH_STORAGE_KEY = 'chat-agent-auth-token';
 
+function createIdempotencyKey() {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID();
+    }
+    return `chat-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 function readStoredAuthToken() {
     if (typeof window === 'undefined') {
         return '';
@@ -1473,8 +1480,13 @@ export const useChatStore = create(persist((set, get) => ({
         }
 
         await get().sendMessage(failedRequest.content, {
-            enableWebSearch: get().enableWebSearch,
+            enableWebSearch: failedRequest.enableWebSearch,
+            planMode: failedRequest.planMode,
+            enableMemory: failedRequest.enableMemory,
+            systemPrompt: failedRequest.systemPrompt,
+            temperature: failedRequest.temperature,
             imageId: failedRequest.imageId || null,
+            idempotencyKey: failedRequest.idempotencyKey || null,
         });
     },
     retryMessageById: async (messageId) => {
@@ -1718,6 +1730,7 @@ export const useChatStore = create(persist((set, get) => ({
         const sessionId = state.currentSessionId;
         const selectedImage = state.selectedImage;
         const selectedImageId = options.imageId ?? selectedImage?.imageId ?? null;
+        const idempotencyKey = options.idempotencyKey || createIdempotencyKey();
 
         const sessionSpecificSettings = sessionId
             ? state.sessionAgentSettings[sessionId]
@@ -2397,7 +2410,12 @@ export const useChatStore = create(persist((set, get) => ({
                         : {
                             content,
                             enableWebSearch,
+                            planMode,
+                            enableMemory,
+                            systemPrompt,
+                            temperature,
                             imageId: selectedImageId,
+                            idempotencyKey,
                         },
                 }));
 
@@ -2412,6 +2430,7 @@ export const useChatStore = create(persist((set, get) => ({
                 systemPrompt,
                 temperature,
                 imageId: selectedImageId,
+                idempotencyKey,
             }
         );
     },

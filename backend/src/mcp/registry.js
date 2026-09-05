@@ -9,6 +9,8 @@
 
 import { DynamicStructuredTool, DynamicTool } from "@langchain/core/tools";
 import { connectToMCPServer } from "./client.js";
+import { getRequestContext } from "../services/requestContext.js";
+import { withRetry } from "../services/resilience.js";
 
 /**
  * MCP Server 的 schema 以 JSON Schema 形式返回，直接交给
@@ -117,24 +119,29 @@ class ToolRegistry {
      * @param {{ name: string, command: string, args?: string[] }} config
      */
     async registerMCPServer(config) {
-        if (this._mcpWrappers.has(config.name)) {
+        const scopeKey = config.scope?.tenantId
+            ? `${config.scope.tenantId}:${config.scope.userId}:${config.name}`
+            : `system:${config.name}`;
+        const existingLegacyKey = !config.scope && this._mcpWrappers.has(config.name) ? config.name : null;
+        if (existingLegacyKey) this._mcpWrappers.delete(existingLegacyKey);
+        if (this._mcpWrappers.has(scopeKey)) {
             console.log(`[registry] MCP server "${config.name}" already connected, skipping`);
             return;
         }
 
         // 防止并发重复连接：如果已有进行中的连接，复用同一个 Promise
-        if (this._pendingConnections.has(config.name)) {
+        if (this._pendingConnections.has(scopeKey)) {
             console.log(`[registry] MCP server "${config.name}" connection in progress, awaiting...`);
-            return this._pendingConnections.get(config.name);
+            return this._pendingConnections.get(scopeKey);
         }
 
-        const connectPromise = this._doConnect(config);
-        this._pendingConnections.set(config.name, connectPromise);
+        const connectPromise = this._doConnect({ ...config, _scopeKey: existingLegacyKey || scopeKey });
+        this._pendingConnections.set(scopeKey, connectPromise);
 
         try {
             return await connectPromise;
         } finally {
-            this._pendingConnections.delete(config.name);
+            this._pendingConnections.delete(scopeKey);
         }
     }
 
@@ -170,17 +177,26 @@ class ToolRegistry {
                 schema,
                 func: async (input) => {
                     try {
-                        const result = await client.callTool({
-                            name: toolName,
-                            arguments: input && typeof input === "object" ? input : {},
-                        });
+                        const result = await withRetry(
+                            (_, signal) => client.callTool({
+                                name: toolName,
+                                arguments: input && typeof input === "object" ? input : {},
+                                signal,
+                            }),
+                            { retries: 1 }
+                        );
                         const content = result?.content || [];
                         const textParts = content
                             .filter(c => c.type === "text")
                             .map(c => c.text);
                         return textParts.length > 0 ? textParts.join("\n") : JSON.stringify(result);
                     } catch (err) {
-                        return `MCP tool "${toolName}" error: ${err.message}`;
+                        return JSON.stringify({
+                            ok: false,
+                            errorCode: "MCP_TOOL_FAILED",
+                            message: `MCP tool "${toolName}" failed`,
+                            retryable: Boolean(err?.code === "ECONNRESET" || err?.code === "ETIMEDOUT"),
+                        });
                     }
                 },
             });
@@ -196,7 +212,13 @@ class ToolRegistry {
             }
         }
 
-        this._mcpWrappers.set(config.name, { client, tools: wrappers });
+        this._mcpWrappers.set(config._scopeKey || `system:${config.name}`, {
+            client,
+            tools: wrappers,
+            name: config.name,
+            scope: config.scope || null,
+            scopeKey: config._scopeKey || `system:${config.name}`,
+        });
         console.log(`[registry] MCP server "${config.name}" ready with ${wrappers.length} tool(s)`);
     }
 
@@ -205,12 +227,29 @@ class ToolRegistry {
      * 本地工具在前，MCP 工具在后。
      * @returns {import("@langchain/core/tools").StructuredToolInterface[]}
      */
-    getAllTools() {
+    getAllTools(scope = null) {
+        const effectiveScope = scope || getRequestContext();
         const mcpTools = [];
         for (const [, wrapper] of this._mcpWrappers) {
+            if (!this._isVisible(wrapper, effectiveScope)) continue;
             mcpTools.push(...wrapper.tools);
         }
         return [...this._localTools, ...mcpTools];
+    }
+
+    _isVisible(wrapper, scope = null) {
+        if (!wrapper?.scope) return true;
+        if (!scope) return false;
+        return Number(wrapper.scope.userId) === Number(scope.userId)
+            && String(wrapper.scope.tenantId) === String(scope.tenantId);
+    }
+
+    _findWrapper(serverName, scope = null) {
+        for (const [key, wrapper] of this._mcpWrappers) {
+            const legacyName = String(key).includes(":") ? String(key).split(":").pop() : String(key);
+            if ((wrapper.name === serverName || legacyName === serverName) && this._isVisible(wrapper, scope)) return wrapper;
+        }
+        return null;
     }
 
     /**
@@ -223,13 +262,14 @@ class ToolRegistry {
      * @param {string} name
      * @returns {import("@langchain/core/tools").StructuredToolInterface | undefined}
      */
-    getTool(name) {
+    getTool(name, scope = null) {
+        const effectiveScope = scope || getRequestContext();
         // Phase 4: 命名空间格式 "serverName/toolName"
         if (name.includes("/")) {
             const slashIdx = name.indexOf("/");
             const serverName = name.slice(0, slashIdx);
             const toolName = name.slice(slashIdx + 1);
-            const wrapper = this._mcpWrappers.get(serverName);
+            const wrapper = this._findWrapper(serverName, effectiveScope);
             if (wrapper) {
                 return wrapper.tools.find(t => t.name === name || t.name === toolName);
             }
@@ -242,6 +282,7 @@ class ToolRegistry {
 
         // MCP 工具 fallback
         for (const [, wrapper] of this._mcpWrappers) {
+            if (!this._isVisible(wrapper, effectiveScope)) continue;
             const found = wrapper.tools.find(t => t.name === name);
             if (found) return found;
         }
@@ -258,12 +299,15 @@ class ToolRegistry {
      * @returns {Promise<unknown>}
      */
     async invokeTool(name, input, config) {
-        const tool = this.getTool(name);
+        const tool = this.getTool(name, config?.scope);
         if (!tool) throw new Error(`工具 "${name}" 不可用`);
         const normalizedInput = tool instanceof DynamicStructuredTool
             ? normalizeLegacyStructuredInput(tool, input)
             : input;
-        return tool.invoke(normalizedInput, config);
+        return withRetry(
+            (_, signal) => tool.invoke(normalizedInput, { ...config, signal }),
+            { retries: 1, signal: config?.signal }
+        );
     }
 
     /**
@@ -279,8 +323,10 @@ class ToolRegistry {
      * 断开并移除 MCP Server。
      * @param {string} name
      */
-    async removeMCPServer(name) {
-        const wrapper = this._mcpWrappers.get(name);
+    async removeMCPServer(name, scope = null) {
+        const effectiveScope = scope || getRequestContext();
+        const key = effectiveScope?.tenantId ? `${effectiveScope.tenantId}:${effectiveScope.userId}:${name}` : `system:${name}`;
+        const wrapper = this._mcpWrappers.get(key) || this._findWrapper(name, effectiveScope);
         if (!wrapper) {
             console.log(`[registry] MCP server "${name}" not found`);
             return;
@@ -292,8 +338,20 @@ class ToolRegistry {
             console.error(`[registry] error closing MCP server "${name}": ${err.message}`);
         }
 
-        this._mcpWrappers.delete(name);
+        this._mcpWrappers.delete(wrapper.scopeKey || key);
         console.log(`[registry] MCP server "${name}" removed`);
+    }
+
+    async closeAllMCPServers() {
+        const wrappers = [...this._mcpWrappers.values()];
+        const results = await Promise.allSettled(wrappers.map(async (wrapper) => {
+            await wrapper.client.close();
+            this._mcpWrappers.delete(wrapper.scopeKey);
+        }));
+        return {
+            closed: results.filter((result) => result.status === "fulfilled").length,
+            failed: results.filter((result) => result.status === "rejected").length,
+        };
     }
 
     // ═══════════════════════════════════════════════════════
@@ -309,7 +367,8 @@ class ToolRegistry {
      *
      * @returns {{ category: string, tools: { name: string, description: string }[] }[]}
      */
-    getToolCategories() {
+    getToolCategories(scope = null) {
+        const effectiveScope = scope || getRequestContext();
         const categories = [];
 
         // 本地工具归类
@@ -349,11 +408,12 @@ class ToolRegistry {
 
         // 每个 MCP Server 为一个独立类别
         for (const [serverName, wrapper] of this._mcpWrappers) {
+            if (!this._isVisible(wrapper, effectiveScope)) continue;
             // 只取带命名空间前缀的版本（避免裸名重复）
             const prefixedTools = wrapper.tools.filter(t => t.name.includes("/"));
             if (prefixedTools.length > 0) {
                 categories.push({
-                    category: serverName,
+                    category: wrapper.name || (String(serverName).includes(":") ? String(serverName).split(":").pop() : String(serverName)),
                     type: "mcp",
                     tools: prefixedTools.map(t => ({ name: t.name, description: t.description || "" })),
                 });
@@ -368,8 +428,9 @@ class ToolRegistry {
      * @param {string} categoryName
      * @returns {Array}
      */
-    getToolsByCategory(categoryName) {
-        const allLocal = this.getAllTools();
+    getToolsByCategory(categoryName, scope = null) {
+        const effectiveScope = scope || getRequestContext();
+        const allLocal = this.getAllTools(effectiveScope);
         if (categoryName === "system") {
             // system 类别：非 search/knowledge 的本地工具
             return allLocal.filter(t =>
@@ -377,8 +438,9 @@ class ToolRegistry {
             );
         }
         // MCP Server 类别
-        if (this._mcpWrappers.has(categoryName)) {
-            return this._mcpWrappers.get(categoryName).tools;
+        const wrapper = this._findWrapper(categoryName, effectiveScope);
+        if (wrapper) {
+            return wrapper.tools;
         }
         return [];
     }
@@ -388,11 +450,12 @@ class ToolRegistry {
      * @param {string} categoryName
      * @returns {boolean}
      */
-    hasToolCategory(categoryName) {
+    hasToolCategory(categoryName, scope = null) {
+        const effectiveScope = scope || getRequestContext();
         // 本地已知类别
         if (["search", "knowledge", "system", "general", "code"].includes(categoryName)) return true;
         // MCP Server 类别
-        if (this._mcpWrappers.has(categoryName)) return true;
+        if (this._findWrapper(categoryName, effectiveScope)) return true;
         return false;
     }
 
@@ -400,8 +463,11 @@ class ToolRegistry {
      * 获取所有已连接的 MCP Server 名称。
      * @returns {string[]}
      */
-    getMCPServerNames() {
-        return Array.from(this._mcpWrappers.keys());
+    getMCPServerNames(scope = null) {
+        const effectiveScope = scope || getRequestContext();
+        return Array.from(this._mcpWrappers.entries())
+            .filter(([, wrapper]) => this._isVisible(wrapper, effectiveScope))
+            .map(([key, wrapper]) => wrapper.name || (String(key).includes(":") ? String(key).split(":").pop() : String(key)));
     }
 
     /**
@@ -409,9 +475,14 @@ class ToolRegistry {
      * @param {string} serverName
      * @returns {{ name: string, description: string }[]}
      */
-    getMCPServerTools(serverName) {
-        const wrapper = this._mcpWrappers.get(serverName);
-        if (!wrapper) return [];
+    getMCPServerTools(serverName, scope = null) {
+        const effectiveScope = scope || getRequestContext();
+        const wrapper = this._findWrapper(serverName, effectiveScope) || this._mcpWrappers.get(`system:${serverName}`);
+        if (!wrapper || !this._isVisible(wrapper, effectiveScope)) {
+            const legacy = this._mcpWrappers.get(serverName);
+            if (legacy && this._isVisible(legacy, effectiveScope)) return legacy.tools.map(t => ({ name: t.name, description: t.description }));
+            return [];
+        }
         return wrapper.tools.map(t => ({ name: t.name, description: t.description }));
     }
 }

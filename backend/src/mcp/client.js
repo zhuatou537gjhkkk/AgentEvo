@@ -9,6 +9,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { validateMCPServerConfig } from "./security.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -23,7 +24,8 @@ const BACKEND_ROOT = path.resolve(__dirname, "..", "..");
  * @returns {Promise<import("@modelcontextprotocol/sdk/client/index.js").Client>}
  */
 export async function connectToMCPServer(config) {
-    const { command, args = [], cwd, env } = config;
+    const safeConfig = validateMCPServerConfig(config, { resolvedEnv: Boolean(config?.env && Object.values(config.env).some((value) => !String(value).startsWith("env:"))) });
+    const { command, args = [], cwd, env } = safeConfig;
 
     // Windows 下 npx 是 npx.cmd 批处理脚本，StdioClientTransport shell:false 直接 spawn "npx" 会 ENOENT
     const resolvedCommand =

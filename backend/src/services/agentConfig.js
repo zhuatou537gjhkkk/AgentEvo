@@ -27,7 +27,11 @@ import {
     getConfigVersion,
     updateConfigVersionLabel,
     deleteConfigVersion,
+    getAgentConfigOverride,
+    getAgentConfigOverrides,
+    deleteAgentConfigOverride,
 } from "../db/index.js";
+import { createResourceScope } from "../security/resourceScope.js";
 
 /**
  * 配置键 → 代码默认值的映射
@@ -69,24 +73,50 @@ class AgentConfigService {
         this._cache = new Map();
     }
 
+    _scope(scope) {
+        if (scope) return createResourceScope(scope);
+        // Prefer the authenticated AsyncLocalStorage context. The development
+        // fallback exists only for legacy standalone unit tests.
+        try {
+            return createResourceScope();
+        } catch (error) {
+            if (process.env.NODE_ENV !== "production") {
+                return createResourceScope({ userId: 1, tenantId: "user:1" });
+            }
+            throw error;
+        }
+    }
+
+    _cacheKey(key, scope) {
+        const current = this._scope(scope);
+        return `${current.tenantId}:${current.userId}:${String(key)}`;
+    }
+
     /**
      * 获取配置值（DB → 默认值 优先级）
      * @param {string} key
      * @returns {string}
      */
-    get(key) {
+    get(key, scope = null) {
+        const current = this._scope(scope);
+        const cacheKey = this._cacheKey(key, current);
         // 检查缓存
-        const cached = this._cache.get(key);
+        const cached = this._cache.get(cacheKey);
         if (cached && (Date.now() - cached.ts) < CACHE_TTL_MS) {
             return cached.value;
         }
 
-        // 查 DB
+        // Scope override → global default row → code default.
         try {
+            const override = getAgentConfigOverride(key, current);
+            if (override && override.value !== null && override.value !== undefined) {
+                this._cache.set(cacheKey, { value: override.value, ts: Date.now() });
+                return override.value;
+            }
             const row = getAgentConfigValue(key);
-            if (row && row.value !== null && row.value !== undefined) {
-                this._cache.set(key, { value: row.value, ts: Date.now() });
-                return row.value;
+            if (row && row.default_value !== null && row.default_value !== undefined) {
+                this._cache.set(cacheKey, { value: row.default_value, ts: Date.now() });
+                return row.default_value;
             }
         } catch (err) {
             console.warn(`[AgentConfig] get("${key}") DB error:`, err.message);
@@ -95,7 +125,7 @@ class AgentConfigService {
         // 回退到代码默认值
         const defaultVal = DEFAULTS[key];
         if (defaultVal !== undefined) {
-            this._cache.set(key, { value: defaultVal, ts: Date.now() });
+            this._cache.set(cacheKey, { value: defaultVal, ts: Date.now() });
             return defaultVal;
         }
 
@@ -108,8 +138,8 @@ class AgentConfigService {
      * @param {number} fallback
      * @returns {number}
      */
-    getNumber(key, fallback = 0) {
-        const val = this.get(key);
+    getNumber(key, fallback = 0, scope = null) {
+        const val = this.get(key, scope);
         const num = Number(val);
         return Number.isNaN(num) ? fallback : num;
     }
@@ -118,26 +148,32 @@ class AgentConfigService {
      * 获取所有配置项（含默认值）
      * @returns {Array<{key: string, value: string, default_value: string|null, description: string|null}>}
      */
-    getAll() {
+    getAll(scope = null) {
+        const current = this._scope(scope);
         try {
             const rows = getAllAgentConfigValues();
+            const overrides = new Map(getAgentConfigOverrides(current).map((row) => [row.key, row]));
             const result = [];
             const seenKeys = new Set();
 
             for (const row of rows) {
-                result.push(row);
+                const override = overrides.get(row.key);
+                result.push(override
+                    ? { ...row, value: override.value, updated_at: override.updated_at }
+                    : { ...row, value: row.default_value ?? row.value });
                 seenKeys.add(row.key);
             }
 
             // 补充未在 DB 中但定义了默认值的 key
             for (const [key, defaultVal] of Object.entries(DEFAULTS)) {
                 if (!seenKeys.has(key)) {
+                    const override = overrides.get(key);
                     result.push({
                         key,
-                        value: defaultVal,
+                        value: override?.value ?? defaultVal,
                         default_value: defaultVal,
-                        description: null,
-                        updated_at: null,
+                        description: override?.description ?? null,
+                        updated_at: override?.updated_at ?? null,
                     });
                 }
             }
@@ -162,18 +198,19 @@ class AgentConfigService {
      * @param {string} [description]
      * @returns {boolean} 是否成功
      */
-    set(key, value, description = null, skipSnapshot = false) {
+    set(key, value, description = null, skipSnapshot = false, scope = null) {
+        const current = this._scope(scope);
         try {
             const defaultVal = DEFAULTS[key] || null;
-            const ok = setAgentConfigValue(key, value, defaultVal, description);
+            const ok = setAgentConfigValue(key, value, defaultVal, description, current);
             if (ok) {
                 // 更新缓存
-                this._cache.set(key, { value: String(value), ts: Date.now() });
+                this._cache.set(this._cacheKey(key, current), { value: String(value), ts: Date.now() });
                 // G5: 自动保存版本快照（每次变更都留痕）
                 if (!skipSnapshot) {
                     try {
-                        const snap = this.snapshot();
-                        saveConfigSnapshot(snap, "manual");
+                        const snap = this.snapshot(current);
+                        saveConfigSnapshot(snap, "manual", current);
                     } catch (vErr) {
                         console.warn("[AgentConfig] auto-version save failed:", vErr.message);
                     }
@@ -191,11 +228,11 @@ class AgentConfigService {
      * @param {Array<{key: string, value: string}>} entries
      * @returns {{ok: number, fail: number}}
      */
-    setBatch(entries, skipSnapshot = false) {
+    setBatch(entries, skipSnapshot = false, scope = null) {
         let ok = 0;
         let fail = 0;
         for (const { key, value } of entries) {
-            if (this.set(key, value, null, skipSnapshot)) ok++;
+            if (this.set(key, value, null, skipSnapshot, scope)) ok++;
             else fail++;
         }
         return { ok, fail };
@@ -206,10 +243,13 @@ class AgentConfigService {
      * @param {string} key
      * @returns {boolean}
      */
-    reset(key) {
+    reset(key, scope = null) {
         const defaultVal = DEFAULTS[key];
         if (defaultVal === undefined) return false;
-        return this.set(key, defaultVal, "重置为默认值");
+        const current = this._scope(scope);
+        const removed = deleteAgentConfigOverride(key, current);
+        this._cache.delete(this._cacheKey(key, current));
+        return removed;
     }
 
     /**
@@ -217,8 +257,9 @@ class AgentConfigService {
      * 供 G5 版本管理使用
      * @returns {object}
      */
-    snapshot() {
-        const all = this.getAll();
+    snapshot(scope = null) {
+        const current = this._scope(scope);
+        const all = this.getAll(current);
         const snap = {};
         for (const row of all) {
             snap[row.key] = row.value;
@@ -231,12 +272,12 @@ class AgentConfigService {
      * @param {object} snap — snapshot() 的输出
      * @returns {{ok: number, fail: number}}
      */
-    restore(snap) {
+    restore(snap, scope = null) {
         if (!snap || typeof snap !== "object") return { ok: 0, fail: 0 };
         const entries = Object.entries(snap).map(([key, value]) => ({ key, value }));
         // skipSnapshot=true: restoreVersion() handles the final rollback snapshot;
         // we must NOT save one snapshot per key (would flood version history)
-        return this.setBatch(entries, true);
+        return this.setBatch(entries, true, scope);
     }
 
     /**
@@ -244,9 +285,10 @@ class AgentConfigService {
      * @param {number} [limit=20]
      * @returns {Array<{id: number, source: string, created_at: string}>}
      */
-    listVersions(limit = 20) {
+    listVersions(limit = 20, scope = null) {
+        const current = this._scope(scope);
         try {
-            return listConfigVersions(limit);
+            return listConfigVersions(limit, current);
         } catch (err) {
             console.error("[AgentConfig] listVersions error:", err.message);
             return [];
@@ -258,9 +300,10 @@ class AgentConfigService {
      * @param {number} id
      * @returns {{id: number, snapshot: object, source: string, created_at: string}|null}
      */
-    getVersion(id) {
+    getVersion(id, scope = null) {
+        const current = this._scope(scope);
         try {
-            return getConfigVersion(id);
+            return getConfigVersion(id, current);
         } catch (err) {
             console.error("[AgentConfig] getVersion error:", err.message);
             return null;
@@ -273,18 +316,19 @@ class AgentConfigService {
      * @param {number} versionId
      * @returns {boolean} 是否成功
      */
-    restoreVersion(versionId) {
+    restoreVersion(versionId, scope = null) {
+        const current = this._scope(scope);
         try {
-            const version = this.getVersion(versionId);
+            const version = this.getVersion(versionId, current);
             if (!version || !version.snapshot) return false;
 
             // 恢复所有配置项
-            const result = this.restore(version.snapshot);
+            const result = this.restore(version.snapshot, current);
 
             // 回滚操作本身也保存为快照
             try {
-                const newSnap = this.snapshot();
-                saveConfigSnapshot(newSnap, "rollback");
+                const newSnap = this.snapshot(current);
+                saveConfigSnapshot(newSnap, "rollback", current);
             } catch (vErr) {
                 console.warn("[AgentConfig] rollback version save failed:", vErr.message);
             }
@@ -302,9 +346,10 @@ class AgentConfigService {
      * @param {string} label
      * @returns {boolean}
      */
-    renameVersion(id, label) {
+    renameVersion(id, label, scope = null) {
+        const current = this._scope(scope);
         try {
-            return updateConfigVersionLabel(id, label);
+            return updateConfigVersionLabel(id, label, current);
         } catch (err) {
             console.error("[AgentConfig] renameVersion error:", err.message);
             return false;
@@ -316,9 +361,10 @@ class AgentConfigService {
      * @param {number} id
      * @returns {boolean}
      */
-    removeVersion(id) {
+    removeVersion(id, scope = null) {
+        const current = this._scope(scope);
         try {
-            return deleteConfigVersion(id);
+            return deleteConfigVersion(id, current);
         } catch (err) {
             console.error("[AgentConfig] removeVersion error:", err.message);
             return false;

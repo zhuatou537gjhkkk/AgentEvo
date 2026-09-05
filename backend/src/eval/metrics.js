@@ -34,6 +34,7 @@ export function saveEvalRunScores({
     messageId = null,
     judgeModel = "",
     scoreType = "offline",
+    scope = null,
 }) {
     const dimensions = [
         { key: "correctness", score: scores.correctness },
@@ -54,6 +55,7 @@ export function saveEvalRunScores({
             judgeRationale: scores.rationale || null,
             judgeModel,
             scoreType,
+            scope,
         });
     }
 }
@@ -63,8 +65,8 @@ export function saveEvalRunScores({
  * @param {string} runId
  * @returns {object}
  */
-export function getRunSummary(runId) {
-    const rows = getScoresByRun(runId);
+export function getRunSummary(runId, scope = null) {
+    const rows = getScoresByRun(runId, scope);
 
     if (rows.length === 0) {
         return { runId, total: 0, passed: 0, failed: 0, avgScores: {} };
@@ -123,8 +125,8 @@ export function getRunSummary(runId) {
  * @param {number} limit
  * @returns {Array}
  */
-export function getTrends(limit = 30) {
-    return getScoreTrends(limit);
+export function getTrends(limit = 30, scope = null) {
+    return getScoreTrends(limit, scope);
 }
 
 /**
@@ -133,16 +135,16 @@ export function getTrends(limit = 30) {
  * @param {number} limit
  * @returns {Array}
  */
-export function getTrendsByRun(runId, limit = 30) {
-    return getScoreTrendsByRun(runId, limit);
+export function getTrendsByRun(runId, limit = 30, scope = null) {
+    return getScoreTrendsByRun(runId, limit, scope);
 }
 
 /**
  * 获取所有历史 run 列表
  * @returns {Array<{run_id: string, created_at: string}>}
  */
-export function getRunList() {
-    return getRunIds();
+export function getRunList(scope = null) {
+    return getRunIds(scope);
 }
 
 /**
@@ -152,8 +154,8 @@ export function getRunList() {
  * @param {string} rating — 'thumbs_up' | 'thumbs_down'
  * @param {string} [comment]
  */
-export function submitFeedback(userId, messageId, rating, comment) {
-    return saveFeedback(userId, messageId, rating, comment);
+export function submitFeedback(userId, messageId, rating, comment, scope = null) {
+    return saveFeedback(userId, messageId, rating, comment, scope);
 }
 
 /**
@@ -162,8 +164,8 @@ export function submitFeedback(userId, messageId, rating, comment) {
  * @param {number} messageId
  * @returns {object|null}
  */
-export function getFeedback(userId, messageId) {
-    return getFeedbackByMessage(userId, messageId);
+export function getFeedback(userId, messageId, scope = null) {
+    return getFeedbackByMessage(userId, messageId, scope);
 }
 
 /**
@@ -171,6 +173,6 @@ export function getFeedback(userId, messageId) {
  * @param {number} userId
  * @returns {{ thumbs_up: number, thumbs_down: number, total: number }}
  */
-export function getFeedbackStats(userId) {
-    return getFeedbackSummary(userId);
+export function getFeedbackStats(userId, scope = null) {
+    return getFeedbackSummary(userId, scope);
 }

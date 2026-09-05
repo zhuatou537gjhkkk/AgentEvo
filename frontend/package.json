@@ -8,7 +8,9 @@
         "build": "vite build",
         "preview": "vite preview",
         "test": "vitest run",
-        "test:watch": "vitest"
+        "test:watch": "vitest",
+        "check:syntax": "vite build --mode test",
+        "check": "npm run check:syntax && npm run test && npm run build"
     },
     "dependencies": {
         "react": "^18.3.1",

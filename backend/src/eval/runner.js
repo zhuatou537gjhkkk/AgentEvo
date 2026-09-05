@@ -15,7 +15,7 @@ import { testCases, getTestCaseById, getTestCasesByCategory } from "./testCases.
 import { LLMJudge } from "./judge.js";
 import { CodeJudge } from "./codeJudge.js";
 import { saveEvalRunScores, getRunSummary } from "./metrics.js";
-import { saveMessage, saveMessageMetric, createSession, getGeneratedTestCaseById } from "../db/index.js";
+import { saveMessage, saveMessageMetric, createSession, getGeneratedTestCaseById, createEvalRun, completeEvalRun, getUserScope } from "../db/index.js";
 import { estimateTokens } from "../services/chatUtils.js";
 
 // Resolve which chat implementation to use based on feature flag
@@ -39,14 +39,17 @@ class EvalRunner {
      */
     async run(testCaseIds = [], runId = null, options = {}) {
         const { reflect = false, onProgress = null } = options;
+        const scope = options.scope || getUserScope(options.userId || 1);
+        if (!scope) throw new Error("evaluation ownership is required");
 
         const effectiveRunId = runId || this._generateRunId();
+        createEvalRun(effectiveRunId, scope);
 
         // 解析 ID：先查硬编码用例，再查 DB 生成用例（G7 桥接）
         const resolveTestCase = (id) => {
             const hardcoded = getTestCaseById(id);
             if (hardcoded) return hardcoded;
-            const generated = getGeneratedTestCaseById(id);
+            const generated = getGeneratedTestCaseById(id, scope);
             if (generated) return dbRowToTestCase(generated);
             return null;
         };
@@ -64,6 +67,7 @@ class EvalRunner {
             : (selected.length > 0 ? selected : (allResolvedFailed ? [] : testCases));
 
         if (targetTestCases.length === 0) {
+            completeEvalRun(effectiveRunId, scope, "completed");
             return {
                 runId: effectiveRunId,
                 total: 0,
@@ -79,12 +83,12 @@ class EvalRunner {
         const startTime = Date.now();
 
         // 为评估创建专用 session（避免 saveMessage 报 session not found）
-        const evalSessionId = createSession(1, `eval-${effectiveRunId}`);
+        const evalSessionId = createSession(scope.userId, `eval-${effectiveRunId}`);
 
         for (let i = 0; i < targetTestCases.length; i++) {
             const testCase = targetTestCases[i];
             try {
-                const result = await this._runSingle(testCase, effectiveRunId, { reflect, evalSessionId });
+                const result = await this._runSingle(testCase, effectiveRunId, { reflect, evalSessionId, scope });
                 results.push(result);
             } catch (err) {
                 console.error(`[EvalRunner] test case ${testCase.id} failed:`, err.message);
@@ -111,6 +115,7 @@ class EvalRunner {
 
         const avgScores = this._computeAvgScores(results);
 
+        completeEvalRun(effectiveRunId, scope, "completed");
         const report = {
             runId: effectiveRunId,
             total: targetTestCases.length,
@@ -143,7 +148,8 @@ class EvalRunner {
         // 构建 fake response 来捕获 SSE 输出
         const captured = new CapturedResponse();
 
-        const userId = 1; // 评估使用默认用户
+        const scope = options.scope || getUserScope(options.userId || 1);
+        const userId = scope.userId;
         const sessionId = options.evalSessionId || null; // 评估使用专用 session
 
         const startedAt = Date.now();
@@ -161,6 +167,7 @@ class EvalRunner {
                 enableWebSearch: testCase.enableWebSearch || false,
                 planMode: false,
                 skipUserMessageSave: true,
+                scope,
             }
         );
 
@@ -213,6 +220,7 @@ class EvalRunner {
                 testCaseId: testCase.id,
                 judgeModel: this.model,
                 scoreType: "offline",
+                scope,
             });
         } catch (err) {
             console.warn(`[EvalRunner] failed to save scores for ${testCase.id}:`, err.message);

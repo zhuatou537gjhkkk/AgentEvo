@@ -6,10 +6,13 @@
  */
 
 import { ChatOpenAI } from "@langchain/openai";
+import { withRetry } from "./resilience.js";
 import { HumanMessage, AIMessage, SystemMessage } from "@langchain/core/messages";
 import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
 import { createToolCallingAgent, AgentExecutor } from "@langchain/classic/agents";
 import { agentTools, setMemoryToolContext } from "../mcp/tools.js";
+import { getRequestContext } from "./requestContext.js";
+import { getSSEWriter } from "./sse.js";
 import { toolRegistry } from "../mcp/registry.js";
 
 // ═══════════════════════════════════════════════════════
@@ -144,15 +147,13 @@ export function resolveModelName(hasImage = false, forceModel = null) {
 // SSE 辅助
 // ═══════════════════════════════════════════════════════
 
-export function emitThought(res, text, status = "running") {
-    res.write(
-        `data: ${JSON.stringify({
-            type: "thought",
-            text,
-            status,
-            at: new Date().toISOString()
-        })}\n\n`
-    );
+export function emitThought(res, text, status = "running", writer = null) {
+    return (writer || getSSEWriter(res, { requestId: res.req?.requestId })).write({
+        type: "thought",
+        text,
+        status,
+        at: new Date().toISOString(),
+    });
 }
 
 // ═══════════════════════════════════════════════════════
@@ -275,7 +276,7 @@ export function buildPrompt(enableWebSearch, userSystemPrompt, planMode = false)
 // ═══════════════════════════════════════════════════════
 
 export async function getAgentExecutor(enableWebSearch, temperature, systemPrompt, planMode = false) {
-    const allTools = toolRegistry.getAllTools();
+    const allTools = toolRegistry.getAllTools(getRequestContext());
     const tools = enableWebSearch
         ? allTools
         : allTools.filter((tool) => tool.name !== WEB_SEARCH_TOOL_NAME);
@@ -311,6 +312,7 @@ export async function streamDirectChat({
     image,
     formattedHistory,
     res,
+    writer = null,
     systemInstruction,
     temperature,
     forceModel,
@@ -338,7 +340,10 @@ export async function streamDirectChat({
     let usage = null;
 
     try {
-        const stream = await llm.stream(messages);
+        const stream = await withRetry(
+            (_, signal) => llm.stream(messages, { signal }),
+            { retries: 2, signal: abortController?.signal }
+        );
 
         for await (const chunk of stream) {
             if (abortController?.signal.aborted) {
@@ -354,13 +359,14 @@ export async function streamDirectChat({
                 continue;
             }
             fullText += text;
-            res.write(`data: ${JSON.stringify({ type: "text", text })}\n\n`);
+            (writer || getSSEWriter(res, { requestId: res.req?.requestId })).write({ type: "text", text });
         }
     } catch (err) {
         console.error(`[agent] streamDirectChat failed: model=${modelName} baseURL=${config.configuration?.baseURL} error="${err.message}"`);
-        const errorText = `[图片识别请求失败: ${err.message}]`;
-        res.write(`data: ${JSON.stringify({ type: "text", text: errorText })}\n\n`);
-        fullText = errorText;
+        // Do not turn an upstream failure into a successful placeholder. The
+        // caller must be able to mark idempotency as failed and avoid storing
+        // an assistant message that can later be replayed as a success.
+        throw err;
     }
 
     return { fullText, usage };

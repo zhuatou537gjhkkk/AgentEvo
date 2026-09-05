@@ -41,7 +41,11 @@ leetcode-progress.json
 *.db-journal
 
 # 本地文件
-docs
+# 本地文件
+# docs 下的所有个人资料均不纳入版本控制，但保留开发日志
+docs/*
+!docs/dev-logs/
+!docs/dev-logs/**
 test
 
 # Memory / Session artifacts

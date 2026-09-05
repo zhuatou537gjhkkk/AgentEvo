@@ -36,31 +36,47 @@ function getAuthToken() {
 }
 
 function shouldRetryStatus(status) {
-    return status === 408 || status === 409 || status === 425 || status === 429 || status === 502 || status === 503 || status === 504;
+    return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+export class HttpRequestError extends Error {
+    constructor(message, { status = 0, errorCode = "HTTP_REQUEST_FAILED", requestId = null, retryable = false, retryAfter = null } = {}) {
+        super(message);
+        this.name = "HttpRequestError";
+        this.status = Number(status) || 0;
+        this.statusCode = this.status;
+        this.errorCode = String(errorCode || "HTTP_REQUEST_FAILED");
+        this.requestId = requestId || null;
+        this.retryable = Boolean(retryable);
+        this.retryAfter = retryAfter;
+    }
 }
 
 async function parseResponseError(response) {
-    let message = `Request failed with status ${response.status}`;
-
+    let data = null;
     try {
-        const data = await response.clone().json();
-        if (data?.message) {
-            message = data.message;
-        } else if (data?.error) {
-            message = data.error;
-        }
+        data = await response.clone().json();
     } catch {
+        // Non-JSON errors still receive the HTTP status below.
+    }
+
+    if (!data) {
         try {
             const text = await response.clone().text();
-            if (text) {
-                message = text;
-            }
+            data = text ? { message: text } : null;
         } catch {
-            // Ignore text parsing errors and keep default message.
+            data = null;
         }
     }
 
-    return message;
+    const retryAfter = response.headers?.get?.("Retry-After") || null;
+    return new HttpRequestError(data?.message || data?.error || `Request failed with status ${response.status}`, {
+        status: response.status,
+        errorCode: data?.errorCode || data?.error || "HTTP_REQUEST_FAILED",
+        requestId: data?.requestId || response.headers?.get?.("X-Request-Id") || null,
+        retryable: data?.retryable ?? shouldRetryStatus(response.status),
+        retryAfter,
+    });
 }
 
 function createRequestController(externalSignal, timeoutMs) {
@@ -95,11 +111,16 @@ function createRequestController(externalSignal, timeoutMs) {
 export async function request(path, options = {}, config = {}) {
     const {
         timeoutMs = DEFAULT_TIMEOUT_MS,
-        retryCount = DEFAULT_RETRY_COUNT,
+        retryCount = undefined,
         externalSignal,
     } = config;
 
     const method = options.method || 'GET';
+    // Mutating requests are not safely replayable by default. Callers must
+    // explicitly opt in (or provide an idempotency key at the endpoint).
+    const effectiveRetryCount = retryCount == null
+        ? ((method === 'GET' || method === 'HEAD') ? DEFAULT_RETRY_COUNT : 0)
+        : Math.max(0, Number(retryCount) || 0);
     const headers = {
         ...(options.headers || {}),
     };
@@ -109,7 +130,7 @@ export async function request(path, options = {}, config = {}) {
         headers.Authorization = `Bearer ${token}`;
     }
 
-    for (let attempt = 0; attempt <= retryCount; attempt += 1) {
+    for (let attempt = 0; attempt <= effectiveRetryCount; attempt += 1) {
         const { signal, cleanup } = createRequestController(externalSignal, timeoutMs);
 
         try {
@@ -120,13 +141,13 @@ export async function request(path, options = {}, config = {}) {
             });
 
             if (!response.ok) {
-                const message = await parseResponseError(response);
+                const error = await parseResponseError(response);
 
-                if (attempt < retryCount && shouldRetryStatus(response.status)) {
+                if (attempt < effectiveRetryCount && (error.retryable || shouldRetryStatus(error.status))) {
                     continue;
                 }
 
-                throw new Error(message);
+                throw error;
             }
 
             return response;
@@ -136,11 +157,21 @@ export async function request(path, options = {}, config = {}) {
                 throw error;
             }
 
-            if (attempt >= retryCount) {
+            if (attempt >= effectiveRetryCount) {
                 throw error;
             }
 
-            if (error instanceof Error && /Request failed with status/.test(error.message)) {
+            // Application/HTTP errors are retried only when explicitly marked
+            // retryable; arbitrary validation and auth failures must stop.
+            if (error instanceof HttpRequestError) {
+                if (!error.retryable && !shouldRetryStatus(error.status)) {
+                    throw error;
+                }
+                continue;
+            }
+
+            // Network failures are safe to retry for read-only requests.
+            if (method !== 'GET' && method !== 'HEAD') {
                 throw error;
             }
         } finally {
@@ -293,6 +324,7 @@ export async function sendUserAnswer(questionId, answer) {
 export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, onDone, onError, options = {}) {
     const {
         signal,
+        idempotencyKey = null,
         enableWebSearch = false,
         planMode = false,
         enableMemory = true,
@@ -309,6 +341,7 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
+                    ...(idempotencyKey ? { 'X-Idempotency-Key': idempotencyKey } : {}),
                 },
                 body: JSON.stringify({
                     session_id: sessionId,
@@ -324,7 +357,9 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
             },
             {
                 externalSignal: signal,
-                retryCount: DEFAULT_RETRY_COUNT,
+                // /chat persists messages and may execute tools; never replay it
+                // through the generic request retry loop.
+                retryCount: 0,
             }
         );
 
@@ -338,6 +373,8 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
 
         // 监听外部 abort signal，取消 reader → 断开 HTTP 连接 → 后端检测到断连
         let abortHandler;
+        let streamTerminal = false;
+        let streamDone = false;
         if (signal) {
             abortHandler = () => {
                 reader.cancel();
@@ -347,14 +384,33 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
             }
         }
 
-        const handlePayload = (payload) => {
-            if (!payload || payload === '[DONE]') {
+        let lastSequence = 0;
+        let lastEventId = null;
+        const handlePayload = (payload, eventId = null) => {
+            if (streamTerminal || !payload) {
+                return;
+            }
+            if (payload === '[DONE]') {
+                streamDone = true;
+                streamTerminal = true;
                 return;
             }
 
             try {
                 const parsed = JSON.parse(payload);
                 const eventType = parsed?.type;
+                const sequence = Number(parsed?.seq);
+                if (Number.isInteger(sequence)) {
+                    if (sequence <= lastSequence || sequence > lastSequence + 1) {
+                        const sequenceError = new Error('stream returned out-of-order event');
+                        sequenceError.errorCode = 'SSE_SEQUENCE_ERROR';
+                        sequenceError.requestId = parsed.request_id || parsed.requestId || null;
+                        streamTerminal = true;
+                        onError(sequenceError);
+                        return;
+                    }
+                    lastSequence = sequence;
+                }
 
                 if (!eventType || eventType === 'text') {
                     const text = parsed && typeof parsed.text === 'string' ? parsed.text : '';
@@ -365,11 +421,31 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
                     return;
                 }
 
+                if (eventType === 'error') {
+                    const streamError = new Error(parsed.message || 'stream failed');
+                    streamError.errorCode = parsed.errorCode || parsed.error || 'STREAM_FAILED';
+                    streamError.requestId = parsed.requestId || null;
+                    streamError.retryable = Boolean(parsed.retryable);
+                    streamTerminal = true;
+                    onError(streamError);
+                    return;
+                }
+
                 if (eventType === 'tool_start' || eventType === 'tool_end' || eventType === 'tool_error' || eventType === 'thought' || eventType === 'metrics' || eventType === 'ask_user_question' || eventType === 'todo_updated' || eventType === 'agent_start' || eventType === 'agent_end' || eventType === 'agent_handoff') {
                     onToolEvent(parsed);
+                    return;
                 }
+
+                const unknownEvent = new Error('stream returned an unknown event');
+                unknownEvent.errorCode = 'MALFORMED_SSE_EVENT';
+                unknownEvent.requestId = parsed.requestId || null;
+                streamTerminal = true;
+                onError(unknownEvent);
             } catch {
-                // Ignore malformed chunk and continue streaming.
+                const malformedError = new Error('stream returned malformed data');
+                malformedError.errorCode = 'MALFORMED_SSE_EVENT';
+                streamTerminal = true;
+                onError(malformedError);
             }
         };
 
@@ -385,14 +461,15 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
 
             for (const part of parts) {
                 const lines = part.split('\n');
-
+                let eventId = null;
+                let data = null;
                 for (const line of lines) {
-                    if (!line.startsWith('data: ')) {
-                        continue;
-                    }
-
-                    handlePayload(line.slice(6));
+                    if (line.startsWith('id: ')) eventId = line.slice(4).trim();
+                    if (line.startsWith('data: ')) data = line.slice(6);
                 }
+                if (eventId && eventId === lastEventId) continue;
+                if (eventId) lastEventId = eventId;
+                if (data != null) handlePayload(data, eventId);
             }
         };
 
@@ -401,7 +478,16 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
 
             if (done) {
                 consumeBuffer(true);
-                onDone();
+                if (!streamTerminal) {
+                    streamTerminal = true;
+                    if (streamDone) onDone();
+                    else {
+                        const truncated = new Error('stream ended before [DONE]');
+                        truncated.errorCode = 'INCOMPLETE_SSE_STREAM';
+                        truncated.retryable = true;
+                        onError(truncated);
+                    }
+                }
                 break;
             }
 
@@ -490,14 +576,14 @@ export async function uploadFile(file, options = {}) {
             return toHex(digest);
         }
 
-        let hash = 2166136261;
-        const view = new Uint8Array(buffer);
-        for (const byte of view) {
-            hash ^= byte;
-            hash = Math.imul(hash, 16777619);
-        }
-
-        return `fallback-${targetFile.size}-${hash >>> 0}`;
+        // Do not fabricate a SHA-256-looking value: the server verifies the
+        // file hash at merge time. Older browsers without SubtleCrypto use a
+        // deterministic non-cryptographic key only for resume, while the
+        // server must reject it before indexing rather than accepting it as
+        // integrity evidence.
+        throw Object.assign(new Error('SHA-256 is unavailable in this browser'), {
+            errorCode: 'UPLOAD_HASH_UNAVAILABLE',
+        });
     };
 
     const uploadSingleChunk = async (hash, chunkIndex, chunkBlob, totalChunks) => {
@@ -523,7 +609,8 @@ export async function uploadFile(file, options = {}) {
             try {
                 return await uploadSingleChunk(hash, chunkIndex, chunkBlob, totalChunks);
             } catch (error) {
-                if (attempt >= DOC_UPLOAD_RETRY_COUNT) {
+                const retryable = error?.retryable === true || error?.status === 408 || error?.status === 429 || error?.status >= 500;
+                if (!retryable || attempt >= DOC_UPLOAD_RETRY_COUNT) {
                     throw error;
                 }
             }
@@ -552,7 +639,10 @@ export async function uploadFile(file, options = {}) {
 
     const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
     const fileHash = await computeFileHash(file);
-    const resumeKey = `${RESUME_KEY_PREFIX}${fileHash}`;
+    const authScope = typeof window === 'undefined'
+        ? 'anonymous'
+        : (window.localStorage.getItem(AUTH_STORAGE_KEY) || 'anonymous').slice(-24);
+    const resumeKey = `${RESUME_KEY_PREFIX}${authScope}:${fileHash}`;
     const resumedState = readResumeState(resumeKey);
     const checkPayload = {
         hash: fileHash,
@@ -735,7 +825,8 @@ export async function uploadImage(file, options = {}) {
                 throw error;
             }
 
-            if (attempt >= retryCount) {
+            const retryable = error?.retryable || error?.status === 408 || error?.status === 429 || error?.status >= 500;
+            if (!retryable || attempt >= retryCount) {
                 throw error;
             }
         }

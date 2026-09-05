@@ -125,6 +125,7 @@ class TestCaseGenerator {
      * @returns {Promise<{ok: boolean, generated: object[], batchId: string, count: number, error?: string}>}
      */
     async generate(seeds = [], options = {}) {
+        const scope = options.scope || null;
         // ── 参数校验 ──
         if (!Array.isArray(seeds) || seeds.length === 0) {
             // 无种子时根据 category 使用内置模板
@@ -163,7 +164,7 @@ class TestCaseGenerator {
         ).join("\n\n");
 
         // ── 获取已有用例 ID 用于去重 ──
-        const existingIds = getGeneratedTestCaseIds({ category });
+        const existingIds = getGeneratedTestCaseIds({ category, scope });
         const existingHint = existingIds.length > 0
             ? `\n\n## 注意：以下已有用例 ID 请勿重复生成类似场景\n${existingIds.slice(0, 20).join(", ")}`
             : "";
@@ -213,16 +214,16 @@ ${seedBlock}
             const id = `gen_${category}_${String(seq).padStart(3, "0")}`;
 
             // 避免 ID 冲突 — 检查 DB 中是否已存在
-            const existing = this._idExists(id);
+            const existing = this._idExists(id, scope);
             if (existing) {
                 // 尝试加后缀
                 const altId = `gen_${category}_${String(seq).padStart(3, "0")}_${Date.now().toString(36).slice(-4)}`;
                 const tc = this._buildTestCase(altId, category, item, seedIds, batchId);
-                insertGeneratedTestCase(tc);
+                insertGeneratedTestCase({ ...tc, scope });
                 generated.push(tc);
             } else {
                 const tc = this._buildTestCase(id, category, item, seedIds, batchId);
-                insertGeneratedTestCase(tc);
+                insertGeneratedTestCase({ ...tc, scope });
                 generated.push(tc);
             }
         }
@@ -308,8 +309,8 @@ ${seedBlock}
     /**
      * 检查 DB 中是否已存在该 ID
      */
-    _idExists(id) {
-        return getGeneratedTestCaseById(id) !== null;
+    _idExists(id, scope = null) {
+        return getGeneratedTestCaseById(id, scope) !== null;
     }
 }
 

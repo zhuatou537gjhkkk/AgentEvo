@@ -1,10 +1,12 @@
 import Database from "better-sqlite3";
+import crypto from "node:crypto";
+import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const dbPath = path.resolve(__dirname, "../../agent_data.db");
+const dbPath = path.resolve(process.env.DB_PATH || path.resolve(__dirname, "../../agent_data.db"));
 
 const db = new Database(dbPath);
 db.pragma("journal_mode = WAL");
@@ -41,6 +43,7 @@ let deleteMessageMetricByMessageIdStmt = null;
 // ── Phase 5: 评估系统 prepared statements ──
 let insertTraceStmt = null;
 let selectTraceByTraceIdStmt = null;
+let selectTraceByOwnerStmt = null;
 let selectRecentTracesStmt = null;
 let insertEvalScoreStmt = null;
 let selectScoresByRunIdStmt = null;
@@ -77,13 +80,206 @@ let updateGeneratedTestCaseStmt = null;
 let deleteGeneratedTestCaseStmt = null;
 let selectGeneratedTestCaseIdsStmt = null;
 
+// W3.1-S1 scoped resource statements
+let selectUserTenantStmt = null;
+let insertEvalRunStmt = null;
+let selectEvalRunStmt = null;
+let completeEvalRunStmt = null;
+let insertConfigOverrideStmt = null;
+let selectConfigOverridesStmt = null;
+let selectConfigOverrideStmt = null;
+let deleteConfigOverrideStmt = null;
+let selectScopedConfigVersionsStmt = null;
+let selectScopedConfigVersionByIdStmt = null;
+let insertMCPConfigStmt = null;
+let selectMCPConfigsStmt = null;
+let selectMCPConfigStmt = null;
+let deleteMCPConfigStmt = null;
+let updateMCPConfigStatusStmt = null;
+
+// W3.3 chat idempotency records
+let insertChatIdempotencyStmt = null;
+let selectChatIdempotencyStmt = null;
+let updateChatIdempotencyStmt = null;
+let updateChatIdempotencyResultStmt = null;
+let updateChatIdempotencyUserMessageStmt = null;
+
 let defaultUserId = null;
+
+function normalizeScope(scope) {
+    if (!scope) return null;
+    const userId = Number(scope.userId ?? scope.ownerUserId ?? scope.id);
+    const tenantId = String(scope.tenantId || `user:${userId}`);
+    if (!Number.isInteger(userId) || userId <= 0 || !tenantId) return null;
+    return { userId, tenantId };
+}
+
+function requireScope(scope, label = "resource") {
+    const normalized = normalizeScope(scope);
+    if (!normalized) throw new Error(`${label} ownership is required`);
+    return normalized;
+}
+
+export function getDatabaseHealth() {
+    try {
+        const result = db.prepare("PRAGMA quick_check").get();
+        return { ok: String(result?.quick_check || "").toLowerCase() === "ok" };
+    } catch (error) {
+        return { ok: false, errorCode: "DATABASE_UNAVAILABLE" };
+    }
+}
+
+export function closeDB() {
+    if (db.open) db.close();
+}
+
+function scopeParams(scope) {
+    const normalized = normalizeScope(scope);
+    return normalized ? [normalized.userId, normalized.tenantId] : [];
+}
+
+function ensureColumn(tableName, columnName, definition) {
+    if (!getTableColumns(tableName).some((column) => column.name === columnName)) {
+        db.prepare(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`).run();
+    }
+}
 
 function hasTable(tableName) {
     const row = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
         .get(tableName);
     return Boolean(row);
+}
+
+function ensureScopedSchema(defaultUserId) {
+    const addColumn = (table, column, definition) => ensureColumn(table, column, definition);
+    addColumn("eval_traces", "tenant_id", "TEXT");
+    addColumn("eval_scores", "owner_user_id", "INTEGER");
+    addColumn("eval_scores", "tenant_id", "TEXT");
+    addColumn("eval_feedback", "tenant_id", "TEXT");
+    addColumn("eval_test_cases", "owner_user_id", "INTEGER");
+    addColumn("eval_test_cases", "tenant_id", "TEXT");
+    addColumn("optimization_log", "owner_user_id", "INTEGER");
+    addColumn("optimization_log", "tenant_id", "TEXT");
+    addColumn("agent_config_versions", "owner_user_id", "INTEGER");
+    addColumn("agent_config_versions", "tenant_id", "TEXT");
+    addColumn("agent_config_versions", "scope_type", "TEXT NOT NULL DEFAULT 'user'");
+
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_eval_traces_scope ON eval_traces(user_id, tenant_id, created_at)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_eval_scores_scope_run ON eval_scores(owner_user_id, tenant_id, run_id)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_eval_feedback_scope_msg ON eval_feedback(user_id, tenant_id, message_id)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_eval_cases_scope ON eval_test_cases(owner_user_id, tenant_id, category)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_optimization_scope ON optimization_log(owner_user_id, tenant_id, source_run_id)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_config_versions_scope ON agent_config_versions(owner_user_id, tenant_id, created_at)").run();
+
+    db.prepare(`CREATE TABLE IF NOT EXISTS eval_runs (
+        run_id TEXT PRIMARY KEY, owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL,
+        config_version_id INTEGER, status TEXT NOT NULL DEFAULT 'running',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP, completed_at DATETIME,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_eval_runs_scope ON eval_runs(owner_user_id, tenant_id, created_at)").run();
+
+    db.prepare(`CREATE TABLE IF NOT EXISTS agent_config_overrides (
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL, key TEXT NOT NULL,
+        value TEXT NOT NULL, description TEXT, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (owner_user_id, tenant_id, key), FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_config_overrides_scope ON agent_config_overrides(owner_user_id, tenant_id)").run();
+
+    db.prepare(`CREATE TABLE IF NOT EXISTS mcp_server_configs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+        scope_type TEXT NOT NULL DEFAULT 'user', owner_user_id INTEGER, tenant_id TEXT,
+        type TEXT NOT NULL DEFAULT 'user', command TEXT, args TEXT NOT NULL DEFAULT '[]',
+        cwd TEXT, env_refs TEXT NOT NULL DEFAULT '{}', enabled INTEGER NOT NULL DEFAULT 1,
+        connection_status TEXT NOT NULL DEFAULT 'disconnected', created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+    db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_configs_scope_name ON mcp_server_configs(scope_type, owner_user_id, tenant_id, name)").run();
+
+    db.prepare(`CREATE TABLE IF NOT EXISTS chat_idempotency (
+        owner_user_id INTEGER NOT NULL,
+        tenant_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'reserved',
+        stream_started INTEGER NOT NULL DEFAULT 0,
+        response_json TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (owner_user_id, tenant_id, idempotency_key),
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+    addColumn("chat_idempotency", "attempt_count", "INTEGER NOT NULL DEFAULT 1");
+    addColumn("chat_idempotency", "expires_at", "DATETIME");
+    addColumn("chat_idempotency", "user_message_id", "INTEGER");
+    addColumn("chat_idempotency", "assistant_message_id", "INTEGER");
+    addColumn("chat_idempotency", "failure_code", "TEXT");
+    addColumn("chat_idempotency", "attempt_token", "TEXT");
+    addColumn("chat_idempotency", "lease_expires_at", "DATETIME");
+    db.prepare("UPDATE chat_idempotency SET attempt_token = lower(hex(randomblob(16))), lease_expires_at = COALESCE(lease_expires_at, datetime('now', '+15 minutes')) WHERE attempt_token IS NULL AND status IN ('reserved', 'started')").run();
+    db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_idempotency_attempt_token ON chat_idempotency(attempt_token) WHERE attempt_token IS NOT NULL").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_chat_idempotency_updated ON chat_idempotency(owner_user_id, tenant_id, updated_at)").run();
+
+    db.prepare(`CREATE TABLE IF NOT EXISTS upload_quota_usage (
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL, usage_day TEXT NOT NULL,
+        committed_bytes INTEGER NOT NULL DEFAULT 0, reserved_bytes INTEGER NOT NULL DEFAULT 0,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (owner_user_id, tenant_id, usage_day),
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+    db.prepare(`CREATE TABLE IF NOT EXISTS upload_reservations (
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL, upload_key TEXT NOT NULL,
+        file_hash TEXT, file_name TEXT, total_chunks INTEGER, status TEXT NOT NULL DEFAULT 'active',
+        reserved_bytes INTEGER NOT NULL DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        expires_at DATETIME NOT NULL, usage_day TEXT NOT NULL DEFAULT '', updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (owner_user_id, tenant_id, upload_key),
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+    ensureColumn("upload_reservations", "usage_day", "TEXT NOT NULL DEFAULT ''");
+    db.prepare("UPDATE upload_reservations SET usage_day = substr(created_at, 1, 10) WHERE usage_day = '' OR usage_day IS NULL").run();
+    db.prepare(`CREATE TABLE IF NOT EXISTS upload_reservation_chunks (
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL, upload_key TEXT NOT NULL,
+        chunk_index INTEGER NOT NULL, byte_length INTEGER NOT NULL DEFAULT 0,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (owner_user_id, tenant_id, upload_key, chunk_index),
+        FOREIGN KEY (owner_user_id, tenant_id, upload_key)
+            REFERENCES upload_reservations(owner_user_id, tenant_id, upload_key) ON DELETE CASCADE
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_upload_reservations_expiry ON upload_reservations(status, expires_at)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_upload_reservations_scope ON upload_reservations(owner_user_id, tenant_id, status)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_upload_quota_usage_scope ON upload_quota_usage(owner_user_id, tenant_id, usage_day)").run();
+
+    const seedPath = path.resolve(__dirname, "../mcp/servers.json");
+    try {
+        const seeds = JSON.parse(fs.readFileSync(seedPath, "utf8")).servers || [];
+        const insertSeed = db.prepare(`INSERT OR IGNORE INTO mcp_server_configs
+            (name, scope_type, type, command, args, cwd, env_refs, enabled, connection_status)
+            VALUES (?, 'system', ?, ?, ?, ?, ?, ?, 'disconnected')`);
+        for (const seed of seeds) {
+            insertSeed.run(
+                String(seed.name || ""), String(seed.type || "mcp"),
+                seed.command ? String(seed.command) : null,
+                JSON.stringify(Array.isArray(seed.args) ? seed.args : []),
+                seed.cwd ? String(seed.cwd) : null,
+                JSON.stringify(seed.env && typeof seed.env === "object" ? seed.env : {}),
+                seed.enabled === false ? 0 : 1
+            );
+        }
+    } catch { /* optional system seed file */ }
+
+    // Import system seeds without exposing or persisting resolved secrets.
+    // Existing records are left untouched so repeated startup is idempotent.
+    const migrationAudit = db.prepare(`CREATE TABLE IF NOT EXISTS security_migration_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        migration TEXT NOT NULL UNIQUE,
+        details TEXT NOT NULL DEFAULT '{}',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+    migrationAudit.run();
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("W3.1-S1", JSON.stringify({ defaultUserId, policy: "unattributed legacy rows are not exposed by scoped queries" }));
+
 }
 
 function getTableColumns(tableName) {
@@ -203,6 +399,8 @@ export function initDB() {
     ensureSessionColumns();
 
     const ensuredDefaultUserId = ensureDefaultUser();
+    ensureColumn("users", "tenant_id", "TEXT");
+    db.prepare("UPDATE users SET tenant_id = ? || id WHERE tenant_id IS NULL OR TRIM(tenant_id) = ''").run("user:");
 
     updateLegacySessionUserStmt = db.prepare(
         "UPDATE sessions SET user_id = ? WHERE user_id IS NULL"
@@ -430,6 +628,10 @@ export function initDB() {
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_optimization_log_run ON optimization_log(source_run_id)`).run();
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_optimization_log_status ON optimization_log(status)`).run();
 
+    // Backfill scope columns after all legacy tables exist.
+    ensureScopedSchema(ensuredDefaultUserId);
+    // Legacy rows remain quarantined (NULL owner/tenant) until an explicit audit.
+
     // G10: optimization_log prepared statements
     if (!insertOptimizationLogStmt) {
         insertOptimizationLogStmt = db.prepare(
@@ -454,14 +656,85 @@ export function initDB() {
 
     if (!selectUserByUsernameStmt) {
         selectUserByUsernameStmt = db.prepare(
-            "SELECT id, username, password_hash, created_at FROM users WHERE username = ?"
+            "SELECT id, username, password_hash, tenant_id, created_at FROM users WHERE username = ?"
         );
     }
 
     if (!selectUserByIdStmt) {
         selectUserByIdStmt = db.prepare(
-            "SELECT id, username, created_at FROM users WHERE id = ?"
+            "SELECT id, username, tenant_id, created_at FROM users WHERE id = ?"
         );
+    }
+
+    if (!selectUserTenantStmt) {
+        selectUserTenantStmt = db.prepare("SELECT id, tenant_id FROM users WHERE id = ?");
+    }
+    if (!insertEvalRunStmt) {
+        insertEvalRunStmt = db.prepare(`INSERT INTO eval_runs (run_id, owner_user_id, tenant_id, config_version_id, status) VALUES (?, ?, ?, ?, ?)`);
+    }
+    if (!selectEvalRunStmt) {
+        selectEvalRunStmt = db.prepare("SELECT * FROM eval_runs WHERE run_id = ? AND owner_user_id = ? AND tenant_id = ?");
+    }
+    if (!completeEvalRunStmt) {
+        completeEvalRunStmt = db.prepare("UPDATE eval_runs SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE run_id = ? AND owner_user_id = ? AND tenant_id = ?");
+    }
+    if (!insertConfigOverrideStmt) {
+        insertConfigOverrideStmt = db.prepare(`INSERT INTO agent_config_overrides (owner_user_id, tenant_id, key, value, description, updated_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(owner_user_id, tenant_id, key) DO UPDATE SET value = excluded.value, description = COALESCE(excluded.description, agent_config_overrides.description), updated_at = CURRENT_TIMESTAMP`);
+    }
+    if (!selectConfigOverridesStmt) {
+        selectConfigOverridesStmt = db.prepare("SELECT key, value, description, updated_at FROM agent_config_overrides WHERE owner_user_id = ? AND tenant_id = ? ORDER BY key");
+    }
+    if (!selectConfigOverrideStmt) {
+        selectConfigOverrideStmt = db.prepare("SELECT key, value, description, updated_at FROM agent_config_overrides WHERE owner_user_id = ? AND tenant_id = ? AND key = ?");
+    }
+    if (!deleteConfigOverrideStmt) {
+        deleteConfigOverrideStmt = db.prepare("DELETE FROM agent_config_overrides WHERE owner_user_id = ? AND tenant_id = ? AND key = ?");
+    }
+    if (!selectScopedConfigVersionsStmt) {
+        selectScopedConfigVersionsStmt = db.prepare("SELECT id, source, label, created_at FROM agent_config_versions WHERE owner_user_id = ? AND tenant_id = ? ORDER BY id DESC LIMIT ?");
+    }
+    if (!selectScopedConfigVersionByIdStmt) {
+        selectScopedConfigVersionByIdStmt = db.prepare("SELECT id, snapshot, source, label, created_at FROM agent_config_versions WHERE id = ? AND owner_user_id = ? AND tenant_id = ?");
+    }
+    if (!insertMCPConfigStmt) {
+        insertMCPConfigStmt = db.prepare(`INSERT INTO mcp_server_configs (name, scope_type, owner_user_id, tenant_id, type, command, args, cwd, env_refs, enabled, connection_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    }
+    if (!selectMCPConfigsStmt) {
+        selectMCPConfigsStmt = db.prepare("SELECT * FROM mcp_server_configs WHERE (scope_type = 'system' OR (owner_user_id = ? AND tenant_id = ?)) ORDER BY scope_type, name");
+    }
+    if (!selectMCPConfigStmt) {
+        selectMCPConfigStmt = db.prepare("SELECT * FROM mcp_server_configs WHERE name = ? AND ((scope_type = 'system') OR (owner_user_id = ? AND tenant_id = ?)) LIMIT 1");
+    }
+    if (!deleteMCPConfigStmt) {
+        deleteMCPConfigStmt = db.prepare("DELETE FROM mcp_server_configs WHERE id = ? AND scope_type = 'user' AND owner_user_id = ? AND tenant_id = ?");
+    }
+    if (!updateMCPConfigStatusStmt) {
+        updateMCPConfigStatusStmt = db.prepare("UPDATE mcp_server_configs SET enabled = ?, connection_status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND ((scope_type = 'system') OR (owner_user_id = ? AND tenant_id = ?))");
+    }
+    if (!insertChatIdempotencyStmt) {
+        insertChatIdempotencyStmt = db.prepare(`INSERT INTO chat_idempotency
+            (owner_user_id, tenant_id, idempotency_key, request_hash, status, attempt_token, lease_expires_at)
+            VALUES (?, ?, ?, ?, 'reserved', ?, datetime('now', '+15 minutes'))`);
+    }
+    if (!selectChatIdempotencyStmt) {
+        selectChatIdempotencyStmt = db.prepare(`SELECT * FROM chat_idempotency
+            WHERE owner_user_id = ? AND tenant_id = ? AND idempotency_key = ?`);
+    }
+    if (!updateChatIdempotencyStmt) {
+        updateChatIdempotencyStmt = db.prepare(`UPDATE chat_idempotency SET
+            status = ?, stream_started = ?, response_json = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE owner_user_id = ? AND tenant_id = ? AND idempotency_key = ? AND attempt_token = ?`);
+    }
+    if (!updateChatIdempotencyResultStmt) {
+        updateChatIdempotencyResultStmt = db.prepare(`UPDATE chat_idempotency SET
+            status = ?, stream_started = ?, response_json = ?, assistant_message_id = ?, failure_code = ?, expires_at = datetime('now', '+15 minutes'), updated_at = CURRENT_TIMESTAMP
+            WHERE owner_user_id = ? AND tenant_id = ? AND idempotency_key = ? AND attempt_token = ? AND status = 'started'`);
+    }
+    if (!updateChatIdempotencyUserMessageStmt) {
+        updateChatIdempotencyUserMessageStmt = db.prepare(`UPDATE chat_idempotency SET
+            user_message_id = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE owner_user_id = ? AND tenant_id = ? AND idempotency_key = ?
+              AND (? IS NULL OR attempt_token = ?)`);
     }
 
     if (!touchSessionStmt) {
@@ -711,7 +984,9 @@ export function createUser(username, passwordHash) {
     }
 
     const result = insertUserStmt.run(safeUsername, safePasswordHash);
-    return Number(result.lastInsertRowid);
+    const userId = Number(result.lastInsertRowid);
+    db.prepare("UPDATE users SET tenant_id = ? WHERE id = ?").run(`user:${userId}`, userId);
+    return userId;
 }
 
 export function getUserByUsername(username) {
@@ -728,6 +1003,13 @@ export function getUserById(userId) {
     }
 
     return selectUserByIdStmt.get(Number(userId)) || null;
+}
+
+export function getUserScope(userId) {
+    if (!selectUserTenantStmt) initDB();
+    const row = selectUserTenantStmt.get(Number(userId));
+    if (!row) return null;
+    return { userId: Number(row.id), tenantId: String(row.tenant_id || `user:${row.id}`) };
 }
 
 export function createSession(userId, title) {
@@ -869,6 +1151,15 @@ export function saveMessageMetric(messageId, metrics = {}) {
         Number(metrics.total_tokens) || 0,
         String(metrics.model || "")
     );
+}
+
+/** Return one message only when it belongs to the requested user. */
+export function getMessageById(userId, messageId) {
+    if (!selectMessageByIdStmt) initDB();
+    const row = selectMessageByIdStmt.get(Number(messageId));
+    if (!row) return null;
+    const session = getSessionById(userId, row.session_id);
+    return session ? row : null;
 }
 
 export function createBranchSession(userId, sourceSessionId, fromMessageId, title, editedContent = "") {
@@ -1080,6 +1371,11 @@ function ensureEvalStatements() {
             `SELECT * FROM eval_traces WHERE trace_id = ?`
         );
     }
+    if (!selectTraceByOwnerStmt) {
+        selectTraceByOwnerStmt = db.prepare(
+            `SELECT * FROM eval_traces WHERE trace_id = ? AND user_id = ?`
+        );
+    }
     if (!selectRecentTracesStmt) {
         selectRecentTracesStmt = db.prepare(
             `SELECT et.trace_id, et.trace_type, et.agent_traversal_path, et.tool_call_count,
@@ -1092,8 +1388,8 @@ function ensureEvalStatements() {
     }
     if (!insertEvalScoreStmt) {
         insertEvalScoreStmt = db.prepare(
-            `INSERT INTO eval_scores (trace_id, message_id, test_case_id, run_id, dimension, score, judge_rationale, judge_model, score_type)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            `INSERT INTO eval_scores (trace_id, message_id, test_case_id, run_id, dimension, score, judge_rationale, judge_model, score_type, owner_user_id, tenant_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
     }
     if (!selectScoresByRunIdStmt) {
@@ -1238,15 +1534,35 @@ export function getAllAgentConfigValues() {
  * @param {string} [description]
  * @returns {boolean} 是否成功
  */
-export function setAgentConfigValue(key, value, defaultValue = null, description = null) {
+export function setAgentConfigValue(key, value, defaultValue = null, description = null, scope = null) {
     ensureAgentConfigStatements();
-    const result = upsertAgentConfigStmt.run(
+    const normalized = requireScope(scope, "configuration");
+    const result = insertConfigOverrideStmt.run(
+        normalized.userId,
+        normalized.tenantId,
         String(key),
         String(value),
-        defaultValue ? String(defaultValue) : null,
         description ? String(description) : null
     );
     return result.changes > 0;
+}
+
+export function getAgentConfigOverride(key, scope) {
+    ensureAgentConfigStatements();
+    const normalized = requireScope(scope, "scoped resource");
+    return selectConfigOverrideStmt.get(normalized.userId, normalized.tenantId, String(key)) || null;
+}
+
+export function getAgentConfigOverrides(scope) {
+    ensureAgentConfigStatements();
+    const normalized = requireScope(scope, "scoped resource");
+    return selectConfigOverridesStmt.all(normalized.userId, normalized.tenantId);
+}
+
+export function deleteAgentConfigOverride(key, scope) {
+    ensureAgentConfigStatements();
+    const normalized = requireScope(scope, "scoped resource");
+    return deleteConfigOverrideStmt.run(normalized.userId, normalized.tenantId, String(key)).changes > 0;
 }
 
 // ── Phase 6b G5: 配置版本管理 ──
@@ -1257,11 +1573,12 @@ export function setAgentConfigValue(key, value, defaultValue = null, description
  * @param {string} source — "manual" | "rollback"
  * @returns {number} version id
  */
-export function saveConfigSnapshot(snapshot, source = "manual") {
+export function saveConfigSnapshot(snapshot, source = "manual", scope = null) {
     ensureAgentConfigStatements();
+    const normalized = requireScope(scope, "configuration");
     const json = JSON.stringify(snapshot);
-    const result = insertConfigVersionStmt.run(json, source);
-    return result.lastInsertRowid;
+    db.prepare("INSERT INTO agent_config_versions (snapshot, source, owner_user_id, tenant_id, scope_type) VALUES (?, ?, ?, ?, 'user')").run(json, source, normalized.userId, normalized.tenantId);
+    return Number(db.prepare("SELECT last_insert_rowid() AS id").get().id);
 }
 
 /**
@@ -1269,9 +1586,10 @@ export function saveConfigSnapshot(snapshot, source = "manual") {
  * @param {number} limit — 最多返回条数
  * @returns {Array<{id: number, source: string, created_at: string}>}
  */
-export function listConfigVersions(limit = 20) {
+export function listConfigVersions(limit = 20, scope = null) {
     ensureAgentConfigStatements();
-    return selectConfigVersionsStmt.all(limit);
+    const normalized = requireScope(scope, "scoped resource");
+    return selectScopedConfigVersionsStmt.all(normalized.userId, normalized.tenantId, limit);
 }
 
 /**
@@ -1279,9 +1597,10 @@ export function listConfigVersions(limit = 20) {
  * @param {number} id — version id
  * @returns {{id: number, snapshot: object, source: string, created_at: string}|null}
  */
-export function getConfigVersion(id) {
+export function getConfigVersion(id, scope = null) {
     ensureAgentConfigStatements();
-    const row = selectConfigVersionByIdStmt.get(id);
+    const normalized = requireScope(scope, "scoped resource");
+    const row = selectScopedConfigVersionByIdStmt.get(id, normalized.userId, normalized.tenantId);
     if (!row) return null;
     try {
         row.snapshot = JSON.parse(row.snapshot);
@@ -1297,9 +1616,10 @@ export function getConfigVersion(id) {
  * @param {string} label — 新标签名
  * @returns {boolean}
  */
-export function updateConfigVersionLabel(id, label) {
+export function updateConfigVersionLabel(id, label, scope = null) {
     ensureAgentConfigStatements();
-    const result = updateConfigVersionLabelStmt.run(label || null, id);
+    const normalized = requireScope(scope, "scoped resource");
+    const result = db.prepare("UPDATE agent_config_versions SET label = ? WHERE id = ? AND owner_user_id = ? AND tenant_id = ?").run(label || null, id, normalized.userId, normalized.tenantId);
     return result.changes > 0;
 }
 
@@ -1308,9 +1628,10 @@ export function updateConfigVersionLabel(id, label) {
  * @param {number} id — version id
  * @returns {boolean}
  */
-export function deleteConfigVersion(id) {
+export function deleteConfigVersion(id, scope = null) {
     ensureAgentConfigStatements();
-    const result = deleteConfigVersionStmt.run(id);
+    const normalized = requireScope(scope, "scoped resource");
+    const result = db.prepare("DELETE FROM agent_config_versions WHERE id = ? AND owner_user_id = ? AND tenant_id = ?").run(id, normalized.userId, normalized.tenantId);
     return result.changes > 0;
 }
 
@@ -1647,9 +1968,15 @@ export function getRecentObservability(userId, limit = 30) {
  */
 export function saveTrace(trace = {}) {
     ensureEvalStatements();
+    const scope = normalizeScope(trace.scope || { userId: trace.userId, tenantId: trace.tenantId });
+    const userId = scope?.userId || Number(trace.userId);
+    const sessionId = Number(trace.sessionId);
+    if (!scope || !Number.isInteger(sessionId) || !getSessionById(userId, sessionId)) {
+        throw new Error("trace ownership is required");
+    }
     const result = insertTraceStmt.run(
-        Number(trace.userId) || defaultUserId,
-        Number(trace.sessionId) || 0,
+        userId,
+        sessionId,
         trace.messageId ? Number(trace.messageId) : null,
         String(trace.traceId || ""),
         trace.parentTraceId ? String(trace.parentTraceId) : null,
@@ -1661,6 +1988,7 @@ export function saveTrace(trace = {}) {
         trace.totalLatencyMs ? Number(trace.totalLatencyMs) : null,
         String(trace.model || "")
     );
+    db.prepare("UPDATE eval_traces SET tenant_id = ? WHERE trace_id = ? AND user_id = ?").run(scope.tenantId, String(trace.traceId || ""), userId);
     return result.lastInsertRowid;
 }
 
@@ -1670,11 +1998,12 @@ export function saveTrace(trace = {}) {
  * @param {number} limit
  * @returns {Array}
  */
-export function getRecentTraces(userId, limit = 30) {
+export function getRecentTraces(userId, limit = 30, scope = null) {
     ensureEvalStatements();
-    const safeUserId = Number(userId) || defaultUserId;
+    const normalized = normalizeScope(scope || { userId });
+    if (!normalized) return [];
     const safeLimit = Math.max(1, Math.min(200, Number(limit) || 30));
-    return selectRecentTracesStmt.all(safeUserId, safeLimit);
+    return db.prepare(`SELECT et.trace_id, et.trace_type, et.agent_traversal_path, et.tool_call_count, et.error_count, et.total_latency_ms, et.model, et.created_at FROM eval_traces et WHERE et.user_id = ? AND et.tenant_id = ? ORDER BY et.id DESC LIMIT ?`).all(normalized.userId, normalized.tenantId, safeLimit);
 }
 
 /**
@@ -1682,9 +2011,11 @@ export function getRecentTraces(userId, limit = 30) {
  * @param {string} traceId
  * @returns {object|null}
  */
-export function getTraceById(traceId) {
+export function getTraceById(traceId, userId = null, scope = null) {
     ensureEvalStatements();
-    return selectTraceByTraceIdStmt.get(String(traceId)) || null;
+    const normalized = normalizeScope(scope || (userId != null ? { userId } : null));
+    if (!normalized) return null;
+    return db.prepare("SELECT * FROM eval_traces WHERE trace_id = ? AND user_id = ? AND tenant_id = ?").get(String(traceId), normalized.userId, normalized.tenantId) || null;
 }
 
 // ── Phase 5: 评估分数 ──
@@ -1696,6 +2027,7 @@ export function getTraceById(traceId) {
  */
 export function saveEvalScore(score = {}) {
     ensureEvalStatements();
+    const scope = requireScope(score.scope || { userId: score.userId, tenantId: score.tenantId }, "evaluation");
     const result = insertEvalScoreStmt.run(
         score.traceId ? String(score.traceId) : null,
         score.messageId ? Number(score.messageId) : null,
@@ -1705,7 +2037,9 @@ export function saveEvalScore(score = {}) {
         Number(score.score) || 0,
         score.judgeRationale ? String(score.judgeRationale) : null,
         score.judgeModel ? String(score.judgeModel) : null,
-        String(score.scoreType || "offline")
+        String(score.scoreType || "offline"),
+        scope.userId,
+        scope.tenantId
     );
     return result.lastInsertRowid;
 }
@@ -1715,9 +2049,10 @@ export function saveEvalScore(score = {}) {
  * @param {string} runId
  * @returns {Array}
  */
-export function getScoresByRun(runId) {
+export function getScoresByRun(runId, scope = null) {
     ensureEvalStatements();
-    return selectScoresByRunIdStmt.all(String(runId));
+    const normalized = requireScope(scope, "scoped resource");
+    return db.prepare(`SELECT * FROM eval_scores WHERE run_id = ? AND owner_user_id = ? AND tenant_id = ? ORDER BY test_case_id, dimension`).all(String(runId), normalized.userId, normalized.tenantId);
 }
 
 /**
@@ -1725,9 +2060,10 @@ export function getScoresByRun(runId) {
  * @param {number} limit
  * @returns {Array}
  */
-export function getScoreTrends(limit = 30) {
+export function getScoreTrends(limit = 30, scope = null) {
     ensureEvalStatements();
-    const rows = selectScoreTrendsStmt.all(limit);
+    const normalized = requireScope(scope, "scoped resource");
+    const rows = db.prepare(`SELECT DATE(created_at) as date, dimension, ROUND(AVG(score), 2) as avg_score FROM eval_scores WHERE score_type = 'offline' AND owner_user_id = ? AND tenant_id = ? GROUP BY DATE(created_at), dimension ORDER BY date DESC LIMIT ?`).all(normalized.userId, normalized.tenantId, limit);
 
     // 按日期 pivot: {date, correctness, tool_usage, conciseness, safety}
     const byDate = new Map();
@@ -1746,9 +2082,10 @@ export function getScoreTrends(limit = 30) {
  * @param {number} limit
  * @returns {Array}
  */
-export function getScoreTrendsByRun(runId, limit = 30) {
+export function getScoreTrendsByRun(runId, limit = 30, scope = null) {
     ensureEvalStatements();
-    const rows = selectScoreTrendsByRunStmt.all(String(runId), limit);
+    const normalized = requireScope(scope, "scoped resource");
+    const rows = db.prepare(`SELECT DATE(created_at) as date, dimension, ROUND(AVG(score), 2) as avg_score FROM eval_scores WHERE score_type = 'offline' AND run_id = ? AND owner_user_id = ? AND tenant_id = ? GROUP BY DATE(created_at), dimension ORDER BY date DESC LIMIT ?`).all(String(runId), normalized.userId, normalized.tenantId, limit);
 
     const byDate = new Map();
     for (const row of rows) {
@@ -1764,9 +2101,10 @@ export function getScoreTrendsByRun(runId, limit = 30) {
  * 获取所有历史 run ID 列表
  * @returns {Array<{run_id: string, created_at: string}>}
  */
-export function getRunIds() {
+export function getRunIds(scope = null) {
     ensureEvalStatements();
-    return selectRunIdsStmt.all();
+    const normalized = requireScope(scope, "scoped resource");
+    return db.prepare(`SELECT run_id, MIN(created_at) as created_at FROM eval_scores WHERE score_type = 'offline' AND owner_user_id = ? AND tenant_id = ? GROUP BY run_id ORDER BY created_at DESC LIMIT 50`).all(normalized.userId, normalized.tenantId);
 }
 
 // ── Phase 5: 用户反馈 ──
@@ -1779,14 +2117,20 @@ export function getRunIds() {
  * @param {string} comment
  * @returns {boolean}
  */
-export function saveFeedback(userId, messageId, rating, comment = null) {
+export function saveFeedback(userId, messageId, rating, comment = null, scope = null) {
     ensureEvalStatements();
+    const normalized = requireScope(scope || { userId }, "feedback");
+    const ownedMessage = db.prepare(
+        `SELECT m.id FROM messages m JOIN sessions s ON s.id = m.session_id WHERE m.id = ? AND s.user_id = ?`
+    ).get(Number(messageId), Number(userId));
+    if (!ownedMessage) return false;
     const result = insertFeedbackStmt.run(
         Number(userId),
         Number(messageId),
         String(rating),
         comment ? String(comment) : null
     );
+    db.prepare("UPDATE eval_feedback SET tenant_id = ? WHERE user_id = ? AND message_id = ?").run(normalized.tenantId, normalized.userId, Number(messageId));
     return result.changes > 0;
 }
 
@@ -1808,9 +2152,11 @@ export function deleteFeedback(userId, messageId) {
  * @param {number} messageId
  * @returns {object|null}
  */
-export function getFeedbackByMessage(userId, messageId) {
+export function getFeedbackByMessage(userId, messageId, scope = null) {
     ensureEvalStatements();
-    return selectFeedbackByMessageStmt.get(Number(userId), Number(messageId)) || null;
+    const normalized = normalizeScope(scope || { userId });
+    if (!normalized) return null;
+    return db.prepare("SELECT rating, comment FROM eval_feedback WHERE user_id = ? AND tenant_id = ? AND message_id = ?").get(normalized.userId, normalized.tenantId, Number(messageId)) || null;
 }
 
 /**
@@ -1818,9 +2164,11 @@ export function getFeedbackByMessage(userId, messageId) {
  * @param {number} userId
  * @returns {{ thumbs_up: number, thumbs_down: number, total: number }}
  */
-export function getFeedbackSummary(userId) {
+export function getFeedbackSummary(userId, scope = null) {
     ensureEvalStatements();
-    const rows = selectFeedbackSummaryStmt.all(Number(userId));
+    const normalized = normalizeScope(scope || { userId });
+    if (!normalized) return { thumbs_up: 0, thumbs_down: 0, total: 0 };
+    const rows = db.prepare("SELECT rating, COUNT(*) as count FROM eval_feedback WHERE user_id = ? AND tenant_id = ? GROUP BY rating").all(normalized.userId, normalized.tenantId);
     const result = { thumbs_up: 0, thumbs_down: 0, total: 0 };
     for (const row of rows) {
         if (row.rating === "thumbs_up") result.thumbs_up = row.count;
@@ -1935,14 +2283,17 @@ export function insertGeneratedTestCase({
     reviewed = 0,
     sourceSeeds = [],
     genBatchId = null,
+    scope = null,
 }) {
+    const normalizedScope = normalizeScope(scope);
+    if (!normalizedScope) throw new Error("test case ownership is required");
     if (!insertGeneratedTestCaseStmt) {
         insertGeneratedTestCaseStmt = db.prepare(
-            `INSERT OR REPLACE INTO eval_test_cases
+            `INSERT INTO eval_test_cases
                 (id, category, difficulty, description, input, expected_behavior,
                  expected_tools, enable_web_search, code_checks,
-                 generated, reviewed, source_seeds, gen_batch_id, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
+                 generated, reviewed, source_seeds, gen_batch_id, owner_user_id, tenant_id, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
         );
     }
     return insertGeneratedTestCaseStmt.run(
@@ -1959,6 +2310,8 @@ export function insertGeneratedTestCase({
         reviewed ? 1 : 0,
         JSON.stringify(sourceSeeds),
         genBatchId,
+        normalizedScope.userId,
+        normalizedScope.tenantId,
     );
 }
 
@@ -1976,9 +2329,12 @@ export function getGeneratedTestCases({
     reviewed = null,
     page = 1,
     pageSize = 50,
+    scope = null,
 } = {}) {
-    let where = [];
-    let params = [];
+    const normalizedScope = normalizeScope(scope);
+    if (!normalizedScope) return [];
+    let where = ["owner_user_id = ?", "tenant_id = ?"];
+    let params = [normalizedScope.userId, normalizedScope.tenantId];
 
     if (category) {
         where.push("category = ?");
@@ -2010,13 +2366,15 @@ export function getGeneratedTestCases({
  * @param {string} id
  * @returns {object|null}
  */
-export function getGeneratedTestCaseById(id) {
+export function getGeneratedTestCaseById(id, scope = null) {
     if (!selectGeneratedTestCaseByIdStmt) {
         selectGeneratedTestCaseByIdStmt = db.prepare(
             "SELECT * FROM eval_test_cases WHERE id = ?"
         );
     }
-    const row = selectGeneratedTestCaseByIdStmt.get(id);
+    const normalizedScope = normalizeScope(scope);
+    if (!normalizedScope) return null;
+    const row = db.prepare("SELECT * FROM eval_test_cases WHERE id = ? AND owner_user_id = ? AND tenant_id = ?").get(id, normalizedScope.userId, normalizedScope.tenantId);
     if (!row) return null;
     return {
         ...row,
@@ -2032,7 +2390,9 @@ export function getGeneratedTestCaseById(id) {
  * @param {object} updates
  * @returns {boolean}
  */
-export function updateGeneratedTestCase(id, updates = {}) {
+export function updateGeneratedTestCase(id, updates = {}, scope = null) {
+    const normalizedScope = normalizeScope(scope);
+    if (!normalizedScope) return false;
     if (!updateGeneratedTestCaseStmt) {
         updateGeneratedTestCaseStmt = db.prepare(
             `UPDATE eval_test_cases
@@ -2044,7 +2404,7 @@ export function updateGeneratedTestCase(id, updates = {}) {
                  description = COALESCE(?, description),
                  reviewed = COALESCE(?, reviewed),
                  updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?`
+             WHERE id = ? AND owner_user_id = ? AND tenant_id = ?`
         );
     }
     const result = updateGeneratedTestCaseStmt.run(
@@ -2056,6 +2416,8 @@ export function updateGeneratedTestCase(id, updates = {}) {
         updates.description ?? null,
         updates.reviewed !== undefined ? (updates.reviewed ? 1 : 0) : null,
         id,
+        normalizedScope.userId,
+        normalizedScope.tenantId,
     );
     return result.changes > 0;
 }
@@ -2079,13 +2441,15 @@ export function approveGeneratedTestCases(ids) {
  * @param {string} id
  * @returns {boolean}
  */
-export function deleteGeneratedTestCase(id) {
+export function deleteGeneratedTestCase(id, scope = null) {
+    const normalizedScope = normalizeScope(scope);
+    if (!normalizedScope) return false;
     if (!deleteGeneratedTestCaseStmt) {
         deleteGeneratedTestCaseStmt = db.prepare(
-            "DELETE FROM eval_test_cases WHERE id = ?"
+            "DELETE FROM eval_test_cases WHERE id = ? AND owner_user_id = ? AND tenant_id = ?"
         );
     }
-    const result = deleteGeneratedTestCaseStmt.run(id);
+    const result = deleteGeneratedTestCaseStmt.run(id, normalizedScope.userId, normalizedScope.tenantId);
     return result.changes > 0;
 }
 
@@ -2096,9 +2460,11 @@ export function deleteGeneratedTestCase(id) {
  * @param {number|null} [filters.reviewed]
  * @returns {string[]}
  */
-export function getGeneratedTestCaseIds({ category = null, reviewed = null } = {}) {
-    let where = [];
-    let params = [];
+export function getGeneratedTestCaseIds({ category = null, reviewed = null, scope = null } = {}) {
+    const normalizedScope = normalizeScope(scope);
+    if (!normalizedScope) return [];
+    let where = ["owner_user_id = ?", "tenant_id = ?"];
+    let params = [normalizedScope.userId, normalizedScope.tenantId];
 
     if (category) {
         where.push("category = ?");
@@ -2153,6 +2519,204 @@ function ensureOptimizationLogStatements() {
  * @param {object} log
  * @returns {number} id
  */
+export function createEvalRun(runId, scope, configVersionId = null) {
+    if (!insertEvalRunStmt) initDB();
+    const normalized = normalizeScope(scope);
+    if (!normalized) throw new Error("evaluation ownership is required");
+    try {
+        insertEvalRunStmt.run(String(runId), normalized.userId, normalized.tenantId, configVersionId ? Number(configVersionId) : null, "running");
+    } catch (error) {
+        if (String(error?.code || "").includes("CONSTRAINT")) {
+            const conflict = new Error("evaluation run already exists");
+            conflict.code = "RESOURCE_CONFLICT";
+            conflict.statusCode = 409;
+            throw conflict;
+        }
+        throw error;
+    }
+    return getEvalRun(runId, normalized);
+}
+
+export function getEvalRun(runId, scope) {
+    if (!selectEvalRunStmt) initDB();
+    const normalized = normalizeScope(scope);
+    if (!normalized) return null;
+    return selectEvalRunStmt.get(String(runId), normalized.userId, normalized.tenantId) || null;
+}
+
+export function completeEvalRun(runId, scope, status = "completed") {
+    if (!completeEvalRunStmt) initDB();
+    const normalized = requireScope(scope, "scoped resource");
+    return completeEvalRunStmt.run(String(status), String(runId), normalized.userId, normalized.tenantId).changes > 0;
+}
+
+export function reserveChatIdempotency(scope, key, requestHash) {
+    if (!insertChatIdempotencyStmt) initDB();
+    const normalized = requireScope(scope, "chat idempotency");
+    const normalizedKey = String(key || "").trim();
+    const normalizedHash = String(requestHash || "").trim();
+    if (!normalizedKey || normalizedKey.length > 200 || !normalizedHash) {
+        throw new Error("invalid chat idempotency key");
+    }
+    const newAttemptToken = () => crypto.randomUUID();
+    try {
+        const attemptToken = newAttemptToken();
+        insertChatIdempotencyStmt.run(normalized.userId, normalized.tenantId, normalizedKey, normalizedHash, attemptToken);
+        db.prepare(`UPDATE chat_idempotency SET attempt_token = ?, lease_expires_at = datetime('now', '+15 minutes')
+            WHERE owner_user_id = ? AND tenant_id = ? AND idempotency_key = ? AND attempt_token IS NULL`)
+            .run(attemptToken, normalized.userId, normalized.tenantId, normalizedKey);
+        return { status: "reserved", requestHash: normalizedHash, attemptToken, created: true };
+    } catch (error) {
+        if (!String(error?.code || "").includes("CONSTRAINT")) throw error;
+        const existing = selectChatIdempotencyStmt.get(normalized.userId, normalized.tenantId, normalizedKey);
+        if (!existing) throw error;
+        if (existing.request_hash !== normalizedHash) return { status: "conflict", existing };
+        if (existing.status === "reserved" || existing.status === "started") {
+            // A process can crash after reserving or starting a request. Reclaim
+            // only an expired lease, and let SQLite's conditional UPDATE choose
+            // a single winner when multiple clients retry concurrently.
+            const attemptToken = newAttemptToken();
+            const reclaimed = db.prepare(`UPDATE chat_idempotency SET
+                status = 'reserved', stream_started = 0, response_json = NULL,
+                failure_code = NULL, attempt_count = COALESCE(attempt_count, 0) + 1,
+                attempt_token = ?, lease_expires_at = datetime('now', '+15 minutes'),
+                updated_at = CURRENT_TIMESTAMP
+                WHERE owner_user_id = ? AND tenant_id = ? AND idempotency_key = ?
+                  AND request_hash = ? AND status IN ('reserved', 'started')
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP)`)
+                .run(attemptToken, normalized.userId, normalized.tenantId, normalizedKey, normalizedHash);
+            if (reclaimed.changes > 0) {
+                return {
+                    status: "reserved",
+                    requestHash: normalizedHash,
+                    attemptToken,
+                    userMessageId: existing.user_message_id || null,
+                    reclaimed: true,
+                };
+            }
+
+            const current = selectChatIdempotencyStmt.get(normalized.userId, normalized.tenantId, normalizedKey);
+            return {
+                status: "started",
+                requestHash: current?.request_hash || normalizedHash,
+                streamStarted: Boolean(current?.stream_started),
+                attemptToken: current?.attempt_token || null,
+                userMessageId: current?.user_message_id || null,
+            };
+        }
+        if (existing.status === "failed") {
+            const attemptToken = newAttemptToken();
+            const claimed = db.prepare(`UPDATE chat_idempotency SET status = 'reserved', stream_started = 0,
+                response_json = NULL, failure_code = NULL, attempt_count = COALESCE(attempt_count, 0) + 1,
+                attempt_token = ?, lease_expires_at = datetime('now', '+15 minutes'), updated_at = CURRENT_TIMESTAMP
+                WHERE owner_user_id = ? AND tenant_id = ? AND idempotency_key = ? AND request_hash = ? AND status = 'failed'`)
+                .run(attemptToken, normalized.userId, normalized.tenantId, normalizedKey, normalizedHash);
+            if (claimed.changes === 0) return { status: "started", requestHash: normalizedHash };
+            return { status: "reserved", requestHash: normalizedHash, attemptToken, userMessageId: existing.user_message_id || null };
+        }
+        return {
+            status: existing.status,
+            requestHash: existing.request_hash,
+            streamStarted: Boolean(existing.stream_started),
+            userMessageId: existing.user_message_id || null,
+            response: existing.response_json ? safeJsonParse(existing.response_json, null) : null,
+        };
+    }
+}
+
+export function markChatIdempotencyStarted(scope, key, attemptToken) {
+    if (!updateChatIdempotencyStmt) initDB();
+    const normalized = requireScope(scope, "chat idempotency");
+    if (!attemptToken) return false;
+    return updateChatIdempotencyStmt.run("started", 1, null, normalized.userId, normalized.tenantId, String(key), String(attemptToken)).changes > 0;
+}
+
+export function completeChatIdempotency(scope, key, response = null, assistantMessageId = null, attemptToken = null) {
+    if (!updateChatIdempotencyResultStmt) initDB();
+    const normalized = requireScope(scope, "chat idempotency");
+    if (!attemptToken) return false;
+    return updateChatIdempotencyResultStmt.run(
+        "completed", 1, response == null ? null : JSON.stringify(response),
+        assistantMessageId == null ? null : Number(assistantMessageId), null,
+        normalized.userId, normalized.tenantId, String(key), String(attemptToken)
+    ).changes > 0;
+}
+
+export function failChatIdempotency(scope, key, failureCode = null, attemptToken = null) {
+    if (!updateChatIdempotencyResultStmt) initDB();
+    const normalized = requireScope(scope, "chat idempotency");
+    if (!attemptToken) return false;
+    return updateChatIdempotencyResultStmt.run(
+        "failed", 0, null, null, failureCode ? String(failureCode).slice(0, 80) : null,
+        normalized.userId, normalized.tenantId, String(key), String(attemptToken)
+    ).changes > 0;
+}
+
+export function setChatIdempotencyUserMessage(scope, key, messageId, attemptToken = null) {
+    if (!updateChatIdempotencyUserMessageStmt) initDB();
+    const normalized = requireScope(scope, "chat idempotency");
+    const token = attemptToken == null ? null : String(attemptToken);
+    return updateChatIdempotencyUserMessageStmt.run(
+        Number(messageId), normalized.userId, normalized.tenantId, String(key), token, token
+    ).changes > 0;
+}
+
+export function getChatIdempotency(scope, key) {
+    if (!selectChatIdempotencyStmt) initDB();
+    const normalized = requireScope(scope, "chat idempotency");
+    const row = selectChatIdempotencyStmt.get(normalized.userId, normalized.tenantId, String(key));
+    if (!row) return null;
+    return { ...row, stream_started: Boolean(row.stream_started), response: safeJsonParse(row.response_json, null) };
+}
+
+export function insertMCPServerConfig(config = {}, scope = null) {
+    if (!insertMCPConfigStmt) initDB();
+    const normalized = requireScope(scope, "MCP server");
+    const result = insertMCPConfigStmt.run(
+        String(config.name), "user", normalized.userId, normalized.tenantId,
+        "mcp", String(config.command || ""), JSON.stringify(config.args || []),
+        config.cwd ? String(config.cwd) : null,
+        JSON.stringify(config.env || {}), config.enabled === false ? 0 : 1,
+        config.connectionStatus || "connected"
+    );
+    return Number(result.lastInsertRowid);
+}
+
+export function listMCPServerConfigs(scope = null) {
+    if (!selectMCPConfigsStmt) initDB();
+    const normalized = requireScope(scope, "scoped resource");
+    return selectMCPConfigsStmt.all(normalized.userId, normalized.tenantId).map((row) => ({
+        ...row,
+        args: safeJsonParse(row.args, []),
+        env_refs: safeJsonParse(row.env_refs, {}),
+    }));
+}
+
+export function getMCPServerConfig(name, scope = null) {
+    if (!selectMCPConfigStmt) initDB();
+    const normalized = normalizeScope(scope);
+    if (!normalized) return null;
+    const row = selectMCPConfigStmt.get(String(name), normalized.userId, normalized.tenantId);
+    if (!row) return null;
+    return { ...row, args: safeJsonParse(row.args, []), env_refs: safeJsonParse(row.env_refs, {}) };
+}
+
+export function deleteMCPServerConfig(name, scope = null) {
+    if (!deleteMCPConfigStmt) initDB();
+    const normalized = requireScope(scope, "scoped resource");
+    const row = getMCPServerConfig(name, normalized);
+    if (!row || row.scope_type !== "user") return false;
+    return deleteMCPConfigStmt.run(row.id, normalized.userId, normalized.tenantId).changes > 0;
+}
+
+export function updateMCPServerConfigStatus(name, scope, enabled, status = "disconnected") {
+    if (!updateMCPConfigStatusStmt) initDB();
+    const normalized = requireScope(scope, "scoped resource");
+    const row = getMCPServerConfig(name, normalized);
+    if (!row || row.scope_type !== "user") return false;
+    return updateMCPConfigStatusStmt.run(enabled ? 1 : 0, String(status), row.id, normalized.userId, normalized.tenantId).changes > 0;
+}
+
 export function saveOptimizationLog({
     sourceRunId,
     targetRunId = null,
@@ -2164,9 +2728,13 @@ export function saveOptimizationLog({
     scoreBefore = null,
     scoreAfter = null,
     status = "applied",
+    scope = null,
 }) {
     if (!insertOptimizationLogStmt) initDB();
-    const result = insertOptimizationLogStmt.run(
+    const normalized = requireScope(scope, "optimization");
+    const result = db.prepare(`INSERT INTO optimization_log
+        (source_run_id, target_run_id, config_version_id, label, bad_case_ids, changes, suggestions, score_before, score_after, status, owner_user_id, tenant_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         String(sourceRunId),
         targetRunId ? String(targetRunId) : null,
         configVersionId ? Number(configVersionId) : null,
@@ -2176,7 +2744,9 @@ export function saveOptimizationLog({
         JSON.stringify(suggestions),
         scoreBefore ? JSON.stringify(scoreBefore) : null,
         scoreAfter ? JSON.stringify(scoreAfter) : null,
-        String(status)
+        String(status),
+        normalized.userId,
+        normalized.tenantId
     );
     return Number(result.lastInsertRowid);
 }
@@ -2186,9 +2756,10 @@ export function saveOptimizationLog({
  * @param {number} limit
  * @returns {Array}
  */
-export function getOptimizationLogs(limit = 20) {
+export function getOptimizationLogs(limit = 20, scope = null) {
     ensureOptimizationLogStatements();
-    const rows = selectOptimizationLogsStmt.all(limit);
+    const normalized = requireScope(scope, "scoped resource");
+    const rows = db.prepare("SELECT * FROM optimization_log WHERE owner_user_id = ? AND tenant_id = ? ORDER BY created_at DESC LIMIT ?").all(normalized.userId, normalized.tenantId, limit);
     return rows.map(row => ({
         ...row,
         bad_case_ids: safeJsonParse(row.bad_case_ids, []),
@@ -2204,9 +2775,11 @@ export function getOptimizationLogs(limit = 20) {
  * @param {number} id
  * @returns {object|null}
  */
-export function getOptimizationLogById(id) {
+export function getOptimizationLogById(id, scope = null) {
     ensureOptimizationLogStatements();
-    const row = selectOptimizationLogByIdStmt.get(id);
+    const normalized = normalizeScope(scope);
+    if (!normalized) return null;
+    const row = db.prepare("SELECT * FROM optimization_log WHERE id = ? AND owner_user_id = ? AND tenant_id = ?").get(id, normalized.userId, normalized.tenantId);
     if (!row) return null;
     return {
         ...row,
@@ -2224,15 +2797,36 @@ export function getOptimizationLogById(id) {
  * @param {object} updates
  * @returns {boolean}
  */
-export function updateOptimizationLog(id, { targetRunId, scoreAfter, status } = {}) {
+export function updateOptimizationLog(id, { targetRunId, scoreAfter, status } = {}, scope = null) {
     ensureOptimizationLogStatements();
-    const result = updateOptimizationLogStmt.run(
+    const normalized = requireScope(scope, "scoped resource");
+    const result = db.prepare(`UPDATE optimization_log
+        SET target_run_id = COALESCE(?, target_run_id), score_after = COALESCE(?, score_after), status = COALESCE(?, status)
+        WHERE id = ? AND owner_user_id = ? AND tenant_id = ?`).run(
         targetRunId ? String(targetRunId) : null,
         scoreAfter ? JSON.stringify(scoreAfter) : null,
         status || null,
-        id
+        id,
+        normalized.userId,
+        normalized.tenantId
     );
     return result.changes > 0;
+}
+
+export function getMigrationAuditSummary() {
+    const tableNames = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all().map((row) => row.name);
+    const nullableScopes = {};
+    for (const table of ["eval_traces", "eval_feedback", "eval_test_cases", "optimization_log", "agent_config_versions"]) {
+        if (!hasTable(table)) continue;
+        const columns = getTableColumns(table).map((column) => column.name);
+        const ownerColumn = columns.includes("owner_user_id") ? "owner_user_id" : (columns.includes("user_id") ? "user_id" : null);
+        const tenantColumn = columns.includes("tenant_id") ? "tenant_id" : null;
+        nullableScopes[table] = {
+            ownerNulls: ownerColumn ? Number(db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${ownerColumn} IS NULL`).get()?.count || 0) : null,
+            tenantNulls: tenantColumn ? Number(db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${tenantColumn} IS NULL`).get()?.count || 0) : null,
+        };
+    }
+    return { tables: tableNames, nullableScopes };
 }
 
 export default db;

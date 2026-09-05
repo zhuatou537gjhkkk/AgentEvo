@@ -59,6 +59,16 @@ describe('ToolRegistry', () => {
     // ═══════════════════════════════════════════════════════
 
     describe('registerMCPServer — 结构化工具', () => {
+        it('user-owned wrappers are visible only to matching scope', async () => {
+            const client = makeMockMCPClient([{ name: 'private_tool' }]);
+            connectToMCPServerMock.mockResolvedValue(client);
+            const owner = { userId: 7, tenantId: 'user:7' };
+            await registry.registerMCPServer({ name: 'private', command: 'mock', scope: owner });
+            expect(registry.getTool('private/private_tool', owner)).toBeDefined();
+            expect(registry.getTool('private/private_tool', { userId: 8, tenantId: 'user:8' })).toBeUndefined();
+            expect(registry.getAllTools({ userId: 8, tenantId: 'user:8' }).some(t => t.name.startsWith('private/'))).toBe(false);
+        });
+
         it('保留 inputSchema 并以对象参数调用 MCP Server', async () => {
             const client = makeMockMCPClient([
                 {

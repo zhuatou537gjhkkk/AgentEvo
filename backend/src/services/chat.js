@@ -3,6 +3,9 @@ import { saveMessage, getHistoryMessages } from "../db/index.js";
 import { agentTools, consumePendingQuestion, cancelAllPendingQuestions, setMemoryToolContext } from "../mcp/tools.js";
 import { TraceCollector } from "../trace/collector.js";
 import { OnlineEvaluator } from "../eval/online.js";
+import { toPublicError } from "./resilience.js";
+import { getRequestContext, withSessionContext } from "./requestContext.js";
+import { getSSEWriter } from "./sse.js";
 import {
     WEB_SEARCH_TOOL_NAME,
     FORCED_WEB_SEARCH_MAX_CHARS,
@@ -24,7 +27,9 @@ import {
 
 export { estimateTokens, resolveModelName, getModelContextWindow, buildChatOpenAIConfig, emitThought, toLangChainMessage, normalizeChunkContent, normalizeTemperature, resolveSystemPrompt, isCreativeTask, buildDirectAnswerSystemInstruction, streamDirectChat, getAgentExecutor, buildPrompt, buildHumanInputMessage, TOOL_ACTIVE_FORMS, PLAN_MODE_INSTRUCTION, WEB_SEARCH_TOOL_NAME, FORCED_WEB_SEARCH_MAX_CHARS, DEFAULT_SYSTEM_PROMPT, DEFAULT_TEMPERATURE } from "./chatUtils.js";
 
-export async function chatWithStream(userId, session_id, userMessage, image, systemPromptInput, temperatureInput, res, options = {}) {
+async function chatWithStreamImpl(userId, session_id, userMessage, image, systemPromptInput, temperatureInput, res, options = {}) {
+    const requestContext = { ...getRequestContext(), userId: Number(userId), sessionId: Number(session_id) };
+    const sseWriter = getSSEWriter(res, { requestId: requestContext?.requestId });
     const {
         enableWebSearch = false,
         skipUserMessageSave = false,
@@ -33,11 +38,25 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
         planMode = false,
         enableMemory = true,
         onComplete,
+        onFailure,
     } = options;
+    // W3.3-G: 深链路服务注入 — chatWithStream 内部读取的模块单例
+    // (saveMessage/getHistoryMessages/getAgentExecutor/streamDirectChat/
+    //  TraceCollector/OnlineEvaluator/agentTools) 优先从请求携带的实例 bag
+    //  (options.deps) 解析。生产 singleton 的 bag 不含这些键 → 全部回落模块
+    //  默认，行为不变；factory 请求命中 fake → 聊天链路的读写真正隔离。
+    const deps = options?.deps || null;
+    const persistMessage = deps?.db?.saveMessage || saveMessage;
+    const fetchHistory = deps?.db?.getHistoryMessages || getHistoryMessages;
+    const buildExecutor = deps?.getAgentExecutor || getAgentExecutor;
+    const directStream = deps?.streamDirectChat || streamDirectChat;
+    const makeTrace = deps?.createTraceCollector || (() => new TraceCollector());
+    const makeEval = deps?.createOnlineEvaluator || (() => new OnlineEvaluator());
+    const availableTools = deps?.agentTools || agentTools;
     const normalizedUserMessage = String(userMessage || "");
     // Phase 4: 设置 memory_tool 的当前用户上下文
     if (enableMemory) {
-        setMemoryToolContext(userId, session_id);
+        setMemoryToolContext(userId);
     }
     const temperature = normalizeTemperature(temperatureInput);
     let systemPrompt = resolveSystemPrompt(systemPromptInput);
@@ -53,7 +72,7 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
     const onClientClose = () => {
         clientDisconnected = true;
         // 清理所有未完成的用户提问
-        cancelAllPendingQuestions();
+        cancelAllPendingQuestions(requestContext);
         if (!abortController.signal.aborted) {
             console.log('[agent] client disconnected, aborting upstream stream');
             abortController.abort();
@@ -63,10 +82,10 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
     const cleanupDisconnect = () => { res.off('close', onClientClose); };
 
     if (!skipUserMessageSave) {
-        saveMessage(userId, session_id, "user", userMessageForStorage ?? normalizedUserMessage);
+        persistMessage(userId, session_id, "user", userMessageForStorage ?? normalizedUserMessage);
     }
 
-    const history = getHistoryMessages(userId, session_id, 10);
+    const history = fetchHistory(userId, session_id, 10);
     const formattedHistory = history.map(toLangChainMessage);
 
     // We pass the latest user message as input, so remove duplicated tail user message from chat_history.
@@ -85,7 +104,7 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
     const shouldBypassTools = isCreativeTask(normalizedUserMessage, systemPrompt) || hasImage || Boolean(forceModel);
 
     // Phase 5: Trace 采集 — 创建 TraceCollector，追踪完整请求路径
-    const traceCollector = new TraceCollector();
+    const traceCollector = makeTrace();
     const traceId = traceCollector.startTrace(userId, session_id, "chat", {
         input: normalizedUserMessage.slice(0, 200),
         enableWebSearch,
@@ -102,7 +121,7 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
         if (shouldBypassTools) {
             emitThought(res, hasImage ? "识别到图片输入，切换视觉理解模式" : "识别为直接回答任务，准备生成结果");
             const directSystemInstruction = buildDirectAnswerSystemInstruction(enableWebSearch, systemPrompt);
-            const { fullText: directText, usage: directUsage } = await streamDirectChat({
+            const { fullText: directText, usage: directUsage } = await directStream({
                 userMessage: normalizedUserMessage,
                 image,
                 formattedHistory,
@@ -113,8 +132,14 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                 abortController,
             });
             fullText = directText;
+            if (clientDisconnected || abortController.signal.aborted) {
+                onFailure?.(Object.assign(new Error("Request aborted"), { code: "ABORTED", statusCode: 499 }), { text: fullText });
+                res.end();
+                cleanupDisconnect();
+                return;
+            }
 
-            const assistantMessageId = saveMessage(userId, session_id, "assistant", fullText);
+            const assistantMessageId = persistMessage(userId, session_id, "assistant", fullText);
             // Phase 5: finish trace
             traceCollector.finishTrace(traceId, modelName, { messageId: assistantMessageId });
             // 优先使用真实 API usage，fallback 到 CJK-aware 估算
@@ -141,12 +166,12 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                     model: modelName,
                     trace_id: traceId,
                   };
-            onComplete?.(metrics);
+            onComplete?.(metrics, { text: fullText, messageId: assistantMessageId });
             emitThought(res, "回答生成完成", "done");
-            res.write("data: [DONE]\n\n");
+            sseWriter.done();
             // Phase 6a G1: 在线评估（异步采样）
             if (fullText) {
-                new OnlineEvaluator().maybeEvaluate({
+                makeEval().maybeEvaluate({
                     userId, sessionId: session_id, messageId: assistantMessageId,
                     userInput: normalizedUserMessage, assistantText: fullText,
                     toolCallNames: [],
@@ -159,7 +184,7 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
 
         if (enableWebSearch) {
             emitThought(res, "需要联网信息，正在准备搜索");
-            const webSearchTool = agentTools.find((tool) => tool.name === WEB_SEARCH_TOOL_NAME);
+            const webSearchTool = availableTools.find((tool) => tool.name === WEB_SEARCH_TOOL_NAME);
 
             if (webSearchTool) {
                 const forcedToolCallId = crypto.randomUUID();
@@ -167,15 +192,13 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                 console.log(
                     `[agent][tool_start][forced] at=${startedAt} id=${forcedToolCallId} name=${WEB_SEARCH_TOOL_NAME} input=${JSON.stringify(normalizedUserMessage)}`
                 );
-                res.write(
-                    `data: ${JSON.stringify({
-                        type: "tool_start",
-                        toolCallId: forcedToolCallId,
-                        toolName: WEB_SEARCH_TOOL_NAME,
-                        input: normalizedUserMessage,
-                        at: startedAt
-                    })}\n\n`
-                );
+                sseWriter.write({
+                    type: "tool_start",
+                    toolCallId: forcedToolCallId,
+                    toolName: WEB_SEARCH_TOOL_NAME,
+                    input: normalizedUserMessage,
+                    at: startedAt,
+                });
 
                 let forcedSearchOutput = "";
                 let forcedSearchError = null;
@@ -194,28 +217,24 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                     console.log(
                         `[agent][tool_error][forced] at=${endedAt} id=${forcedToolCallId} name=${WEB_SEARCH_TOOL_NAME} error=${forcedSearchError}`
                     );
-                    res.write(
-                        `data: ${JSON.stringify({
-                            type: "tool_error",
-                            toolCallId: forcedToolCallId,
-                            toolName: WEB_SEARCH_TOOL_NAME,
-                            error: forcedSearchError,
-                            at: endedAt
-                        })}\n\n`
-                    );
+                    sseWriter.write({
+                        type: "tool_error",
+                        toolCallId: forcedToolCallId,
+                        toolName: WEB_SEARCH_TOOL_NAME,
+                        error: "联网检索失败",
+                        at: endedAt,
+                    });
                 } else {
                     console.log(
                         `[agent][tool_end][forced] at=${endedAt} id=${forcedToolCallId} name=${WEB_SEARCH_TOOL_NAME} output=${JSON.stringify(forcedSearchOutput)}`
                     );
-                    res.write(
-                        `data: ${JSON.stringify({
-                            type: "tool_end",
-                            toolCallId: forcedToolCallId,
-                            toolName: WEB_SEARCH_TOOL_NAME,
-                            output: forcedSearchOutput.slice(0, 500),
-                            at: endedAt
-                        })}\n\n`
-                    );
+                    sseWriter.write({
+                        type: "tool_end",
+                        toolCallId: forcedToolCallId,
+                        toolName: WEB_SEARCH_TOOL_NAME,
+                        output: forcedSearchOutput.slice(0, 500),
+                        at: endedAt,
+                    });
                 }
 
                 if (forcedSearchOutput) {
@@ -232,7 +251,7 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
             // 联网模式：使用 Agent 编排工具调用
             emitThought(res, "正在调用模型生成回答");
 
-            const agentExecutor = await getAgentExecutor(true, temperature, systemPrompt, planMode);
+            const agentExecutor = await buildExecutor(true, temperature, systemPrompt, planMode);
             console.log(`[agent] model=${resolveModelName(false)} baseURL=${process.env.OPENAI_BASE_URL}`);
             const eventStream = await agentExecutor.streamEvents(
                 {
@@ -262,16 +281,14 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                     console.log(
                         `[agent][tool_start] id=${toolCallId} name=${toolName}`
                     );
-                    res.write(
-                        `data: ${JSON.stringify({
-                            type: "tool_start",
-                            toolCallId,
-                            toolName,
-                            input: event?.data?.input ?? {},
-                            at: toolStartedAt,
-                            activeForm: TOOL_ACTIVE_FORMS[toolName] || "正在执行...",
-                        })}\n\n`
-                    );
+                    sseWriter.write({
+                        type: "tool_start",
+                        toolCallId,
+                        toolName,
+                        input: event?.data?.input ?? {},
+                        at: toolStartedAt,
+                        activeForm: TOOL_ACTIVE_FORMS[toolName] || "正在执行...",
+                    });
 
                     // update_todo: 从 tool input 中提取任务计划并发射 todo_updated
                     if (toolName === "update_todo") {
@@ -293,34 +310,30 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                             }
                             const todos = Array.isArray(parsed?.todos) ? parsed.todos : [];
                             console.log(`[agent][todo_updated] count=${todos.length}`);
-                            res.write(
-                                `data: ${JSON.stringify({ type: "todo_updated", todos, at: toolStartedAt })}\n\n`
-                            );
+                            sseWriter.write({ type: "todo_updated", todos, at: toolStartedAt });
                         } catch (e) {
                             console.log(`[agent][todo_updated] parse error:`, e.message);
                         }
                     }
 
                     // 如果是 ask_user_question，延迟到 tool func 同步部分执行后发射提问事件
-                    // LangChain 的 on_tool_start 在 tool.func 执行前触发，直接 consumePendingQuestion() 会拿到 null
+                    // LangChain 的 on_tool_start 在 tool.func 执行前触发，直接 consumePendingQuestion(requestContext) 会拿到 null
                     if (event.name === "ask_user_question") {
                         const toolStartedAtCapture = toolStartedAt;
                         setImmediate(() => {
-                            const pending = consumePendingQuestion();
+                            const pending = consumePendingQuestion(requestContext);
                             if (pending) {
                                 console.log(
                                     `[agent][ask_user_question] id=${pending.questionId} type=${pending.questionType}`
                                 );
-                                res.write(
-                                    `data: ${JSON.stringify({
-                                        type: "ask_user_question",
-                                        questionId: pending.questionId,
-                                        question: pending.question,
-                                        questionType: pending.questionType,
-                                        options: pending.options,
-                                        at: toolStartedAtCapture,
-                                    })}\n\n`
-                                );
+                                sseWriter.write({
+                                    type: "ask_user_question",
+                                    questionId: pending.questionId,
+                                    question: pending.question,
+                                    questionType: pending.questionType,
+                                    options: pending.options,
+                                    at: toolStartedAtCapture,
+                                });
                             } else {
                                 console.log(`[agent][ask_user_question] consumePendingQuestion returned null!`);
                             }
@@ -344,15 +357,13 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                     console.log(
                         `[agent][tool_end] id=${toolCallId} name=${event.name || "unknown"}`
                     );
-                    res.write(
-                        `data: ${JSON.stringify({
-                            type: "tool_end",
-                            toolCallId,
-                            toolName: event.name || "unknown",
-                            output: typeof output === "string" ? output.slice(0, 500) : "",
-                            at: toolEndedAt
-                        })}\n\n`
-                    );
+                    sseWriter.write({
+                        type: "tool_end",
+                        toolCallId,
+                        toolName: event.name || "unknown",
+                        output: typeof output === "string" ? output.slice(0, 500) : "",
+                        at: toolEndedAt,
+                    });
                     continue;
                 }
 
@@ -369,15 +380,13 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                     console.log(
                         `[agent][tool_error] id=${toolCallId} name=${event.name || "unknown"} error=${errorMessage}`
                     );
-                    res.write(
-                        `data: ${JSON.stringify({
-                            type: "tool_error",
-                            toolCallId,
-                            toolName: event.name || "unknown",
-                            error: String(errorMessage),
-                            at: toolEndedAt
-                        })}\n\n`
-                    );
+                    sseWriter.write({
+                        type: "tool_error",
+                        toolCallId,
+                        toolName: event.name || "unknown",
+                        error: "工具执行异常",
+                        at: toolEndedAt,
+                    });
                     continue;
                 }
 
@@ -404,13 +413,13 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                 }
 
                 fullText += text;
-                res.write(`data: ${JSON.stringify({ type: "text", text })}\n\n`);
+                sseWriter.write({ type: "text", text });
             }
         } else {
             // 非联网模式：使用 Agent 编排（排除 web_search），支持 get_system_time / get_db_message_count 等工具
             emitThought(res, "正在调用模型生成回答");
 
-            const agentExecutor = await getAgentExecutor(false, temperature, systemPrompt, planMode);
+            const agentExecutor = await buildExecutor(false, temperature, systemPrompt, planMode);
             console.log(`[agent] model=${resolveModelName(false)} baseURL=${process.env.OPENAI_BASE_URL}`);
             const eventStream = await agentExecutor.streamEvents(
                 {
@@ -440,16 +449,14 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                     console.log(
                         `[agent][tool_start] id=${toolCallId} name=${toolName}`
                     );
-                    res.write(
-                        `data: ${JSON.stringify({
-                            type: "tool_start",
-                            toolCallId,
-                            toolName,
-                            input: event?.data?.input ?? {},
-                            at: toolStartedAt,
-                            activeForm: TOOL_ACTIVE_FORMS[toolName] || "正在执行...",
-                        })}\n\n`
-                    );
+                    sseWriter.write({
+                        type: "tool_start",
+                        toolCallId,
+                        toolName,
+                        input: event?.data?.input ?? {},
+                        at: toolStartedAt,
+                        activeForm: TOOL_ACTIVE_FORMS[toolName] || "正在执行...",
+                    });
 
                     // update_todo: 从 tool input 中提取任务计划并发射 todo_updated
                     if (toolName === "update_todo") {
@@ -471,34 +478,30 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                             }
                             const todos = Array.isArray(parsed?.todos) ? parsed.todos : [];
                             console.log(`[agent][todo_updated] count=${todos.length}`);
-                            res.write(
-                                `data: ${JSON.stringify({ type: "todo_updated", todos, at: toolStartedAt })}\n\n`
-                            );
+                            sseWriter.write({ type: "todo_updated", todos, at: toolStartedAt });
                         } catch (e) {
                             console.log(`[agent][todo_updated] parse error:`, e.message);
                         }
                     }
 
                     // 如果是 ask_user_question，延迟到 tool func 同步部分执行后发射提问事件
-                    // LangChain 的 on_tool_start 在 tool.func 执行前触发，直接 consumePendingQuestion() 会拿到 null
+                    // LangChain 的 on_tool_start 在 tool.func 执行前触发，直接 consumePendingQuestion(requestContext) 会拿到 null
                     if (event.name === "ask_user_question") {
                         const toolStartedAtCapture = toolStartedAt;
                         setImmediate(() => {
-                            const pending = consumePendingQuestion();
+                            const pending = consumePendingQuestion(requestContext);
                             if (pending) {
                                 console.log(
                                     `[agent][ask_user_question] id=${pending.questionId} type=${pending.questionType}`
                                 );
-                                res.write(
-                                    `data: ${JSON.stringify({
-                                        type: "ask_user_question",
-                                        questionId: pending.questionId,
-                                        question: pending.question,
-                                        questionType: pending.questionType,
-                                        options: pending.options,
-                                        at: toolStartedAtCapture,
-                                    })}\n\n`
-                                );
+                                sseWriter.write({
+                                    type: "ask_user_question",
+                                    questionId: pending.questionId,
+                                    question: pending.question,
+                                    questionType: pending.questionType,
+                                    options: pending.options,
+                                    at: toolStartedAtCapture,
+                                });
                             } else {
                                 console.log(`[agent][ask_user_question] consumePendingQuestion returned null!`);
                             }
@@ -522,15 +525,13 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                     console.log(
                         `[agent][tool_end] id=${toolCallId} name=${event.name || "unknown"}`
                     );
-                    res.write(
-                        `data: ${JSON.stringify({
-                            type: "tool_end",
-                            toolCallId,
-                            toolName: event.name || "unknown",
-                            output: typeof output === "string" ? output.slice(0, 500) : "",
-                            at: toolEndedAt
-                        })}\n\n`
-                    );
+                    sseWriter.write({
+                        type: "tool_end",
+                        toolCallId,
+                        toolName: event.name || "unknown",
+                        output: typeof output === "string" ? output.slice(0, 500) : "",
+                        at: toolEndedAt,
+                    });
                     continue;
                 }
 
@@ -547,15 +548,13 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                     console.log(
                         `[agent][tool_error] id=${toolCallId} name=${event.name || "unknown"} error=${errorMessage}`
                     );
-                    res.write(
-                        `data: ${JSON.stringify({
-                            type: "tool_error",
-                            toolCallId,
-                            toolName: event.name || "unknown",
-                            error: String(errorMessage),
-                            at: toolEndedAt
-                        })}\n\n`
-                    );
+                    sseWriter.write({
+                        type: "tool_error",
+                        toolCallId,
+                        toolName: event.name || "unknown",
+                        error: "工具执行异常",
+                        at: toolEndedAt,
+                    });
                     continue;
                 }
 
@@ -583,11 +582,18 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                 }
 
                 fullText += text;
-                res.write(`data: ${JSON.stringify({ type: "text", text })}\n\n`);
+                sseWriter.write({ type: "text", text });
             }
         }
 
-        const assistantMessageId = saveMessage(userId, session_id, "assistant", fullText);
+        if (clientDisconnected || abortController.signal.aborted) {
+            onFailure?.(Object.assign(new Error("Request aborted"), { code: "ABORTED", statusCode: 499 }), { text: fullText });
+            res.end();
+            cleanupDisconnect();
+            return;
+        }
+
+        const assistantMessageId = persistMessage(userId, session_id, "assistant", fullText);
         // Phase 5: finish trace
         const chatTrace = traceCollector.getTrace(traceId);
         const chatTraceToolCount = chatTrace?.toolCallCount || 0;
@@ -596,7 +602,7 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
 
         // Phase 6a G1: 在线评估（异步采样）
         if (fullText) {
-            new OnlineEvaluator().maybeEvaluate({
+            makeEval().maybeEvaluate({
                 userId, sessionId: session_id, messageId: assistantMessageId,
                 userInput: normalizedUserMessage, assistantText: fullText,
                 toolCallNames: chatTracePath.filter(t => !["router","synthesizer"].includes(t)),
@@ -626,24 +632,30 @@ export async function chatWithStream(userId, session_id, userMessage, image, sys
                 model: modelName,
                 trace_id: traceId,
               };
-        onComplete?.(metrics);
+        onComplete?.(metrics, { text: fullText, messageId: assistantMessageId });
         if (!clientDisconnected) {
             emitThought(res, "回答生成完成", "done");
-            res.write("data: [DONE]\n\n");
+            sseWriter.done();
         }
         res.end();
         cleanupDisconnect();
     } catch (error) {
         console.error(`[agent][fatal] message="${error.message}" stack="${error.stack}"`);
         // 清理所有未完成的用户提问
-        cancelAllPendingQuestions();
+        cancelAllPendingQuestions(requestContext);
         if (!clientDisconnected) {
             emitThought(res, "生成过程发生错误", "error");
-            res.write(
-                `data: ${JSON.stringify({ error: error.message || "stream failed" })}\n\n`
-            );
+            sseWriter.write(toPublicError(error, requestContext?.requestId));
         }
+        sseWriter.done();
         res.end();
         cleanupDisconnect();
+        onFailure?.(error, { text: fullText });
     }
+}
+
+export function chatWithStream(userId, session_id, userMessage, image, systemPromptInput, temperatureInput, res, options = {}) {
+    return withSessionContext(session_id, () => chatWithStreamImpl(
+        userId, session_id, userMessage, image, systemPromptInput, temperatureInput, res, options
+    ));
 }

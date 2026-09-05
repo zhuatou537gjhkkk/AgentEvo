@@ -16,6 +16,7 @@
 import { LLMJudge } from "./judge.js";
 import { saveEvalRunScores } from "./metrics.js";
 import crypto from "crypto";
+import { getUserScope } from "../db/index.js";
 
 /**
  * 从对话中构建简易 testCase（在线评估没有预设评测集）
@@ -77,6 +78,9 @@ class OnlineEvaluator {
      * @returns {boolean} 是否触发了评估
      */
     maybeEvaluate(params) {
+        const scope = params?.scope || getUserScope(params?.userId);
+        if (!scope) return false;
+        params = { ...params, scope };
         if (!this.enabled) {
             this._evalSkipped++;
             return false;
@@ -156,6 +160,7 @@ class OnlineEvaluator {
             // 写入 eval_scores 表（score_type='online'）
             saveEvalRunScores({
                 scores,
+                scope: params.scope || getUserScope(userId),
                 runId: effectiveRunId,
                 testCaseId: testCase.id,
                 judgeModel: this.judge.llm.model || "unknown",

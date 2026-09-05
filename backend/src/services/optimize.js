@@ -102,8 +102,8 @@ class OptimizationPipeline {
      * @param {string} runId — 评估 run ID
      * @returns {Promise<{runId: string, badCases: object[], summary: object}>}
      */
-    async analyze(runId) {
-        const rows = getScoresByRun(runId);
+    async analyze(runId, scope = null) {
+        const rows = getScoresByRun(runId, scope);
         if (!rows || rows.length === 0) {
             return { runId, badCases: [], summary: { total: 0, badCount: 0, byRootCause: {} } };
         }
@@ -156,7 +156,7 @@ class OptimizationPipeline {
             byRootCause[minDim].push(bc);
 
             // 丰富：附加测试用例描述信息
-            const tc = getTestCaseById(bc.testCaseId) || getGeneratedTestCaseById(bc.testCaseId);
+            const tc = getTestCaseById(bc.testCaseId) || getGeneratedTestCaseById(bc.testCaseId, scope);
             if (tc) {
                 bc.category = tc.category || "unknown";
                 bc.description = tc.description || tc.input || "";
@@ -189,7 +189,8 @@ class OptimizationPipeline {
      * @param {object[]} badCases — analyze() 返回的 badCases 数组
      * @returns {Promise<{suggestions: object[], summary: string, rawResponse: string}>}
      */
-    async suggest(runId, badCases) {
+    async suggest(runId, badCases, scope = null) {
+        if (!scope || getScoresByRun(runId, scope).length === 0) return { suggestions: [], summary: "评估记录不存在", rawResponse: "" };
         if (!badCases || badCases.length === 0) {
             return { suggestions: [], summary: "没有需要优化的 BadCase", rawResponse: "" };
         }
@@ -277,22 +278,22 @@ ${badCaseDescriptions}
      * @param {string} label — 本次优化的标签
      * @returns {Promise<{ok: boolean, logId: number, configVersionId: number}>}
      */
-    async apply(sourceRunId, changes, suggestions = [], badCaseIds = [], scoreBefore = null, label = "") {
+    async apply(sourceRunId, changes, suggestions = [], badCaseIds = [], scoreBefore = null, label = "", scope = null) {
         if (!changes || changes.length === 0) {
             return { ok: false, logId: null, configVersionId: null, error: "没有要应用的变更" };
         }
 
         try {
             // 1. 应用配置变更（skipSnapshot=true，统一在下面做快照）
-            const applyResult = agentConfig.setBatch(changes, true);
+            const applyResult = agentConfig.setBatch(changes, true, scope);
             if (applyResult.ok === 0) {
                 return { ok: false, logId: null, configVersionId: null, error: "所有配置变更均失败" };
             }
 
             // 2. 创建版本快照
-            const snap = agentConfig.snapshot();
+            const snap = agentConfig.snapshot(scope);
             const { saveConfigSnapshot } = await import("../db/index.js");
-            const configVersionId = saveConfigSnapshot(snap, "optimization");
+            const configVersionId = saveConfigSnapshot(snap, "optimization", scope);
 
             // 3. 保存优化日志
             const logId = saveOptimizationLog({
@@ -305,6 +306,7 @@ ${badCaseDescriptions}
                 scoreBefore,
                 scoreAfter: null,
                 status: "applied",
+                scope,
             });
 
             return { ok: true, logId, configVersionId };
@@ -323,14 +325,14 @@ ${badCaseDescriptions}
      * @param {string[]} testCaseIds — 要重评的测试用例 ID 列表
      * @returns {Promise<{ok: boolean, newRunId: string, logId: number}>}
      */
-    async reevaluate(optimizationLogId, testCaseIds) {
+    async reevaluate(optimizationLogId, testCaseIds, scope = null) {
         if (!testCaseIds || testCaseIds.length === 0) {
             return { ok: false, newRunId: null, logId: optimizationLogId, error: "没有测试用例" };
         }
 
         try {
             // 获取优化日志，拿到 source run
-            const log = getOptimizationLogById(optimizationLogId);
+            const log = getOptimizationLogById(optimizationLogId, scope);
             if (!log) {
                 return { ok: false, newRunId: null, logId: optimizationLogId, error: "优化日志不存在" };
             }
@@ -341,7 +343,7 @@ ${badCaseDescriptions}
             const invalidIds = [];
             for (const id of testCaseIds) {
                 const hardcoded = resolveById(id);
-                const generated = getGeneratedTestCaseById(id);
+                const generated = getGeneratedTestCaseById(id, scope);
                 if (hardcoded || generated) {
                     validIds.push(id);
                 } else {
@@ -374,7 +376,7 @@ ${badCaseDescriptions}
             console.log(
                 `[OptimizationPipeline] reevaluating ${validIds.length} test cases (${invalidIds.length} skipped) → runId=${newRunId}`
             );
-            const report = await runner.run(validIds, newRunId, { reflect: false });
+            const report = await runner.run(validIds, newRunId, { reflect: false, scope });
 
             // 计算优化后分数
             const scoreAfter = {
@@ -394,7 +396,7 @@ ${badCaseDescriptions}
                 targetRunId: newRunId,
                 scoreAfter,
                 status: "reevaluated",
-            });
+            }, scope);
 
             return {
                 ok: true,
@@ -419,11 +421,14 @@ ${badCaseDescriptions}
      * @param {string} afterRunId
      * @returns {Promise<object>}
      */
-    async compare(beforeRunId, afterRunId) {
+    async compare(beforeRunId, afterRunId, scope = null) {
         const dims = ["correctness", "tool_usage", "tool_quality", "conciseness", "safety"];
 
-        const beforeRows = getScoresByRun(beforeRunId);
-        const afterRows = getScoresByRun(afterRunId);
+        const beforeRows = getScoresByRun(beforeRunId, scope);
+        const afterRows = getScoresByRun(afterRunId, scope);
+        if (!scope || beforeRows.length === 0 || afterRows.length === 0) {
+            return { ok: false, error: "评估记录不存在" };
+        }
 
         const computeAvg = (rows) => {
             const byTc = {};
@@ -480,8 +485,8 @@ ${badCaseDescriptions}
      * @param {number} limit
      * @returns {Array}
      */
-    getHistory(limit = 20) {
-        return getOptimizationLogs(limit);
+    getHistory(limit = 20, scope = null) {
+        return getOptimizationLogs(limit, scope);
     }
 
     /**
@@ -489,8 +494,8 @@ ${badCaseDescriptions}
      * @param {number} id
      * @returns {object|null}
      */
-    getOne(id) {
-        return getOptimizationLogById(id);
+    getOne(id, scope = null) {
+        return getOptimizationLogById(id, scope);
     }
 
     // ── private ──

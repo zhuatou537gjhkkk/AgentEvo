@@ -5,6 +5,7 @@ import { queryKnowledgeBase } from "../rag/index.js";
 import { toolRegistry } from "./registry.js";
 import { MemoryService } from "../services/memory.js";
 import { agentConfig } from "../services/agentConfig.js";
+import { getRequestContext, getRequestUserId } from "../services/requestContext.js";
 
 // ── User Question Broker ──────────────────────────────────────
 // 管理 Agent 向用户提问的 Promise/deferred 注册表。
@@ -17,17 +18,17 @@ const pendingQuestions = new Map(); // questionId → { resolve, reject, timer, 
  * 由 ask_user_question 工具的 func 调用。
  * @returns {{ questionId: string, promise: Promise<string> }}
  */
-export function registerPendingQuestion(question, questionType, options = []) {
+export function registerPendingQuestion(question, questionType, options = [], context = null) {
     const questionId = crypto.randomUUID();
     let timer = null;
 
     const promise = new Promise((resolve, reject) => {
         timer = setTimeout(() => {
-            pendingQuestions.delete(questionId);
+            pendingQuestions.delete(String(questionId));
             resolve(JSON.stringify({ status: "timeout", answer: null }));
         }, 120_000); // 2 分钟超时
 
-        pendingQuestions.set(questionId, { resolve, reject, timer, question, questionType, options });
+        pendingQuestions.set(questionId, { resolve, reject, timer, question, questionType, options, context });
     });
 
     return { questionId, promise };
@@ -38,9 +39,12 @@ export function registerPendingQuestion(question, questionType, options = []) {
  * 返回 null 表示没有待发射的问题。
  * 工具调用是串行的，所以最近未发射的一定对应当前工具调用。
  */
-export function consumePendingQuestion() {
-    // 遍历找第一个未发射的（通常只有一个）
+export function consumePendingQuestion(context = null) {
+    // Only consume a question belonging to the current authenticated
+    // user/session; old callers without context retain legacy behavior.
     for (const [questionId, entry] of pendingQuestions) {
+        if (context?.userId && entry.context?.userId !== context.userId) continue;
+        if (context?.sessionId && entry.context?.sessionId && entry.context.sessionId !== context.sessionId) continue;
         if (!entry.emitted) {
             entry.emitted = true;
             return {
@@ -58,13 +62,19 @@ export function consumePendingQuestion() {
  * 用户回答了问题。由 REST 端点 POST /chat/answer 调用。
  * @returns {boolean} 是否成功 resolve
  */
-export function resolveUserQuestion(questionId, answer) {
-    const deferred = pendingQuestions.get(questionId);
+export function resolveUserQuestion(questionId, answer, context = null) {
+    const deferred = pendingQuestions.get(String(questionId));
     if (!deferred) {
         return false;
     }
+    if (context?.userId && deferred.context?.userId !== context.userId) {
+        return false;
+    }
+    if (context?.sessionId && deferred.context?.sessionId && deferred.context.sessionId !== context.sessionId) {
+        return false;
+    }
     clearTimeout(deferred.timer);
-    pendingQuestions.delete(questionId);
+    pendingQuestions.delete(String(questionId));
     deferred.resolve(JSON.stringify({ status: "answered", answer }));
     return true;
 }
@@ -73,12 +83,12 @@ export function resolveUserQuestion(questionId, answer) {
  * 清理指定 questionId（流异常结束时调用）。
  */
 export function cancelUserQuestion(questionId) {
-    const deferred = pendingQuestions.get(questionId);
+    const deferred = pendingQuestions.get(String(questionId));
     if (!deferred) {
         return false;
     }
     clearTimeout(deferred.timer);
-    pendingQuestions.delete(questionId);
+    pendingQuestions.delete(String(questionId));
     deferred.resolve(JSON.stringify({ status: "cancelled", answer: null }));
     return true;
 }
@@ -86,12 +96,14 @@ export function cancelUserQuestion(questionId) {
 /**
  * 清理所有未完成的提问（流结束时批量调用）。
  */
-export function cancelAllPendingQuestions() {
+export function cancelAllPendingQuestions(context = null) {
     for (const [questionId, deferred] of pendingQuestions) {
+        if (context?.userId && deferred.context?.userId !== context.userId) continue;
+        if (context?.sessionId && deferred.context?.sessionId && deferred.context.sessionId !== context.sessionId) continue;
         clearTimeout(deferred.timer);
         deferred.resolve(JSON.stringify({ status: "cancelled", answer: null }));
+        pendingQuestions.delete(questionId);
     }
-    pendingQuestions.clear();
 }
 
 const BOCHA_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -109,7 +121,7 @@ const getDbMessageCountTool = new DynamicTool({
     name: "get_db_message_count",
     description: "获取本地 SQLite 数据库中的历史对话总条数",
     func: async () => {
-        const stats = getMessageStats();
+        const stats = getMessageStats(getRequestUserId());
         return JSON.stringify(stats);
     }
 });
@@ -118,7 +130,7 @@ const searchKnowledgeBaseTool = new DynamicTool({
     name: "search_knowledge_base",
     description: "仅用于上传文档的事实问答（参数、负责人、定义、规则、引用证据）。若用户是创意写作任务（如标语、文案、命名、润色、头脑风暴），禁止调用此工具。若返回“当前知识库为空”或“未检索到相关知识片段”，必须停止继续调用。",
     func: async (input) => {
-        return queryKnowledgeBase(input);
+        return queryKnowledgeBase(input, getRequestUserId());
     }
 });
 
@@ -714,7 +726,7 @@ const askUserQuestionTool = new DynamicTool({
             : "text_input";
         const options = Array.isArray(parsed.options) ? parsed.options : [];
 
-        const { questionId, promise } = registerPendingQuestion(question, questionType, options);
+        const { questionId, promise } = registerPendingQuestion(question, questionType, options, getRequestContext());
 
         console.log(`[agent][ask_user] id=${questionId} type=${questionType} question="${question.slice(0, 80)}"`);
 
@@ -727,14 +739,13 @@ const askUserQuestionTool = new DynamicTool({
 
 /** 当前请求的 userId，由 chatGraph 在每次请求前设置 */
 let _memoryToolUserId = null;
-let _memoryToolSessionId = null;
 
 /**
  * 设置 memory_tool 的当前用户上下文（每次请求前由 chatGraph 调用）
  */
-export function setMemoryToolContext(userId, sessionId) {
+export function setMemoryToolContext(userId) {
+    // Legacy setter retained for tests/old callers; authenticated request context is authoritative.
     _memoryToolUserId = userId;
-    _memoryToolSessionId = sessionId;
 }
 
 const memoryTool = new DynamicTool({
@@ -757,9 +768,15 @@ const memoryTool = new DynamicTool({
             }
 
             const action = String(parsed.action || "search");
-            const userId = Number(parsed.userId || parsed.user_id || _memoryToolUserId || 1);
-            const sessionId = parsed.sessionId || parsed.session_id || _memoryToolSessionId || null;
-            console.log(`[memory_tool] action=${action} userId=${userId} sessionId=${sessionId} _ctxUserId=${_memoryToolUserId}`);
+            const requestContext = getRequestContext();
+            const testUserFallback = process.env.NODE_ENV === "test" || process.env.VITEST ? 1 : null;
+            const userId = getRequestUserId(_memoryToolUserId || testUserFallback);
+            const sessionId = requestContext?.sessionId || null;
+            if (!userId) {
+                return JSON.stringify({ ok: false, error: "REQUEST_CONTEXT_REQUIRED" });
+            }
+            // Identity fields from model input are intentionally ignored.
+            console.log(`[memory_tool] action=${action} userId=${userId} sessionId=${sessionId}`);
             const memory = new MemoryService(userId);
 
             switch (action) {

@@ -18,11 +18,12 @@ function cleanupExpired() {
     }
 }
 
-export function saveUploadedImage(buffer, mimeType) {
+export function saveUploadedImage(buffer, mimeType, ownerId = null) {
     cleanupExpired();
 
     const id = crypto.randomUUID();
     imageStore.set(id, {
+        ownerId: Number(ownerId) || null,
         createdAt: Date.now(),
         dataUrl: makeDataUrl(buffer, mimeType),
     });
@@ -30,7 +31,7 @@ export function saveUploadedImage(buffer, mimeType) {
     return id;
 }
 
-export function getUploadedImageDataUrl(id) {
+export function getUploadedImageDataUrl(id, ownerId = null) {
     if (!id) {
         return null;
     }
@@ -39,6 +40,11 @@ export function getUploadedImageDataUrl(id) {
 
     const item = imageStore.get(id);
     if (!item) {
+        return null;
+    }
+
+    const requestedOwner = Number(ownerId) || null;
+    if (item.ownerId !== requestedOwner) {
         return null;
     }
 
