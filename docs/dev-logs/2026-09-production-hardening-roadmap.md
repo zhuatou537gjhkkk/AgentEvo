@@ -299,3 +299,15 @@
 - [x] 验证：定向 **4/4**（一次通过）；全量 backend **35 files / 528 tests 全绿**（原 34/524，+1/+4）；`node --check` + `git diff --check` OK；dev 库不被触碰。零生产代码改动。
 - [ ] **残余/候选**：真实工具侧 flaky 集成缝（工具退避 abort 无独立集成测试）；LangChain `maxRetries:0` 与 withRetry 协调；rag/eval/mcp/bocha 余下接线；**W4-SSE 错误字段审计**（独立小波）；durable 同 key 跨进程锁（需分布式锁）、软点→404、组织 RBAC、多实例 RAG、W5-W8/P2 继续延后。
 
+## 22. W4-R3：一次收口 — 预算统一 + 余下接线 + SSE 错误终态 + bocha 瞬态真重试（2026-09-06）
+
+收口 W4 §2 余下项（R1 graph 主链 + R2 集成验收之后）；用户 3 决策：bocha transient 抛错 / legacy error 后无 [DONE] 对齐 graph / SSE 只修 #1+#3。完整记录见主日志 `2026-09-production-hardening.md` W4-R3 段。
+
+- [x] **C1 预算统一**：`buildChatOpenAIConfig` 默认 `maxRetries:0`（withRetry = 唯一重试预算层）；legacy `getAgentExecutor` 显式 `{maxRetries:2}`（整 executor withRetry 会重放工具副作用 → 保留模型层单层，注释注明）。`app.js` compaction ×2、`eval` generator/judge/optimize.suggest 的 raw `llm.invoke` 包 withRetry(retries:2)，耗尽可能回落的 `error/rationale/summary` 用 `toPublicError` 消息（provider secret 不写 DB）。
+- [x] **C1 MCP connect 有界超时（计划偏差）**：不用 withRetry 包 connect（Stdio 重 spawn 泄漏孤儿子进程）→ `Promise.race` 15s 握手超时 + transport.close。
+- [x] **C2 SSE #1**：`chat.js` catch 删无条件 `sseWriter.done()`，error 帧后 `res.end()`（对齐 graph；FE 不再把 [DONE] 当成功）。
+- [x] **C2 SSE #3**：`app.js` `chatImpl` async guarded —— `!headersSent` → JSON 500（显式改回 application/json content-type）；`headersSent` → `writeSseError`+`onFailure`+`end`。四个调用点一次改齐；pre-try 逃逸不再挂死。
+- [x] **C3 bocha 真重试**：`fetchBocha` 不再吞错 —— 429/408/5xx throw 带 status、10s abort → `UPSTREAM_TIMEOUT`、网络上抛走 cause 链、4xx 保持空结果；web_search 外层 catch `retryable → throw classified` 否则 public 字符串；chat.js 强制联网步 `withRetry(retries:1, signal)` + toPublicError 脱敏喂模型。graph searchAgent withRetry+fallback 由惰性转真重试。
+- [x] 测试 +4 文件 / +15 用例（budgetRetryWiring 5 / chatSseContract 2 / webSearchRetry 6 / chatForcedSearchRetry 2）。
+- [x] 全量 backend **39 files / 543 tests 全绿**（原 35/528，+4/+15）；frontend 9 files / 155 tests 保险复跑全绿；`node --check` + `git diff --check` OK；dev 库不被触碰。
+- [ ] **残余/延后**：SSE #2（streamEvents error 分支，延后专门 legacy 波）；真实工具 flaky 集成缝；durable 同 key 跨进程锁（需分布式锁）、软点→404、组织 RBAC、多实例 RAG、W5-W8/P2 继续延后。

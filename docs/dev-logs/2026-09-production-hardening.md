@@ -315,6 +315,31 @@ W4-R 全貌（withRetry 全链路 + 可靠性矩阵）拆 2 小波；本段 = **
 - **验证**：`node --check` OK；定向 **4/4**（一次通过，~12.6s）；全量 backend **35 files / 528 tests 全绿**（原 34/524，+1 文件/+4）；`git diff --check` exit=0；dev `agent_data.db` 不被触碰（sha/mtime 不变）。
 - **未覆盖/残余（下波候选，见 roadmap §21）**：真实工具侧（web_search/search_knowledge_base/registry MCP func）无法经 makeLlm seam 注入 flaky，工具 `invoke` 的 withRetry 退避只在纯语义单测覆盖（同 signal 机制，无独立集成缝）；LangChain `maxRetries` 与 withRetry 预算协调仍未做（共享 `buildChatOpenAIConfig`）；rag/eval/mcp-connect/bocha fetch 接线未做；SSE 错误字段审计 = 独立 W4-SSE 波。
 
+### W4-R3：一次收口 — 预算统一 + 余下接线 + SSE 错误终态 + bocha 瞬态真重试（2026-09-06）
+
+收口 W4 §2 余下项（R1 只做 graph 主链 + R2 集成验收）。3 路只读侦察 + 本人精读关键编辑区后，用户 3 个方向决策获确认：**①bocha transient 抛错启用真重试 ②legacy error 后无 [DONE]（对齐 graph）③SSE 只修 #1+#3，延后 #2（streamEvents error 分支）**。
+
+- **盘点发现（推翻 roadmap 若干假设）**：
+  - **预算叠乘**：LangChain/OpenAI SDK `maxRetries` 默认 2 且全库现设 0 处 → 与已接的 withRetry（graph/streamDirectChat）把一次上游故障放大到 ~9 次尝试。
+  - **bocha 惰性**：`fetchBocha` 把一切失败（5xx/超时/网络）吞成 `[]`，web_search 外层 catch 再转字符串 → 工具**从不 reject** → graph searchAgent :1241 与强制联网步的 withRetry 无从触发。
+  - **legacy [DONE] 误报成功**：chat.js catch 写 error envelope 后仍无条件 `sseWriter.done()`（graph 不写）→ FE 把 [DONE] 当成功。
+  - **SSE #3 挂死**：`chatWithStreamImpl` 内部 try(:118) 之前（getHistoryMessages 预取 :88）一抛即逃逸到 Express4（不转发 async rejection），SSE 头已 setHeader（:1807）→ socket 无 error 帧无 end 挂死；`writeSseError` 是死代码。
+  - **MCP connect 有界超时（计划偏差）**：最初计划 withRetry 包 connect，但 Stdio connect 重 spawn 会在重试时泄漏上一次尝试的存活子进程 → 改为 `Promise.race` 15s 有界握手超时（超时 close transport 杀子进程再抛），工具调用侧本就 withRetry。
+- **C1 预算统一 + 余下接线**：
+  - `chatUtils.js` `buildChatOpenAIConfig(hasImage, { maxRetries = 0 })`：**默认 `maxRetries:0`**（withRetry 成为唯一重试预算层）。`getAgentExecutor` 显式 `{ maxRetries: 2 }` —— legacy AgentExecutor **不能**整 executor withRetry（会重跑已执行工具的副作用），保留模型层内部单层（注释注明）。
+  - `app.js` compaction ×2（defaultBuildCompactionSummary + 路由内联）的 `llm.invoke` 包 withRetry(retries:2)。
+  - `eval/generator.js`、`eval/judge.js`、`services/optimize.js`(suggest) 的 raw `llm.invoke` 包 withRetry(retries:2)（在各自吞错回落**之前**），耗尽可能回落 `error/rationale/summary` 均改为 `toPublicError(err).message` —— provider secret 不再写进 DB。
+- **C2 SSE #1 + #3**：
+  - #1：`chat.js` catch 删除无条件 `sseWriter.done()`；错误路径（`!clientDisconnected`）写 toPublicError 帧后直接 `res.end()`（对齐 graph 语义）。
+  - #3：`app.js` `chatImpl` 改为 async guarded —— `!response.headersSent` → JSON 500 envelope（handler 已 `setHeader("Content-Type","text/event-stream")`，Express `res.json` 不会覆盖 → 显式 `setHeader("Content-Type","application/json")`，避免以 SSE content-type 返回 JSON body）；`headersSent` → `writeSseError` + `onFailure` + `end`。四个 `await chatImpl` 调用点一次改齐。
+- **C3 bocha transient 抛错（真重试）**：
+  - `mcp/tools.js` `fetchBocha` 不再吞 `[]`：`!response.ok` 中 429/408/5xx → 抛带 status 的 classifyable 错（其余 4xx 如 401 key 无效保持返回空）；catch 中 10s 自毁 AbortError → `createRetryableError("博查搜索超时", "UPSTREAM_TIMEOUT")`，网络/解析错误原样上抛（走 cause 链 ECONNRESET/ECONNREFUSED 等）。
+  - web_search 外层 catch：`classifyError(error).retryable` → `throw classified`（冒泡给 withRetry 真重试）；否则回落 `toPublicError(error).message` 字符串（agent 可继续）。
+  - `services/chat.js` 强制联网步 `webSearchTool.invoke` 包 `withRetry((_,sig)=>invoke(msg,{signal:sig}), {retries:1, signal: abortController.signal})`；raw 错误只进 console，喂给模型的回落文案用 toPublicError（防 secret 被模型 echo）。graph searchAgent 既有 withRetry+fallback（:1246-1250 `{ok:false,...message:"联网检索暂时不可用"}` + toolError）从"惰性"变为真重试。
+- **测试（+4 文件 / +15 用例）**：`services/budgetRetryWiring.test.js`(5：config 默认 0 / 显式覆盖 / vision 分支 / judge withRetry 真重试至成功 / 耗尽回落 public 错误无 secret)、`routes/chatSseContract.test.js`(2：legacy #3 pre-try 逃逸 → 干净 JSON 500 不挂死 / #1 streamDirectChat 失败 → error 帧**无 [DONE]** 且不落 assistant)、`mcp/webSearchRetry.test.js`(6：503/429/网络 cause 链/10s abort → reject 且 classifyable retryable；401/200 空 → resolve 空结果)、`routes/chatForcedSearchRetry.test.js`(2：强制步 flaky→invoke 2 次成功注入 / 恒 503→retries 耗尽 tool_error + public 回落文案、secret 不进 stream 不进 executor input)。
+- **验证**：`node --check` 全部改动文件通过；定向 4 组新测试全绿；全量 backend **39 files / 543 tests 全绿**（原 35/528，+4/+15）；frontend 9 files / 155 tests 全绿（本波未改前端，保险复跑）；`git diff --check` exit=0（仅预期 LF/CRLF 警告）；dev `agent_data.db` 不被触碰（W3.3-J per-worker 临时库）。
+- **残余（roadmap §22）**：SSE #2（streamEvents error 分支）延后专门 legacy 波；executor 预算保留模型层单层属设计决策；真实工具 flaky 集成缝仍缺；durable 同 key 跨进程锁、组织 RBAC、多实例 RAG、W5-W8/P2 继续延后。
+
 ## 回滚与遗留风险
 
 - 所有新增行为使用环境变量或兼容 fallback；必要时可关闭新开关并保留旧数据。
