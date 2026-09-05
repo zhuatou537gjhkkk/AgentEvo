@@ -392,7 +392,7 @@ function emitAgentStart(sse, state, agentType) {
 // 工具执行辅助：在 Agent 节点内手动执行工具调用并发射 SSE
 // ═══════════════════════════════════════════════════════
 
-async function executeToolCalls(toolCalls, agentType, sse, toolsMap, requestContext = getRequestContext()) {
+async function executeToolCalls(toolCalls, agentType, sse, toolsMap, requestContext = getRequestContext(), signal = requestContext?.signal) {
     const results = [];
     for (const toolCall of toolCalls) {
         const tool = toolsMap.get(toolCall.name);
@@ -413,7 +413,7 @@ async function executeToolCalls(toolCalls, agentType, sse, toolsMap, requestCont
         try {
             const toolResult = await withRetry(
                 (_, retrySignal) => tool.invoke(toolCall.args, { signal: retrySignal }),
-                { retries: 1, signal: requestContext?.signal }
+                { retries: 1, signal }
             );
             const output = normalizeChunkContent(toolResult);
             sse.toolEnd(toolCallId, toolCall.name, output, agentType);
@@ -1089,11 +1089,15 @@ ${hasTools ? `\n你可以使用以下系统工具：memory（记忆管理）、g
                         const toolCallId = tc.id || crypto.randomUUID();
                         sse?.toolStart(toolCallId, toolName, toolInputForSse, "general");
                         try {
-                            const result = await tool.invoke(toolInput);
+                            const result = await withRetry(
+                                (_, retrySignal) => tool.invoke(toolInput, { signal: retrySignal }),
+                                { retries: 1, signal }
+                            );
                             const resultStr = typeof result === "string" ? result : JSON.stringify(result);
                             sse?.toolEnd(toolCallId, toolName, resultStr, "general");
                             conversation.push(new ToolMessage({ content: resultStr, tool_call_id: tc.id || toolCallId, name: toolName }));
                         } catch (err) {
+                            if (signal?.aborted) throw err; // client disconnected — surface as cancellation
                             const safeToolError = "工具暂时不可用";
                             sse?.toolError(toolCallId, toolName, safeToolError, "general");
                             conversation.push(new ToolMessage({ content: JSON.stringify({ ok: false, data: null, errorCode: "TOOL_FAILED", message: safeToolError, retryable: Boolean(err?.retryable) }), tool_call_id: tc.id || toolCallId, name: toolName }));
@@ -1233,10 +1237,14 @@ async function searchAgentNode(state, config) {
 
     let searchResults = "";
     try {
-        const toolResult = await webSearchTool.invoke(query);
+        const toolResult = await withRetry(
+            (_, retrySignal) => webSearchTool.invoke(query, { signal: retrySignal }),
+            { retries: 1, signal }
+        );
         searchResults = normalizeChunkContent(toolResult).slice(0, FORCED_WEB_SEARCH_MAX_CHARS);
         sse.toolEnd(toolCallId, WEB_SEARCH_TOOL_NAME, searchResults, agentType);
     } catch (err) {
+        if (signal?.aborted) throw err; // client disconnected — surface as cancellation
         searchResults = JSON.stringify({ ok: false, data: null, errorCode: "MCP_TOOL_FAILED", message: "联网检索暂时不可用", retryable: Boolean(err?.retryable) });
         sse.toolError(toolCallId, WEB_SEARCH_TOOL_NAME, "联网检索暂时不可用", agentType);
     }
@@ -1418,7 +1426,7 @@ async function knowledgeAgentNode(state, config) {
         const toolCalls = firstResponse.tool_calls || firstResponse.additional_kwargs?.tool_calls || [];
 
         if (toolCalls.length > 0) {
-            const toolMessages = await executeToolCalls(toolCalls, agentType, sse, toolsMap, getRequestContext());
+            const toolMessages = await executeToolCalls(toolCalls, agentType, sse, toolsMap, getRequestContext(), signal);
             knowledgeResults = toolMessages.map(m => m.content).join("\n\n");
 
             // ── Solo 模式：LLM 基于检索结果生成最终回答 ──
@@ -1443,7 +1451,10 @@ async function knowledgeAgentNode(state, config) {
 
                 let fullText = "";
                 try {
-                    const stream = await summaryLlm.stream(summaryMessages, { signal });
+                    const stream = await withRetry(
+                        (_, retrySignal) => summaryLlm.stream(summaryMessages, { signal: retrySignal }),
+                        { retries: 2, signal }
+                    );
                     let summaryResponse;
                     for await (const chunk of stream) {
                         summaryResponse = summaryResponse ? summaryResponse.concat(chunk) : chunk;
@@ -1988,6 +1999,7 @@ async function toolExecutorNode(state, config) {
     let subTask = state.currentSubTask;
     const sse = config?.configurable?.sse;
     const agentType = "tool_executor";
+    const signal = config?.configurable?.abortSignal;
 
     // Phase 4: planMode=OFF 时 Planner 跳过，currentSubTask 可能为 null。
     // 对于动态 MCP 意图（如 filesystem），根据 intent 自动构造默认 subTask。
@@ -2074,6 +2086,7 @@ async function toolExecutorNode(state, config) {
         if (sse) sse.toolEnd(toolCallId, subTask.toolName, result, agentType);
         console.log(`[graph][tool_executor] subTask ${subTask.id} completed, result length=${result.length}`);
     } catch (err) {
+        if (signal?.aborted) throw err; // client disconnected — surface as cancellation, not a tool failure
         hasError = true;
         result = JSON.stringify({ ok: false, data: null, errorCode: "TOOL_FAILED", message: "工具暂时不可用", retryable: Boolean(err?.retryable) });
         console.log(`[graph][tool_executor] subTask ${subTask.id} failed: ${err.message}`);

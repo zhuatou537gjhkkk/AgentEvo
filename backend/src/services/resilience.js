@@ -1,5 +1,9 @@
 const RETRYABLE_CODES = new Set(["ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EAI_AGAIN", "UPSTREAM_UNAVAILABLE", "MCP_TRANSPORT_ERROR"]);
 
+// SDK-level timeout errors (e.g. OpenAI's APIConnectionTimeoutError) carry no
+// HTTP status/code — match on name so they retry instead of falling to INTERNAL_ERROR.
+const SDK_TIMEOUT_NAME = /(?:Timeout|TimeoutError|APIConnectionTimeoutError)$/i;
+
 export class AppError extends Error {
     constructor(message, { code = "INTERNAL_ERROR", statusCode = 500, retryable = false, cause } = {}) {
         super(message, { cause });
@@ -10,11 +14,29 @@ export class AppError extends Error {
     }
 }
 
+// Walk the cause chain for a retryable transport code. undici surfaces network
+// failures as `TypeError: fetch failed` whose real code (ECONNREFUSED/ETIMEDOUT/
+// ECONNRESET…) lives on `cause` (sometimes nested several levels deep).
+function findRetryableCauseCode(error) {
+    let current = error;
+    for (let depth = 0; current && depth < 5; depth += 1) {
+        const code = String(current?.code || "").toUpperCase();
+        if (RETRYABLE_CODES.has(code)) return code;
+        current = current?.cause;
+    }
+    return null;
+}
+
 export function classifyError(error) {
     if (error instanceof AppError) return error;
     const status = Number(error?.status || error?.statusCode || error?.response?.status || 0);
     const code = String(error?.code || "").toUpperCase();
-    const retryable = status === 408 || status === 425 || status === 429 || status >= 500 || RETRYABLE_CODES.has(code);
+    const hasHttpStatus = status > 0;
+    // A concrete HTTP status wins: only 408/425/429/5xx (or an explicit transport
+    // code) are retryable; a 4xx stays non-retryable even if it hides a network cause.
+    const retryable = hasHttpStatus
+        ? status === 408 || status === 425 || status === 429 || status >= 500 || RETRYABLE_CODES.has(code)
+        : RETRYABLE_CODES.has(code) || SDK_TIMEOUT_NAME.test(error?.name || "") || findRetryableCauseCode(error) != null;
     return new AppError(error?.message || "Request failed", {
         code: retryable ? "UPSTREAM_UNAVAILABLE" : (code || "INTERNAL_ERROR"),
         statusCode: status >= 400 && status < 600 ? status : 500,
