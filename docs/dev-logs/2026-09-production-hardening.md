@@ -220,6 +220,19 @@
 - 迁移 runbook（B7）：新增 `backend/scripts/migrate-db.mjs`（dry-run 只读审计；`--apply` = checkpoint → 自动备份 → 复用 db `initDB()` 幂等 additive 路径 → `security_migration_audit` 记 `migrate-db:apply:<ts>` → 复检；WAL busy 拒写、无库无 `--force` 拒绝、orphan 只报告）。runbook 见 `2026-09-db-migration-runbook.md`；工具测试 `src/db/migrateDb.test.js` 4 个（隔离临时库）。
 - A1 决策：evalRoutes 的 DB 单例 gap 在下游 4 模块（模块顶 import 真实 DB + optimize 模块加载即 new ChatOpenAI），路由层仅能半隔离；eval 为 admin-only + 离线，W3.1-S1 已加 owner scope + admin 门禁 → **深度注入（D2）延后**，作为已知残余记录，本轮不做 D1 半隔离切片。
 
+### W3.3-I：远程 CI 首次验证 + 红灯修复（idempotency 测试自治）（2026-09-05）
+
+- 远程 CI 首次验证：`24958d7` / `91beca4` / `8481c4f` 三条 commit 触发 `.github/workflows/ci.yml`。frontend job 三条全绿；backend job 三条全挂**同一测试** `src/db/idempotency.test.js`（`isolates the same key across owners`），错误 `SqliteError: FOREIGN KEY constraint failed`（code `SQLITE_CONSTRAINT_FOREIGNKEY`），run 秒级失败 —— 说明挂在测试阶段而非构建。
+- 根因（本地 `DB_PATH=<空库>` 定向复现，与 CI 完全一致）：
+  - 本项目 better-sqlite3 **默认 `PRAGMA foreign_keys = ON`**（最小实验确认：`:memory:` 建 users/child 后插 missing-parent 即抛 FK），且仓库代码从未显式关 FK；
+  - `chat_idempotency.owner_user_id` 建表带 `FOREIGN KEY → users(id)`；
+  - 原测试硬编码 scope `userId: 1 / 2`、不自建父行 → 本地绿只因 dev `agent_data.db` 里恰好有真人账号 id 1/2；
+  - CI 干净库只被 `initDB()` 自举出 demo 用户（AUTOINCREMENT 恰为 **id=1**）→ 前两个用例命中 demo 通过，跨 owner 用例的 `userId:2` 无父行 → FK 崩。
+  - 结论：测试不自治（依赖共享库历史残留），本地全量绿也无法暴露 —— 远程 CI 首战即抓到真实测试卫生缺陷。
+- 修复（`8d8c0f3`）：`idempotency.test.js` 改为自治 —— `beforeAll` 动态插入两个专属用户（真实 AUTOINCREMENT id + 唯一 username），`afterAll` 按 FK 顺序**先删 `chat_idempotency` 子行再删父用户**，不碰 demo 与其数据；根因写入文件头注释防复发。验证：`DB_PATH=<空库>` 全量 **32 files / 503 tests 绿**（最接近 CI 形态），dev 库 32/503 亦绿。
+- 远程复跑：`8d8c0f3` → backend + frontend 双 job **success**，CI 自此可作回归防线。
+- 遗留债务（系统性，见 roadmap §16 候选）：所有 db 单测共享同一真实形态 DB 文件，靠 FK ON + 恰好存在的父行续命，`idempotency` 只是首个撞枪者；根治 = 每 vitest worker/fork 独立临时库（setup 为每个 worker 设独立 `DB_PATH`），已列 roadmap 后续波次候选。
+
 ## 回滚与遗留风险
 
 - 所有新增行为使用环境变量或兼容 fallback；必要时可关闭新开关并保留旧数据。
