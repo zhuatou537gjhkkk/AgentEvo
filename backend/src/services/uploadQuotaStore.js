@@ -120,9 +120,22 @@ function createDurableAdapter() {
                     if (Number(active?.count) >= maxActiveUploads) {
                         throw quotaError("UPLOAD_CONCURRENCY_LIMIT", "too many active uploads", 429);
                     }
+                    // Tombstone rows keep their PK after settle/release/expiry (they
+                    // are never deleted), and upload_key is the content hash, so a
+                    // re-upload of the same bytes (or an inline-expiry retry in this
+                    // same transaction) must resurrect the row, not collide on it.
+                    // Tombsstones always have reserved_bytes=0 and their reservation
+                    // already deducted from usage, so resetting to a fresh active
+                    // reservation on today's usage_day leaks nothing.
                     db.prepare(`INSERT INTO upload_reservations
                         (owner_user_id, tenant_id, upload_key, status, reserved_bytes, expires_at, usage_day)
-                        VALUES (?, ?, ?, 'active', 0, datetime('now', ?), ?)`)
+                        VALUES (?, ?, ?, 'active', 0, datetime('now', ?), ?)
+                        ON CONFLICT(owner_user_id, tenant_id, upload_key) DO UPDATE SET
+                            status = 'active',
+                            reserved_bytes = 0,
+                            expires_at = excluded.expires_at,
+                            usage_day = excluded.usage_day,
+                            updated_at = CURRENT_TIMESTAMP`)
                         .run(scope.userId, scope.tenantId, key, `+${Math.ceil(ttlMs / 1000)} seconds`, day);
                 }
                 const previous = db.prepare(`SELECT byte_length FROM upload_reservation_chunks
