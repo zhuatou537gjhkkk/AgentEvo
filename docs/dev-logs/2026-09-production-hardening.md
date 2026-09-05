@@ -209,6 +209,17 @@
 - 验证：定向 3/3 通过；全量后端测试 30 files / 495 tests 通过；`node --check` 通过 chat.js/app.js/新测试；`git diff --check` exit=0。
 - 残留：chatGraph 各节点内联 ChatOpenAI 仍未注入（深链路仅覆盖 legacy chatWithStream）；agent 内部工具（`searchKnowledgeBaseTool`/`getDbMessageCountTool`）仍以模块单例 + request-context userId 解析，属用户级 scoped 而非 per-factory；evalRoutes 内部 DB 仍模块单例。
 
+### W3.3-H：chatGraph 节点 LLM 注入缝 + 迁移 runbook（2026-09-05）
+
+- 基线收口：全量加固 W0→W3.3-G 综合提交 `24958d7` 并推 origin/main（61 files / +6375 / −1169）；此前 `cea4e0b` 亦随附推送。backend 30/495、frontend 9/155 与双端 build 本地验证通过后提交。远程 CI 首次触发尚待人工确认（本地无 gh）。
+- chatGraph makeLlm 注入：app.js:1840 的 chatImpl wrapper 早已给 langgraph 与 legacy 两路都注入 `deps: instanceDeps`，但 `chatWithGraphImpl` 从未消费 `options.deps`，且 8 个节点直接 `new ChatOpenAI(...)`。本轮：
+  - 新增 `defaultMakeLlm(opts)`（`new ChatOpenAI({ ...opts, ...buildChatOpenAIConfig() })`）与 `resolveMakeLlm(config)`（取 `config.configurable.makeLlm`，缺省回落默认）；
+  - 8 处构造站点（router/planner/general/search/summary/knowledge/code/synthesizer）统一改 `resolveMakeLlm(config)({ modelName, temperature, ... })`，`buildChatOpenAIConfig()` 下沉进默认工厂 → 逐站行为不变；
+  - `chatWithGraphImpl` 从 `options?.deps?.services?.makeLlm || options?.deps?.makeLlm || defaultMakeLlm` 解析，并写入 graph `config.configurable.makeLlm`（与 sse/abortSignal 同缝）；生产 singleton bag 无该键 → 回落默认，零行为变化。
+  - 提交 `91beca4`；新增 `chatGraphMakeLlm.test.js`（解析语义 + 默认复刻 + 源码不变量：`new ChatOpenAI(` 全库仅 1 处、8 站点全走 seam、config 已携带 makeLlm）4 个通过；backend 31 files / 499 tests。
+- 迁移 runbook（B7）：新增 `backend/scripts/migrate-db.mjs`（dry-run 只读审计；`--apply` = checkpoint → 自动备份 → 复用 db `initDB()` 幂等 additive 路径 → `security_migration_audit` 记 `migrate-db:apply:<ts>` → 复检；WAL busy 拒写、无库无 `--force` 拒绝、orphan 只报告）。runbook 见 `2026-09-db-migration-runbook.md`；工具测试 `src/db/migrateDb.test.js` 4 个（隔离临时库）。
+- A1 决策：evalRoutes 的 DB 单例 gap 在下游 4 模块（模块顶 import 真实 DB + optimize 模块加载即 new ChatOpenAI），路由层仅能半隔离；eval 为 admin-only + 离线，W3.1-S1 已加 owner scope + admin 门禁 → **深度注入（D2）延后**，作为已知残余记录，本轮不做 D1 半隔离切片。
+
 ## 回滚与遗留风险
 
 - 所有新增行为使用环境变量或兼容 fallback；必要时可关闭新开关并保留旧数据。

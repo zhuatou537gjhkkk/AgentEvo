@@ -46,7 +46,7 @@
 
 - [ ] 增加单用户并发上传数、单文件总大小、每日/累计磁盘配额。
 - [x] 合并时禁止无限 `readFile`；采用流式大小校验，失败时清理临时目录（RAG 兼容入口仍可能保留文本内存态）。
-- [~] hash、user namespace、旧版本未完成上传兼容迁移策略已覆盖基础校验/用户目录和单测；迁移 runbook 与持久化审计仍待完成。
+- [~] hash、user namespace、旧版本未完成上传兼容迁移策略已覆盖基础校验/用户目录和单测；**迁移 runbook + 工具已交付**（见 §15），迁移审计 ledger 复用 `security_migration_audit`，durable quota 重启/锁/生产写入仍待验收。
 - [~] 已增加进程内 RAG tenant store 数量上限与大文件 segment cache 的数量/TTL 淘汰；重启丢失告警、字节级磁盘治理和多实例共享仍未完成。
 - [~] `/upload`、`/upload/chunk`、`/upload/merge` 已统一主要错误 code/status 并隐藏内部路径；全量 HTTP contract 矩阵仍待完成。
 
@@ -236,5 +236,13 @@
 - [x] 注入只覆盖 legacy `chatWithStream`；测试统一 `USE_LANGGRAPH=false`（本机 dotenv 默认开图），afterEach 还原。
 - [x] 回归：定向 3/3；全量后端测试 30 files / 495 tests 通过；syntax OK；`git diff --check` exit=0。
 - [ ] 残余：chatGraph 各节点内联 ChatOpenAI 未注入（深链路仅 legacy）；agent 内部工具（search_knowledge_base/get_db_message_count）为 request-context userId scoped 而非 per-factory；evalRoutes 内部 DB 仍模块单例；结构性搬移 + 移除 shadowed inline handlers 未做。
-- [ ] durable quota restart/lock/生产写入、migration ledger/runbook 仍未完成；组织 RBAC、持久 RAG、W4-W8/P2 继续延期。
+- [ ] durable quota restart/lock/生产写入 仍未验收；组织 RBAC、持久 RAG、W4-W8/P2 继续延期。
+
+## 15. W3.3-H：chatGraph makeLlm 注入 + W3.2-B 迁移 runbook（2026-09-05）
+
+- [x] 基线提交并推远程：全部加固 W0→W3.3-G 作为单 commit `24958d7`（61 files / +6375）已推 origin/main，远程 CI 首次触发待验证（本地无 gh，需人工或装 gh 确认 Actions run）。
+- [x] A2：chatGraph 8 个节点内联 ChatOpenAI 统一改为经 `config.configurable.makeLlm` 构造；`chatWithGraphImpl` 从 `options.deps` 解析 makeLlm（app.js:1840 早已给 langgraph 路径注入 deps，此前 impl 未消费）；默认回落 `defaultMakeLlm`（真实 ChatOpenAI + buildChatOpenAIConfig），生产零行为变化。提交 `91beca4`。离线 seam 单测（解析语义 + 默认复刻 + 源码不变量：仅 defaultMakeLlm 内 new ChatOpenAI）4 个；backend 31 files / 499 tests 全绿。
+- [x] B7：新增 `backend/scripts/migrate-db.mjs`（默认只读审计 dry-run；`--apply` = WAL checkpoint → 自动备份 → 复用 db `initDB()` 幂等 additive 迁移 → `security_migration_audit` 记 `migrate-db:apply:<ts>` → 只读复检）；WAL busy 拒绝、无库无 --force 拒绝、orphan 只报告。runbook 文档 `docs/dev-logs/2026-09-db-migration-runbook.md`。工具测试 `backend/src/db/migrateDb.test.js` 4 个（隔离临时库）。audit-db.mjs 保留。
+- [~] A1：侦察确认 evalRoutes 真正的"DB 单例"gap 在下游 metrics/runner/generator/optimize 模块顶 import 真实 DB（+ optimize 模块加载即 new ChatOpenAI），路由层 bag 只能半隔离（6 个纯 db 端点）；eval 为 admin-only + 离线工具，W3.1-S1 已加 owner scope + admin 门禁。**决策：延后 eval 深度注入（D2）**，不勾选"evalRoutes 内部 DB 已隔离"，作为已知残余保留；其唯一价值是 fake-db 测试可达性，ROI 低。
+- [ ] 残余未变：durable quota restart/cross-process lock/生产写入验收、完整 HTTP 双用户/并发矩阵（eval 维度待 deep injection 后补）、组织 RBAC、W4 全量 retries、W5-W8/P2。远程 CI 结果待确认。
 
