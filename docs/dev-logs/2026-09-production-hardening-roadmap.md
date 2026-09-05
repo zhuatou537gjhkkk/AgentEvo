@@ -46,7 +46,7 @@
 
 - [ ] 增加单用户并发上传数、单文件总大小、每日/累计磁盘配额。
 - [x] 合并时禁止无限 `readFile`；采用流式大小校验，失败时清理临时目录（RAG 兼容入口仍可能保留文本内存态）。
-- [~] hash、user namespace、旧版本未完成上传兼容迁移策略已覆盖基础校验/用户目录和单测；**迁移 runbook + 工具已交付**（见 §15），迁移审计 ledger 复用 `security_migration_audit`，durable quota 重启/锁/生产写入仍待验收。
+- [x] hash、user namespace、旧版本未完成上传兼容迁移策略已覆盖基础校验/用户目录和单测；迁移 runbook + 工具已交付（见 §15），ledger 复用 `security_migration_audit`；durable quota **restart 持久化 / 跨进程记账 / 生产写入 smoke** 已在 A1+A2 验收（见 §18）。唯一残余：**同 key 跨进程锁** 需分布式锁服务。
 - [~] 已增加进程内 RAG tenant store 数量上限与大文件 segment cache 的数量/TTL 淘汰；重启丢失告警、字节级磁盘治理和多实例共享仍未完成。
 - [~] `/upload`、`/upload/chunk`、`/upload/merge` 已统一主要错误 code/status 并隐藏内部路径；全量 HTTP contract 矩阵仍待完成。
 
@@ -134,7 +134,7 @@
 
 1. 阅读本文件和 `2026-09-production-hardening.md`，以主日志最新验证记录为准。
 2. 执行 `git status --short`，确认当前修改不被覆盖；本轮所有代码仍为未提交工作树变更。
-3. 当前波次执行 **W3.3-A + W3.2-A**：先完成威胁模型/迁移顺序，再建立最小 HTTP factory seam、持久化 upload reservation、限流与 SSE contract。
+3. durable quota 生产写入验收 + migrate `--apply` 真实落地已完成（**A1+A2**，见 §18）。下一候选波次：durable **同 key 跨进程锁**（需分布式锁服务），或完整 HTTP 双用户/并发矩阵（eval 维度待 D2 深度注入后补）。
 4. 为 durable quota 做 additive migration 前，先备份 SQLite/WAL、执行 integrity/orphan audit；默认只报告未知 orphan，不自动删除。
 5. 补 native HTTP contract、双用户隔离和并发测试，再运行 backend/frontend 完整测试与 build；不能用 unit test 代替矩阵验收。
 6. 当前 personal `tenant_id=user:<id>` 不代表组织 tenant/RBAC；不要先做 Skills Runtime、代码沙箱或 remote MCP。
@@ -258,4 +258,14 @@
 - [x] 动机：W3.3-I 只修单个测试；根本问题是整套测试共享 dev 库（db/index.js 导入时读一次 DB_PATH），且 memory×memory.tool 在共享库上互删 user1 行。
 - [x] 实现：新增 `backend/vitest.setup.js`（pool=forks+isolate 下每文件一进程；setupFiles 于文件导入前设 DB_PATH 到独立临时空库；不 import db 以免破坏 vi.mock；exit 尽力删除 + >1h 陈旧 sweep）；`vitest.config.js` 加 `setupFiles`；`check:syntax` 纳入 setup 文件。**零测试文件、零生产代码改动**。
 - [x] 验证：全量 32 files / 503 tests 绿；dev `agent_data.db` sha/mtime 逐字节不变（此前 memory 测试会写它）；memory+memory.tool 连跑 5× 绿；远程 CI 双 job success。完整记录见主日志 `2026-09-production-hardening.md` W3.3-J。
+
+## 18. A1+A2：durable quota 生产写入验收 + migrate runbook 真实落地（2026-09-05）
+
+关闭了 §15/§17（及更早波次）反复出现的 "durable quota restart/cross-process lock/生产写入仍未验收"。完整记录见主日志 `2026-09-production-hardening.md` A1+A2 段与 runbook §7。
+
+- [x] **durable reserve PK 复用修复**：`upload_key` = 内容 sha256，settle/release/expiry 后行保留为 tombstone → 同内容重传/同事务 inline-expiry 重试的裸 INSERT 撞 PK。修复：`uploadQuotaStore.js` `reserveUploadChunk` INSERT → UPSERT（复活 active、reserved_bytes=0、usage_day=今日）。修复前崩溃路径均有回归断言。
+- [x] 新增 `src/services/uploadQuotaDurable.test.js` 8 个（durable adapter on per-worker 临时库）+ `scripts/quota-worker.mjs` 子进程 harness：restart 持久化、跨进程记账、PK 复用×2、usage_day 跨 UTC 日、expiry cleanup、settle/release 记账。全量 backend **33 files / 511 tests 绿**；`check:syntax` 纳入被改生产文件与两个新 scripts。
+- [x] **HTTP durable 生产写入 smoke** `scripts/durable-upload-smoke.mjs`（真实 `/upload`、隔离临时库、`DURABLE_UPLOAD_QUOTA=true`、内置 embedding stub）：http 200 / committedBytes=194 / 0 active 残留，exit 0。
+- [x] **真实 dev 库 `migrate-db.mjs --apply` 首次落地**：备份 `backend/backups/agent_data-2026-09-05T15-56-52-057Z.db`、WAL 折叠、ledger +1（`migrate-db:apply:2026-09-05T15-56-52-073Z`）、integrity 复检 ok、quota 表仍 0 active reservations、`destructiveActions:false`。runbook §6 全勾并新增 §7 执行记录。`backups/*.db` 已被 gitignore，不污染工作树。
+- [ ] **残余（本轮不宣称解决）**：durable **同 key 跨进程锁** 需分布式锁服务（SQLite 只串行化记账事务；in-process `withUploadLock` 是唯一同 key 锁，adapter 注释已声明）。其余未变：eval 深度注入（D2，low ROI）、完整 HTTP 双用户/并发矩阵（eval 维度待 D2）、组织 RBAC、多实例 RAG、W4-W8/P2。
 

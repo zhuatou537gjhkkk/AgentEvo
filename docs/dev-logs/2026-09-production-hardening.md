@@ -248,6 +248,26 @@
   5. 远程 CI 双 job success。
 - 收益：任何测试**结构性不可能**依赖 dev 库残留；每次 `npm test` 等价于在干净 CI 形态下运行；roadmap DoD 的 "temporary SQLite" 从特例成为强制约定。
 
+### A1+A2：durable quota 生产写入验收 + migration runbook 真实落地（2026-09-05）
+
+- 范围：一次关掉 W3.2/W3.3 反复出现的 "durable quota restart/锁/生产写入仍未验收" 与 runbook §6 DoD；migrate `--apply` 首次在真实 dev 库执行（additive 落地，非演练）。
+- **代码修复 —— durable reserve 的 PK 复用**（`backend/src/services/uploadQuotaStore.js`）：`upload_key` = 内容 sha256；settle/release/expiry 后 reservation 行保留为 tombstone（reserved_bytes=0、已从 `upload_quota_usage` 扣除、chunks 已删），因此**同内容重传 / 同事务内 inline-expiry 后立即重试** 的裸 `INSERT` 会撞 `(owner_user_id, tenant_id, upload_key)` 主键。修复：`reserveUploadChunk` 的 INSERT 改为 UPSERT（`ON CONFLICT ... DO UPDATE` 把行复活为 `status='active'`、`reserved_bytes=0`、`usage_day=excluded(今日)`、刷新 `expires_at`）。活跃行过期仍先走既有 inline-expiry 回滚（先扣 usage 再复活），故不泄漏、不重复扣。tombstone 恒 reserved=0 且不占活跃并发名额 → 语义正确。
+- **新增 durable 测试** `backend/src/services/uploadQuotaDurable.test.js`（8 个，驱动真实 durable adapter，绑定 vitest 逐 worker 临时库，不动 dev 库）：
+  - reserve→settle / reserve→release 字节记账（usage_day 正确映射）；
+  - **PK 复用回归×2**：settle 后重传同内容、inline-expiry 后同流程立即重试（修复前均抛 PK 冲突）；断言单行复活 active、chunks 1、usage reserved 恰记一次；
+  - usage_day 跨 UTC 日：SQL 预置昨日 active reservation + usage，settle 计入昨日行（committed 100→130 / reserved 50→0），今日行不出现；
+  - expiry cleanup 归零 reserved 并保留 expired tombstone；
+  - restart 持久化：settle 后子进程重开同一文件读到 committed / usage 33（本 worker 无 close/reopen 路径，用独立连接证明落盘）；
+  - 跨进程并发：两个子进程对 owner1/owner2 各 reserve+settle 100，全部 exit 0、usage 各自 committed 100、无 active 残留、`PRAGMA integrity_check=ok`。
+  - 新 harness `backend/scripts/quota-worker.mjs`（读 `DB_PATH`、argv 给 owner/tenant/key/size、驱动真实 durable adapter）供上两项使用。
+- **HTTP durable 生产写入 smoke** `backend/scripts/durable-upload-smoke.mjs`（不进 CI gate，验收时手工跑并留档）：自 spawn 模式 —— 子进程 `--serve` 走真实 `startServer()`（`DURABLE_UPLOAD_QUOTA=true`）指向隔离临时库，父进程内置 OpenAI 兼容 embedding stub（`OPENAI_EMBEDDING_BASE_URL` 指向它）保证 RAG 索引确定性成功，再经真实 HTTP `/auth/register` + multipart `/upload` 驱动 `withUploadLock → reserve → processAndStoreDocument → settle`。实测：`http 200`、`committedBytes=194`、`committedRows=1`、`activeReservationsLeft=0`、exit 0。隔离库不含任何 dev 数据；子进程内存态 RAG store 不落库不写盘。
+- **全量回归**：`backend npm run check:syntax` 绿（含 `uploadQuotaStore.js` 与两个新 scripts）；`backend npm test` **33 files / 511 tests 全绿**。
+- **migrate runbook 真实落地**（`backend/scripts/migrate-db.mjs --apply` 于 dev `agent_data.db`，先确认无 3000/5173 写进程）：
+  - apply 前只读基线（dry-run）：integrity `["ok"]`、21 tables、ledger `[W3.1-S1]`、scope-null 全 0、orphanCandidates `[]`；主库 5,324,800 B + `-wal` 4,128,272 B + `-shm` 32,768 B；`backups/` 不存在。
+  - `--apply` 实测：`ok:true`、`integrity:["ok"]`、21 tables、`destructiveActions:false`、`backupFiles:[backend/backups/agent_data-2026-09-05T15-56-52-057Z.db]`（5,337,088 B）、`ledgerEntry:migrate-db:apply:2026-09-05T15-56-52-073Z`。
+  - 复检：dry-run ledger 现 2 行（W3.1-S1 + apply 条目）；`-wal` 折叠为 0、主库 5,337,088 B；`audit-db` `activeReservations:[]`、integrity ok。`backups/*.db` 被根 `.gitignore` 的 `*.db*` 忽略，不污染 git 工作树（已验证 `git status --short` 仅源码改动）。
+- **残余（写入 roadmap §18）**：durable **同 key 跨进程锁** 仍需分布式锁服务 —— SQLite 只串行化记账事务，in-process `withUploadLock` 仍是唯一同 key 锁（adapter 注释 232-236 已声明）；eval 深度注入（D2）继续延后（admin-only + 离线，low ROI）；组织 RBAC、多实例 RAG、W4-W8/P2 未宣称。
+
 ## 回滚与遗留风险
 
 - 所有新增行为使用环境变量或兼容 fallback；必要时可关闭新开关并保留旧数据。

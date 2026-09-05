@@ -70,9 +70,22 @@ node scripts/migrate-db.mjs               # ledger 全量 + scope-null 审计
 
 ## 6. 验收门槛（对应 roadmap DoD）
 
-- [ ] 只读 pre-check / 复检均跑 `PRAGMA integrity_check`。
-- [ ] `--apply` 前自动备份；已有库时 `backupFiles` 非空。
-- [ ] 重复 `--apply` 幂等（表数不变，ledger 每次 +1 行唯一条目）。
-- [ ] 未知 orphan 只报告，不删除（`destructiveActions:false` 恒真）。
-- [ ] 不存在的库无 `--force` 时拒绝（`DB_NOT_FOUND`）。
-- [ ] 测试：`backend/src/db/migrateDb.test.js`（隔离临时库，CI 可跑）。
+- [x] 只读 pre-check / 复检均跑 `PRAGMA integrity_check`。
+- [x] `--apply` 前自动备份；已有库时 `backupFiles` 非空。
+- [x] 重复 `--apply` 幂等（表数不变，ledger 每次 +1 行唯一条目）。
+- [x] 未知 orphan 只报告，不删除（`destructiveActions:false` 恒真）。
+- [x] 不存在的库无 `--force` 时拒绝（`DB_NOT_FOUND`）。
+- [x] 测试：`backend/src/db/migrateDb.test.js`（隔离临时库，CI 可跑）。
+
+## 7. 首次真实生产 `--apply` 执行记录（2026-09-05）
+
+在真实 dev 库 `backend/agent_data.db` 上执行本 runbook §3.1 的例行流程（此前仅在隔离临时库演练）。执行前确认无 3000/5173 写进程（`WAL busy>0` 拒写是第二道闸）。
+
+1. **只读 pre-check**（`node scripts/migrate-db.mjs`）：`ok:true`、`integrity:["ok"]`、`tableCount:21`、`ledger:[W3.1-S1]`、scope-null 全 0、`orphanCandidates:[]`。文件基线：主库 5,324,800 B、`-wal` 4,128,272 B、`-shm` 32,768 B；`backups/` 不存在。
+2. **`--apply`**（`node scripts/migrate-db.mjs --apply`）：`ok:true`、`integrity:["ok"]`、`tableCount:21`、`destructiveActions:false`、
+   - `backupFiles:["D:\\AgentEvo\\backend\\backups\\agent_data-2026-09-05T15-56-52-057Z.db"]`（5,337,088 B）
+   - `ledgerEntry:"migrate-db:apply:2026-09-05T15-56-52-073Z"`
+3. **复检**：dry-run ledger 现 2 行（W3.1-S1 + apply 条目）；`-wal` 折叠为 0、主库 5,337,088 B（checkpoint 收尾写入很小——大部分 WAL 帧此前已自动 checkpoint）；`audit-db` `activeReservations:[]`、integrity ok。
+4. `git status --short` 无 `backups/` 条目（`*.db*` 已被根 `.gitignore` 覆盖），备份留档不污染工作树。流程即 §3.1 第 2-3 步的实证。
+
+> 备注：本次 `security_migration_audit` 新行 id=3516（该表 AUTOINCREMENT 序列存在更早历史），ledger 内容行数仍为 2 —— 语义按 `migration UNIQUE` 条目计数，不依赖自增 id 连续。
