@@ -466,6 +466,25 @@ function initializeNode(state) {
 }
 
 // ═══════════════════════════════════════════════════════
+// LLM 构造 seam（W3.3-H）
+// ═══════════════════════════════════════════════════════
+//
+// 各 agent 节点原本直接内联构造 ChatOpenAI。为保证生产行为不变的同时，
+// 让 factory fixture 能注入确定性 fake LLM（离线驱动完整 graph、不触真实
+// provider），节点统一改经 config.configurable.makeLlm 构建：
+//   - 生产 singleton 的 bag 不含该键 → 回落 defaultMakeLlm，行为与先前一致；
+//   - 测试可 createApp({ dependencies: { services: { makeLlm } } }) 注入；
+//   - 未来也可在此按请求/租户路由模型。
+
+function defaultMakeLlm(opts) {
+    return new ChatOpenAI({ ...opts, ...buildChatOpenAIConfig() });
+}
+
+function resolveMakeLlm(config) {
+    return config?.configurable?.makeLlm || defaultMakeLlm;
+}
+
+// ═══════════════════════════════════════════════════════
 // 节点 2: RouterNode — LLM 意图分类
 // ═══════════════════════════════════════════════════════
 
@@ -473,10 +492,9 @@ async function routerNode(state, config) {
     console.log(`[graph][router] classifying intent for: "${state.userInput.slice(0, 80)}..."`);
     const signal = config?.configurable?.abortSignal;
 
-    const llm = new ChatOpenAI({
+    const llm = resolveMakeLlm(config)({
         modelName: state.modelName,
         temperature: 0,
-        ...buildChatOpenAIConfig(),
     });
 
     // Phase 4: 动态构建工具类别列表（从 ToolRegistry 实时获取）
@@ -777,10 +795,9 @@ async function plannerNode(state, config) {
 
     console.log(`[graph][planner] generating subTasks for intent="${state.intent}"`);
 
-    const llm = new ChatOpenAI({
+    const llm = resolveMakeLlm(config)({
         modelName: state.modelName,
         temperature: 0,
-        ...buildChatOpenAIConfig(),
     });
 
     // Phase 4: 构建可用工具列表（从 ToolRegistry 动态获取）
@@ -975,11 +992,10 @@ async function generalChatNode(state, config) {
     );
     const hasTools = systemTools.length > 0;
 
-    const llm = new ChatOpenAI({
+    const llm = resolveMakeLlm(config)({
         modelName: state.modelName,
         temperature: state.temperature,
         streaming: true,
-        ...buildChatOpenAIConfig(),
     });
 
     const generalInstr = agentConfig.get("agent.general.instruction");
@@ -1231,11 +1247,10 @@ async function searchAgentNode(state, config) {
     if (solo) {
         plan = emitPlanProgress(sse, plan, 'tools_done');
 
-        const llm = new ChatOpenAI({
+        const llm = resolveMakeLlm(config)({
             modelName: state.modelName,
             temperature: state.temperature,
             streaming: true,
-            ...buildChatOpenAIConfig(),
         });
 
         // Solo 模式：进度由 emitPlanProgress 自动管理，不给 LLM update_todo 指令(LLM 没有 tool 会文字模拟)
@@ -1355,10 +1370,9 @@ async function knowledgeAgentNode(state, config) {
         : [kbTool];
     const toolsMap = new Map(toolsForAgent.map(t => [t.name, t]));
 
-    const llm = new ChatOpenAI({
+    const llm = resolveMakeLlm(config)({
         modelName: state.modelName,
         temperature: state.temperature,
-        ...buildChatOpenAIConfig(),
     });
 
     const llmWithTools = llm.bindTools?.(toolsForAgent) || llm;
@@ -1411,11 +1425,10 @@ async function knowledgeAgentNode(state, config) {
             if (solo && knowledgeResults && !knowledgeResults.includes("当前知识库为空") && !knowledgeResults.includes("未检索到相关知识片段")) {
                 const { streamDirectChat } = await import("./chatUtils.js");
                 // 用 invoke 生成总结（knowledge 不走流式，LLM 一次性输出）
-                const summaryLlm = new ChatOpenAI({
+                const summaryLlm = resolveMakeLlm(config)({
                     modelName: state.modelName,
                     temperature: state.temperature,
                     streaming: true,
-                    ...buildChatOpenAIConfig(),
                 });
 
                 const summarySys = new SystemMessage(
@@ -1526,11 +1539,10 @@ async function codeAgentNode(state, config) {
     // Plan 模式：确保首个步骤为 in_progress
     let plan = emitPlanProgress(sse, state.plan, 'agent_start');
 
-    const llm = new ChatOpenAI({
+    const llm = resolveMakeLlm(config)({
         modelName: state.modelName,
         temperature: state.temperature,
         streaming: solo,  // solo: stream to user directly
-        ...buildChatOpenAIConfig(),
     });
 
     const parallelHint = solo
@@ -1787,11 +1799,10 @@ async function synthesizerNode(state, config) {
         (reasoningSubTasks.length > 0 ? ` + ${reasoningSubTasks.length} reasoning step(s)` : ""));
 
     // ── 融合生成最终回答 ──
-    const llm = new ChatOpenAI({
+    const llm = resolveMakeLlm(config)({
         modelName: state.modelName,
         temperature: state.temperature,
         streaming: true,
-        ...buildChatOpenAIConfig(),
     });
 
     const mergeHint = sources.length > 1
@@ -2179,6 +2190,9 @@ async function chatWithGraphImpl(userId, session_id, userMessage, image, systemP
         onComplete,
         onFailure,
     } = options;
+    // W3.3-H: LLM 构造工厂注入缝。默认回落 defaultMakeLlm（真实 ChatOpenAI），
+    // factory fixture 可通过 deps.services.makeLlm 注入确定性 fake。
+    const makeLlm = options?.deps?.services?.makeLlm || options?.deps?.makeLlm || defaultMakeLlm;
     const normalizedUserMessage = String(userMessage || "");
     const temperature = normalizeTemperature(temperatureInput);
     let systemPrompt = resolveSystemPrompt(systemPromptInput);
@@ -2358,6 +2372,7 @@ async function chatWithGraphImpl(userId, session_id, userMessage, image, systemP
                 thread_id: `session-${session_id}-${Date.now()}`,
                 sse: graphSse, // SSE emitter 通过 config 传入节点
                 abortSignal: abortController.signal, // 允许节点感知客户端断连
+                makeLlm, // LLM 构造工厂：默认真实 ChatOpenAI，测试可注入 fake
             },
         };
 
@@ -2505,4 +2520,6 @@ export {
     fanoutByIntents,
     buildAgentGraph,
     createSSEEmitter,
+    defaultMakeLlm,
+    resolveMakeLlm,
 };
