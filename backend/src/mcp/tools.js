@@ -6,6 +6,7 @@ import { toolRegistry } from "./registry.js";
 import { MemoryService } from "../services/memory.js";
 import { agentConfig } from "../services/agentConfig.js";
 import { getRequestContext, getRequestUserId } from "../services/requestContext.js";
+import { classifyError, createRetryableError, toPublicError } from "../services/resilience.js";
 
 // ── User Question Broker ──────────────────────────────────────
 // 管理 Agent 向用户提问的 Promise/deferred 注册表。
@@ -431,6 +432,13 @@ const bochaSearchTool = new DynamicTool({
                     }
 
                     if (!response.ok) {
+                        // W4-R3 (C3)：瞬时上游故障（429/408/5xx）抛带 status 的 classifyable 错，
+                        // 让外层 withRetry（chatGraph:1241 / chat.js 强制联网步）真正重试；否则 bocha
+                        // 一律吞成 [] 会让 withRetry 无从触发（惰性）。其余 4xx（如 key 无效 401）
+                        // 不可重试，保持历史行为返回空结果。
+                        if (response.status === 429 || response.status === 408 || response.status >= 500) {
+                            throw Object.assign(new Error(`博查上游返回 HTTP ${response.status}`), { status: response.status });
+                        }
                         return [];
                     }
 
@@ -446,8 +454,14 @@ const bochaSearchTool = new DynamicTool({
                         rows
                     });
                     return rows;
-                } catch {
-                    return [];
+                } catch (error) {
+                    // W4-R3 (C3)：不再吞成 [] —— 否则错误被静默消化，withRetry/外层 catch 全部惰性。
+                    // 10s 自毁 abort → 显式可重试超时；其余网络/解析错误原样上抛，
+                    // 由 classifyError 判定 retryable（ECONNRESET/ECONNREFUSED/ETIMEDOUT 等走 cause 链）。
+                    if (error?.name === "AbortError" || error?.code === "ABORT_ERR") {
+                        throw createRetryableError("博查搜索超时", "UPSTREAM_TIMEOUT");
+                    }
+                    throw error;
                 } finally {
                     clearTimeout(timer);
                 }
@@ -675,7 +689,13 @@ const bochaSearchTool = new DynamicTool({
                     .join("\n")
             );
         } catch (error) {
-            return `web_search 调用异常: ${error?.message || "unknown error"}`;
+            const classified = classifyError(error);
+            // W4-R3 (C3)：可重试（5xx/429/超时/网络）→ 冒泡给 withRetry/工具错误路径真正重试；
+            // 不可重试（响应解析/逻辑等）→ 回落公开消息字符串，Agent 可据此继续。
+            if (classified.retryable) {
+                throw classified;
+            }
+            return `web_search 调用异常: ${toPublicError(error).message}`;
         }
     }
 });

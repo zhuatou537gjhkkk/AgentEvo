@@ -15,6 +15,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // backend root = src/mcp → src → backend
 const BACKEND_ROOT = path.resolve(__dirname, "..", "..");
+// 有界握手：MCP Server 启动后若 initialize 无响应会挂起 connect。
+// 这里用 race 保证超时后 close transport（杀掉子进程）再抛错，不让 admin/启动路径无限等待。
+// 注：不用 withRetry 重跑整个 spawn —— 子进程 connect 重试可能泄漏上一次尝试的存活子进程；
+// 工具调用侧（registry.callTool/invokeTool）本就 withRetry，连接本身只需有界超时。
+const MCP_CONNECT_TIMEOUT_MS = 15000;
 
 /**
  * 连接到 MCP Server（Stdio transport）。
@@ -49,7 +54,26 @@ export async function connectToMCPServer(config) {
         }
     );
 
-    await client.connect(transport);
+    let handshakeTimer;
+    try {
+        await Promise.race([
+            client.connect(transport),
+            new Promise((_, reject) => {
+                handshakeTimer = setTimeout(() => {
+                    reject(Object.assign(new Error(`MCP connect timeout after ${MCP_CONNECT_TIMEOUT_MS}ms: "${config.name}"`), {
+                        code: "MCP_CONNECT_TIMEOUT",
+                        statusCode: 504,
+                        retryable: true,
+                    }));
+                }, MCP_CONNECT_TIMEOUT_MS);
+            }),
+        ]);
+    } catch (err) {
+        clearTimeout(handshakeTimer);
+        try { await transport.close(); } catch { /* 尽力清理子进程 */ }
+        throw err;
+    }
+    clearTimeout(handshakeTimer);
     console.log(`[mcp:client] connected to "${config.name}" (${command} ${args.join(" ")})`);
     return client;
 }

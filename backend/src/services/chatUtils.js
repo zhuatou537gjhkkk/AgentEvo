@@ -114,7 +114,16 @@ export function extractUsageFromChunk(chunk) {
 // LLM 配置
 // ═══════════════════════════════════════════════════════
 
-export function buildChatOpenAIConfig(hasImage = false) {
+/**
+ * 统一 LLM 构造配置。默认 `maxRetries: 0`：LangChain/OpenAI SDK 的内部重试交给
+ * 调用方的 `withRetry` 统一管理（withRetry 是唯一重试预算层），避免"内部 maxRetries(默认 2)
+ * × withRetry 叠乘"把一次上游故障放大到 ~9 次尝试。
+ *
+ * 仅当调用点**没有** withRetry、且只能在模型层重试时才显式传 `{ maxRetries: 2 }`
+ * 保留单层内部重试 —— 典型如 legacy AgentExecutor（整 executor 用 withRetry 重跑会
+ * 重放已执行工具的副作用，只能在模型 HTTP 层重试）。
+ */
+export function buildChatOpenAIConfig(hasImage = false, { maxRetries = 0 } = {}) {
     if (hasImage && process.env.VISION_BASE_URL) {
         return {
             apiKey: process.env.VISION_API_KEY || process.env.OPENAI_API_KEY,
@@ -122,6 +131,7 @@ export function buildChatOpenAIConfig(hasImage = false) {
                 baseURL: process.env.VISION_BASE_URL,
             },
             timeout: 120000,
+            maxRetries,
         };
     }
     return {
@@ -130,6 +140,7 @@ export function buildChatOpenAIConfig(hasImage = false) {
             baseURL: process.env.OPENAI_BASE_URL,
         },
         timeout: 120000,
+        maxRetries,
     };
 }
 
@@ -281,11 +292,14 @@ export async function getAgentExecutor(enableWebSearch, temperature, systemPromp
         ? allTools
         : allTools.filter((tool) => tool.name !== WEB_SEARCH_TOOL_NAME);
 
+    // legacy AgentExecutor 路径**不加** withRetry（整 executor 重跑会重放已执行工具的
+    // 副作用），因此保留模型层内部 maxRetries:2 作为其唯一重试层；其余经 withRetry
+    // 包裹的调用点由 buildChatOpenAIConfig 默认 maxRetries:0 统一关闭内部重试。
     const llm = new ChatOpenAI({
         modelName: resolveModelName(false),
         temperature,
         streaming: true,
-        ...buildChatOpenAIConfig(),
+        ...buildChatOpenAIConfig(false, { maxRetries: 2 }),
     });
     const prompt = buildPrompt(enableWebSearch, systemPrompt, planMode);
     const agent = await createToolCallingAgent({

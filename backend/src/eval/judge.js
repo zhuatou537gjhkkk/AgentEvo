@@ -19,6 +19,7 @@
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { buildChatOpenAIConfig } from "../services/chatUtils.js";
+import { toPublicError, withRetry } from "../services/resilience.js";
 
 const JUDGE_SYSTEM_PROMPT = `你是一个严格的AI评估专家。你需要对AI助手的回答从5个维度进行评分（0-5分，0.5为最小粒度）。
 
@@ -78,10 +79,14 @@ class LLMJudge {
         const userPrompt = this._buildUserPrompt(testCase, capturedOutput);
 
         try {
-            const response = await this.llm.invoke([
-                new SystemMessage(JUDGE_SYSTEM_PROMPT),
-                new HumanMessage(userPrompt),
-            ]);
+            // buildChatOpenAIConfig 默认 maxRetries:0 → withRetry 是唯一重试层
+            const response = await withRetry(
+                (_, retrySignal) => this.llm.invoke([
+                    new SystemMessage(JUDGE_SYSTEM_PROMPT),
+                    new HumanMessage(userPrompt),
+                ], { signal: retrySignal }),
+                { retries: 2 }
+            );
 
             const content = typeof response.content === "string"
                 ? response.content
@@ -90,13 +95,15 @@ class LLMJudge {
             return this._parseResponse(content);
         } catch (err) {
             console.error(`[LLMJudge] evaluate failed for ${testCase.id}:`, err.message);
+            // 只把 public 消息写进 rationale/error，不泄 provider 原始错误
+            const publicMessage = toPublicError(err).message;
             return {
                 correctness: 0,
                 tool_usage: 0,
                 conciseness: 0,
                 safety: 0,
-                rationale: `LLMJudge error: ${err.message}`,
-                error: err.message,
+                rationale: `LLMJudge error: ${publicMessage}`,
+                error: publicMessage,
             };
         }
     }

@@ -71,7 +71,7 @@ import { assertProductionSecurityConfig, isAllowedCorsOrigin } from "./security/
 import { validateMCPServerConfig } from "./mcp/security.js";
 import { createRequestContext, runWithRequestContext } from "./services/requestContext.js";
 import { createRateLimit, requireAdmin } from "./security/access.js";
-import { toErrorEnvelope, toPublicError } from "./services/resilience.js";
+import { toErrorEnvelope, toPublicError, withRetry } from "./services/resilience.js";
 import { getSSEWriter } from "./services/sse.js";
 import { reserveUploadChunk, getUploadReservation, rollbackUploadChunk, settleUploadReservation, releaseUploadReservation, withUploadLock, startUploadQuotaCleanup } from "./services/uploadQuotaStore.js";
 import { registerCoreRoutes } from "./routes/coreRoutes.js";
@@ -395,10 +395,14 @@ async function defaultBuildCompactionSummary(conversationText) {
         temperature: 0.3,
         ...chatUtils.buildChatOpenAIConfig(false),
     });
-    const result = await llm.invoke([
-        new SystemMessage("你是一个对话摘要助手。请用中文将以下对话历史压缩为一段简洁摘要，保留关键问题、回答要点和结论，控制在 150-300 字以内。"),
-        new HumanMessage(`对话历史：\n\n${conversationText.slice(0, 12000)}\n\n请生成摘要：`),
-    ]);
+    // buildChatOpenAIConfig 默认 maxRetries:0 → 这里补 withRetry 作为唯一重试层
+    const result = await withRetry(
+        (_, retrySignal) => llm.invoke([
+            new SystemMessage("你是一个对话摘要助手。请用中文将以下对话历史压缩为一段简洁摘要，保留关键问题、回答要点和结论，控制在 150-300 字以内。"),
+            new HumanMessage(`对话历史：\n\n${conversationText.slice(0, 12000)}\n\n请生成摘要：`),
+        ], { signal: retrySignal }),
+        { retries: 2 }
+    );
     return String(result?.content || "").trim();
 }
 
@@ -943,7 +947,11 @@ app.post("/legacy-sessions/:id/compact", requireAuth, async (req, res) => {
             `对话历史：\n\n${conversationText.slice(0, 12000)}\n\n请生成摘要：`
         );
 
-        const result = await llm.invoke([systemMsg, userMsg]);
+        // buildChatOpenAIConfig 默认 maxRetries:0 → 这里补 withRetry 作为唯一重试层
+        const result = await withRetry(
+            (_, retrySignal) => llm.invoke([systemMsg, userMsg], { signal: retrySignal }),
+            { retries: 2 }
+        );
         const summaryContent = String(result?.content || "").trim();
 
         if (!summaryContent) {
@@ -1837,8 +1845,28 @@ app.post("/chat", requireAuth, createRateLimit({ scope: "chat", windowMs: 60_000
     // W3.3-G: 把实例依赖 bag 注入深链路 options.deps，使 chatWithStream 内部
     // 的 db/executor/trace/eval 读取可按 factory 隔离。生产 singleton 的 bag
     // 不含覆盖键，chat.js 全回落模块默认 → 零行为变化。
-    const chatImpl = (uid, sid, msg, img, sys, temp, response, opts = {}) =>
-        (_useLangGraph ? chatWithGraph : chatWithStream)(uid, sid, msg, img, sys, temp, response, { ...opts, deps: instanceDeps });
+    // 路由级 SSE 兜底：chatWithStream/chatWithGraph 各自的内部 try 从 impl 中段才开始，
+    // 之前（如 getHistoryMessages/saveMessage 预取）的抛错会逃逸到这里 —— Express 4 不
+    // 转发 async handler rejection，SSE 头已发时不在此收尾会挂死（无 error 帧、无 end）。
+    // 正常失败已由服务层内部 catch + opts.onFailure 处理，这里只兜 pre-try 逃逸。
+    const chatImpl = async (uid, sid, msg, img, sys, temp, response, opts = {}) => {
+        try {
+            return await (_useLangGraph ? chatWithGraph : chatWithStream)(uid, sid, msg, img, sys, temp, response, { ...opts, deps: instanceDeps });
+        } catch (error) {
+            console.error(`[chat][route] uncaught error escaping chatImpl: ${error?.message}`);
+            if (!response.headersSent) {
+                // handler 已 setHeader("Content-Type","text/event-stream")，但首帧未 flush；
+                // Express res.json 不会覆盖已显式设置的 Content-Type → 显式改回 JSON，
+                // 避免以 SSE content-type 返回 JSON body（前端以 status 判错，此为协议干净化）。
+                response.setHeader("Content-Type", "application/json");
+                return response.status(500).json(toErrorEnvelope(error, req.requestId));
+            }
+            writeSseError(response, error, req.requestId);
+            opts?.onFailure?.(error, { text: "" });
+            response.end();
+            return undefined;
+        }
+    };
 
     if (isKnowledgeIntent(message) && !resolvedImage) {
         const userLargeFile = getActiveLargeFile(req.user.id);

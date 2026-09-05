@@ -3,7 +3,7 @@ import { saveMessage, getHistoryMessages } from "../db/index.js";
 import { agentTools, consumePendingQuestion, cancelAllPendingQuestions, setMemoryToolContext } from "../mcp/tools.js";
 import { TraceCollector } from "../trace/collector.js";
 import { OnlineEvaluator } from "../eval/online.js";
-import { toPublicError } from "./resilience.js";
+import { toPublicError, withRetry } from "./resilience.js";
 import { getRequestContext, withSessionContext } from "./requestContext.js";
 import { getSSEWriter } from "./sse.js";
 import {
@@ -204,10 +204,17 @@ async function chatWithStreamImpl(userId, session_id, userMessage, image, system
                 let forcedSearchError = null;
 
                 try {
-                    const toolResult = await webSearchTool.invoke(normalizedUserMessage);
+                    // W4-R3 (C3)：bocha transient（5xx/429/超时/网络）现在抛 classifyable 错
+                    // （不再吞成 []），强制联网步在此包 withRetry 真重试一次；raw 错误只进 console，
+                    // 喂给模型的回落文案用 toPublicError 的公开消息（防 provider secret 被模型 echo）。
+                    const toolResult = await withRetry(
+                        (_, retrySignal) => webSearchTool.invoke(normalizedUserMessage, { signal: retrySignal }),
+                        { retries: 1, signal: abortController.signal }
+                    );
                     forcedSearchOutput = normalizeChunkContent(toolResult).slice(0, FORCED_WEB_SEARCH_MAX_CHARS);
                 } catch (forcedSearchErrorObj) {
-                    forcedSearchError = forcedSearchErrorObj?.message || "unknown error";
+                    console.error(`[agent][forced_search] failed: ${forcedSearchErrorObj?.message}`);
+                    forcedSearchError = toPublicError(forcedSearchErrorObj).message;
                     forcedSearchOutput = `强制联网检索失败: ${forcedSearchError}`;
                 }
 
@@ -643,11 +650,12 @@ async function chatWithStreamImpl(userId, session_id, userMessage, image, system
         console.error(`[agent][fatal] message="${error.message}" stack="${error.stack}"`);
         // 清理所有未完成的用户提问
         cancelAllPendingQuestions(requestContext);
+        // 错误终态对齐 graph 语义：写 error envelope 后直接 res.end()，**不**再发
+        // [DONE] —— 前端把 [DONE] 当成功，error+[DONE] 会被误读为成功。
         if (!clientDisconnected) {
             emitThought(res, "生成过程发生错误", "error");
             sseWriter.write(toPublicError(error, requestContext?.requestId));
         }
-        sseWriter.done();
         res.end();
         cleanupDisconnect();
         onFailure?.(error, { text: fullText });

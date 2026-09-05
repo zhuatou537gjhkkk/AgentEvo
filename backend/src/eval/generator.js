@@ -13,6 +13,7 @@
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { buildChatOpenAIConfig } from "../services/chatUtils.js";
+import { toPublicError, withRetry } from "../services/resilience.js";
 import { insertGeneratedTestCase, getGeneratedTestCaseIds, getGeneratedTestCaseById } from "../db/index.js";
 
 const GENERATOR_SYSTEM_PROMPT = `你是一个专业的AI测试用例设计师。你的任务是根据用户提供的种子用例，生成多样化的评测测试用例。
@@ -184,16 +185,21 @@ ${seedBlock}
         console.log(`[TestCaseGenerator] 🚀 开始生成: category=${category}, count=${count}, seeds=${seeds.filter(s => s.id).length || "(内置模板)"}`);
         let content;
         try {
-            const response = await this.llm.invoke([
-                new SystemMessage(GENERATOR_SYSTEM_PROMPT),
-                new HumanMessage(userPrompt),
-            ]);
+            // buildChatOpenAIConfig 默认 maxRetries:0 → withRetry 是唯一重试层
+            const response = await withRetry(
+                (_, retrySignal) => this.llm.invoke([
+                    new SystemMessage(GENERATOR_SYSTEM_PROMPT),
+                    new HumanMessage(userPrompt),
+                ], { signal: retrySignal }),
+                { retries: 2 }
+            );
             content = typeof response.content === "string"
                 ? response.content
                 : (Array.isArray(response.content) ? response.content.map(c => c.text).join("") : "");
         } catch (err) {
             console.error("[TestCaseGenerator] LLM call failed:", err.message);
-            return { ok: false, generated: [], batchId: "", count: 0, error: `LLM调用失败: ${err.message}` };
+            // 只把 public 消息写进 DB，不泄 provider 原始错误
+            return { ok: false, generated: [], batchId: "", count: 0, error: `LLM调用失败: ${toPublicError(err).message}` };
         }
 
         // ── 解析 JSON ──

@@ -30,6 +30,7 @@
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { buildChatOpenAIConfig } from "./chatUtils.js";
+import { toPublicError, withRetry } from "./resilience.js";
 import {
     getScoresByRun,
     saveOptimizationLog,
@@ -244,10 +245,14 @@ ${badCaseDescriptions}
 
         let rawResponse = "";
         try {
-            const response = await this.llm.invoke([
-                new SystemMessage(systemPrompt),
-                new HumanMessage(userPrompt),
-            ]);
+            // buildChatOpenAIConfig 默认 maxRetries:0 → withRetry 是唯一重试层
+            const response = await withRetry(
+                (_, retrySignal) => this.llm.invoke([
+                    new SystemMessage(systemPrompt),
+                    new HumanMessage(userPrompt),
+                ], { signal: retrySignal }),
+                { retries: 2 }
+            );
 
             rawResponse = typeof response.content === "string"
                 ? response.content
@@ -257,9 +262,10 @@ ${badCaseDescriptions}
             return { ...parsed, rawResponse };
         } catch (err) {
             console.error("[OptimizationPipeline] suggest failed:", err.message);
+            // 只把 public 消息写进 summary，不泄 provider 原始错误
             return {
                 suggestions: [],
-                summary: `LLM 建议生成失败: ${err.message}`,
+                summary: `LLM 建议生成失败: ${toPublicError(err).message}`,
                 rawResponse,
             };
         }
