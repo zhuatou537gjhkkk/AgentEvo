@@ -8,7 +8,7 @@
         "start": "node src/server.js",
         "test": "vitest run",
         "test:watch": "vitest",
-        "check:syntax": "node --check src/app.js && node --check src/auth.js && node --check src/db/index.js && node --check src/services/chat.js && node --check src/services/chatGraph.js && node --check src/services/chatUtils.js && node --check src/services/sse.js && node --check src/services/uploadQuota.js",
+        "check:syntax": "node --check src/app.js && node --check src/auth.js && node --check src/db/index.js && node --check src/services/chat.js && node --check src/services/chatGraph.js && node --check src/services/chatUtils.js && node --check src/services/sse.js && node --check src/services/uploadQuota.js && node --check vitest.setup.js",
         "test:coverage": "vitest run --coverage"
     },
     "dependencies": {

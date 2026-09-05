@@ -233,6 +233,21 @@
 - 远程复跑：`8d8c0f3` → backend + frontend 双 job **success**，CI 自此可作回归防线。
 - 遗留债务（系统性，见 roadmap §16 候选）：所有 db 单测共享同一真实形态 DB 文件，靠 FK ON + 恰好存在的父行续命，`idempotency` 只是首个撞枪者；根治 = 每 vitest worker/fork 独立临时库（setup 为每个 worker 设独立 `DB_PATH`），已列 roadmap 后续波次候选。
 
+### W3.3-J：db 测试逐 worker 隔离（W3.3-I 事故的系统性根治）（2026-09-05）
+
+- 动机：W3.3-I 只修了 `idempotency` 单个测试；根本问题是**整套测试共享真实 dev 库** `backend/agent_data.db`（`db/index.js` 模块导入时读一次 `process.env.DB_PATH`，无人设置它），任何新表/新 FK 都可能重现"本地绿、CI 红"。另审计发现 `memory.test.js` × `memory.tool.test.js` 共享 `USER_ID=1`，在共享库上并行互删对方行，属潜在 flaky。
+- 改动（生产代码零改动；新增 1 文件 + 1 行配置）：
+  - 新增 `backend/vitest.setup.js`：vitest 默认 `pool=forks + isolate=true`（每测试文件一个独立子进程），setup 在每个 worker 内、文件模块导入前执行 → `mkdtempSync` 一个独立临时空库并设 `process.env.DB_PATH`；不 import db（避免破坏对其 `vi.mock` 的 collector/metrics/chatGraph/generator 测试）；`exit` 尽力删除 + 对命名空间 `agentevo-vitest/` 下 >1h 旧目录做 sweep（Windows 无法删打开中的 SQLite，残目录由下次 sweep 收敛）。
+  - `vitest.config.js` 加 `setupFiles: ['./vitest.setup.js']`；`check:syntax` 纳入 `vitest.setup.js`。
+  - 零测试文件改动：审计 32 文件，唯一真实写库的 3 个测试（idempotency/memory/memory.tool）均自带 `initDB()`，空库上成立（demo 用户空库自举 id=1，memory 的 `USER_ID=1` 仍有效）。
+- 验证：
+  1. 全量 `npm test` 32 files / 503 tests 绿；
+  2. **dev 库不再被碰**：跑前/跑后 `agent_data.db`/`-wal`/`-shm` 的 sha256 + mtime + size 逐字节一致（改造前 memory 测试会写 dev 库，此检查改造前必红）；
+  3. `memory.test.js` + `memory.tool.test.js` 连跑 5× 全绿（旧共享库会互删 user1 行）；
+  4. 运行中 `os.tmpdir()/agentevo-vitest/<rand>/agent_data.db` 确认存在（Windows 下 exit 删除失败 → 32 个残目录由下次 >1h sweep 收敛，已手工清理一次）；
+  5. 远程 CI 双 job success。
+- 收益：任何测试**结构性不可能**依赖 dev 库残留；每次 `npm test` 等价于在干净 CI 形态下运行；roadmap DoD 的 "temporary SQLite" 从特例成为强制约定。
+
 ## 回滚与遗留风险
 
 - 所有新增行为使用环境变量或兼容 fallback；必要时可关闭新开关并保留旧数据。

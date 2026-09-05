@@ -138,7 +138,7 @@
 4. 为 durable quota 做 additive migration 前，先备份 SQLite/WAL、执行 integrity/orphan audit；默认只报告未知 orphan，不自动删除。
 5. 补 native HTTP contract、双用户隔离和并发测试，再运行 backend/frontend 完整测试与 build；不能用 unit test 代替矩阵验收。
 6. 当前 personal `tenant_id=user:<id>` 不代表组织 tenant/RBAC；不要先做 Skills Runtime、代码沙箱或 remote MCP。
-7. 每完成一个小波次，先跑隔离/并发/回归测试，再同步更新本文件和主开发日志；远程 CI 已是回归防线（§16），会拦截"共享库依赖"型测试红。
+7. 每完成一个小波次，先跑隔离/并发/回归测试，再同步更新本文件和主开发日志；远程 CI 已是回归防线（§16）；db 测试已逐文件隔离（§17）——本地 `npm test` 即干净形态，dev `agent_data.db` 不会被测试触碰。
 
 ## 6. W3.3-B + W3.2-B（2026-09-04，进行中）
 
@@ -251,5 +251,11 @@
 - [x] 远程 CI 首验：三条已推 commit（24958d7/91beca4/8481c4f）frontend job 全绿、backend job 全红于同一 `src/db/idempotency.test.js`（`SQLITE_CONSTRAINT_FOREIGNKEY`，run 秒级失败，非构建问题）。
 - [x] 根因闭环：本仓库 better-sqlite3 默认 `PRAGMA foreign_keys=ON`；`chat_idempotency.owner_user_id`→`users(id)`；测试硬编码 scope userId 1/2 且不自建父行 → 本地绿仅因 dev 库恰有 id 1/2，CI 干净库仅 initDB 自举的 demo(id=1) → 跨 owner 用例 userId:2 FK 崩。本地空库定向复现与 CI 一致。
 - [x] 修复 `8d8c0f3`：`idempotency.test.js` 自治化 —— beforeAll 动态建两专属用户、afterAll 先删 idempotency 子行再删父行；`DB_PATH=<空库>` 全量 32 files / 503 tests 绿 + dev 库 32/503 绿；远程 backend+frontend 双 job success。事故/修复/债务完整记录见主日志 `2026-09-production-hardening.md` W3.3-I。
-- [ ] **候选后续波次：db 单测 per-worker/per-file 临时库隔离**。所有 db 测试当前共享同一真实形态 DB 文件，靠 FK ON + 恰好存在的父行续命，属系统性测试卫生债务（idempotency 只是首个撞枪者）。根治：vitest setup 为每个 fork/worker 设独立 `DB_PATH`（setupFiles 在首个 db import 前生效），使每文件获得可重复、不共享状态的空库；新增 db 表/外键时不再隐式依赖共享库残留。建议并入 **W4 测试矩阵波**（W4 的半开连接/Abort/429/并发/双用户测试正需要可重置、隔离的库），DoD §4 的 "temporary SQLite" 由特例晋升为 db 测试强制约定。
+- [x] **db 单测 per-worker/per-file 临时库隔离 —— 已在 W3.3-J 落地（见 §17）**：vitest.setup.js 为每个 fork/worker 设独立临时空库，任何测试结构性不可能依赖 dev 库残留；DoD §4 的 "temporary SQLite" 由特例晋升为 db 测试强制约定。原"并入 W4 测试矩阵波"的捆绑建议不再需要 —— W4 现在可直接建立在已隔离的库上。
+
+## 17. W3.3-J：db 测试逐 worker 隔离（2026-09-05）
+
+- [x] 动机：W3.3-I 只修单个测试；根本问题是整套测试共享 dev 库（db/index.js 导入时读一次 DB_PATH），且 memory×memory.tool 在共享库上互删 user1 行。
+- [x] 实现：新增 `backend/vitest.setup.js`（pool=forks+isolate 下每文件一进程；setupFiles 于文件导入前设 DB_PATH 到独立临时空库；不 import db 以免破坏 vi.mock；exit 尽力删除 + >1h 陈旧 sweep）；`vitest.config.js` 加 `setupFiles`；`check:syntax` 纳入 setup 文件。**零测试文件、零生产代码改动**。
+- [x] 验证：全量 32 files / 503 tests 绿；dev `agent_data.db` sha/mtime 逐字节不变（此前 memory 测试会写它）；memory+memory.tool 连跑 5× 绿；远程 CI 双 job success。完整记录见主日志 `2026-09-production-hardening.md` W3.3-J。
 
