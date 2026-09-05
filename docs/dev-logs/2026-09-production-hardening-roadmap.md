@@ -134,7 +134,7 @@
 
 1. 阅读本文件和 `2026-09-production-hardening.md`，以主日志最新验证记录为准。
 2. 执行 `git status --short`，确认当前修改不被覆盖；本轮所有代码仍为未提交工作树变更。
-3. durable quota 生产写入验收 + migrate `--apply` 真实落地（**A1+A2**，§18）与完整 HTTP 双用户/并发隔离矩阵（**A3**，§19，真实 DB 版）均已完成。下一候选波次：durable **同 key 跨进程锁**（需分布式锁服务），或 **W4 统一重试/SSE 可靠性**（doD 要求半开连接/Abort/429 矩阵，可建在已隔离的 db 测试上），或把软点（跨 owner 读 200 空）改 404 的行为收紧（涉及 FE 兼容评估，优先级低）。
+3. durable quota 生产写入验收 + migrate `--apply` 真实落地（**A1+A2**，§18）、完整 HTTP 双用户/并发隔离矩阵（**A3**，§19，真实 DB 版）与 **W4-R1 统一重试接入**（§20，分类修复 + graph 工具/流裸点接线 + toolExecutor bug）均已完成。下一候选：**W4-R2 可靠性矩阵**（fake makeLlm 注入 flaky + HTTP `reader.cancel` 半开 abort + B 用户不受 A 取消影响；需新建 fake-LLM 节点 harness 与 reader 级消费方式），或 durable **同 key 跨进程锁**（需分布式锁服务），或把软点（跨 owner 读 200 空）改 404 的行为收紧（涉及 FE 兼容评估，优先级低）。
 4. 为 durable quota 做 additive migration 前，先备份 SQLite/WAL、执行 integrity/orphan audit；默认只报告未知 orphan，不自动删除。
 5. 补 native HTTP contract、双用户隔离和并发测试，再运行 backend/frontend 完整测试与 build；不能用 unit test 代替矩阵验收。
 6. 当前 personal `tenant_id=user:<id>` 不代表组织 tenant/RBAC；不要先做 Skills Runtime、代码沙箱或 remote MCP。
@@ -278,4 +278,15 @@
 - [x] 新增 `src/httpIsolationMatrix.test.js`（真实 DB + `createApp()` 模块默认 + 原生 HTTP + 真实 JWT，A=admin/B=normal，fixtures 走 db API）：sessions CRUD 跨 owner 404 + 读路径 200 空零泄露、extension pair/branch/compact 无副作用、memory 隔离、feedback 跨 owner 不落库 vs 本人落库、obs trace 跨 owner 404 + admin 门禁 403/200、并发混合操作互斥。定向 6/6。
 - [x] 全量 backend **34 files / 517 tests 绿**；**零生产代码改动**（矩阵锁定既有语义，无真越权可修）。
 - [ ] **残余/候选**：eval 深矩阵（admin-only 树，现只到 admin 门禁层；补全待 D2）、durable 同 key 跨进程锁（需分布式锁）、软点改 404 属 FE 兼容评估（低优先）、组织 RBAC、多实例 RAG、W4-W8/P2。
+
+## 20. W4-R1：统一重试接入 — 分类修复 + graph 工具/流裸点接线 + toolExecutor bug（2026-09-06）
+
+关闭历波反复的 "W4 全量 retries 未做" 的首段（基础 + 接线 + bug）；W4-R 全貌（含可靠性矩阵）拆 2 小波，R1 = 本段，R2 = 下段。完整记录见主日志 `2026-09-production-hardening.md` W4-R1 段。
+
+- [x] 侦察（2 路只读 + 本人核验锚点）：`resilience.withRetry`/`classifyError` 工具能力已完整，**缺口是接线**；并发现现存 bug —— `toolExecutorNode` 引用未声明 `signal`（工具路径必 ReferenceError → 吞成 TOOL_FAILED）。`requestContext` 身份对象无 `signal`（设计正确，abort 走 `config`）。
+- [x] `services/resilience.js` `classifyError`：有 HTTP status 时 status 优先（4xx 保持不可重试）；无 status 时兜底 = 顶层网络码 / SDK Timeout name / `cause` 链（≤5 层）找网络码。向后兼容。
+- [x] `services/chatGraph.js`：toolExecutorNode 补 `signal = config?.configurable?.abortSignal`（bug 修复）+ catch abort rethrow；`executeToolCalls` 加 signal 参并由 knowledgeAgentNode 传 config 真实 signal；三处裸点（generalChat 工具循环 / searchAgent webSearch / knowledge solo 流）包 `withRetry`（工具 retries:1、流 retries:2）+ abort rethrow。SSE/FSM/HTTP 契约零改动。
+- [x] 测试：`services/resilience.test.js` +7 纯语义单测（classify SDK Timeout / cause 链单层与嵌套 / 400 隐藏网络 cause 仍不可重试 / 429+retryAfter 咨询 / 5xx 耗尽 rethrow / deadline → `RETRY_DEADLINE_EXCEEDED`）。定向 **11/11**；全量 backend **34 files / 524 tests 绿**（原 34/517，+7）；`node --check` ×3 OK。
+- [ ] **R2（下波）**：graph 可靠性矩阵 —— 需新建 fake makeLlm（实现 invoke/stream/bindTools，按次抛 429/5xx/timeout/ABORT，经 `createApp({dependencies:{services:{makeLlm}}})` + `USE_LANGGRAPH=true` 注入真实节点）与 HTTP `reader.cancel` 半开 abort 消费方式；断言工具退避 abort、"B 用户不受 A 取消影响"。
+- [ ] **仍延后**：LangChain `maxRetries` 与 withRetry 叠加的预算协调（共享 `buildChatOpenAIConfig`，牵 legacy 路径，并入接线时统一置 0）；rag 全链路 / eval judge·generator·reflection / mcp connect·listTools / bocha fetch 接线；SSE 错误字段审计（独立 W4-SSE 波）。W4 §2 清单以本段 + R2 为准逐步勾选。
 

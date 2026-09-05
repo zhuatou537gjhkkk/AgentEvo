@@ -285,6 +285,22 @@
 - **非目标（已在别处覆盖，注明防重复）**：upload/upload-image caller 注入 → registrarBagIsolation；/chat owner 404 + 双 factory 并发 → registrarServiceIsolation/Bag；eval 深矩阵（admin-only 树）→ 各表 scope 列 + 本波 admin 门禁；durable 跨进程记账 → uploadQuotaDurable。
 - **残余候选（写入 roadmap §5/§19）**：eval 深度注入 D2（low ROI）→ 矩阵对 eval 只到 admin 门禁层；durable 同 key 跨进程锁；软点改 404 属 API 行为变更，FE 兼容优先故保持现状、以测试锁定。
 
+### W4-R1：统一重试接入 — 分类修复 + graph 工具/流裸点接线 + toolExecutor bug（2026-09-06）
+
+W4-R 全貌（withRetry 全链路 + 可靠性矩阵）拆 2 小波；本段 = **R1（基础 + 接线 + bug）**，R2（graph 集成矩阵）另立项。动机：历波把 "W4 全量 retries 未做" 记为残余，两路只读侦察 + 本人核验表明 **`withRetry` 工具能力已完整、缺口是接线**，并发现一个现存真实 bug。
+
+- **盘点结论**：`resilience.withRetry` 已支持 AbortSignal 透传 + 退避期 abort 唤醒、`deadlineMs`、指数退避+jitter、`retryAfter`、`shouldRetry`；`classifyError` 是唯一分类源（同驱动 `toErrorEnvelope.retryable`）。缺口清单：
+  1. `classifyError` 只认 408/425/429/5xx + 网络码；**无 status/code 的 SDK 超时**（OpenAI `APIConnectionTimeoutError`）、undici `TypeError: fetch failed`（网络码藏在 `cause`）被误判为不可重试 → 落到 `INTERNAL_ERROR`。
+  2. **现存 bug**：`toolExecutorNode`（chatGraph）七个兄弟节点顶部均 `const signal = config?.configurable?.abortSignal`，唯它未声明却在 withRetry 引用裸 `signal`（无模块级绑定）→ 命中工具路径即 ReferenceError → 被 catch 吞成 `TOOL_FAILED`。即 tool_executor 路径当前**必然工具失败**。
+  3. `executeToolCalls` 用 `requestContext?.signal`（恒 undefined，身份对象无 signal）→ 工具重试退避收不到客户端 abort。
+  4. 三处裸调用点：generalChat 工具循环 `tool.invoke`、searchAgent `webSearchTool.invoke`、knowledgeAgent solo `summaryLlm.stream` —— 无重试、无 signal。
+- **改动（3 生产文件 + 测试）**：
+  - `services/resilience.js` `classifyError`：**有 HTTP status 时 status 优先**（4xx 保持不可重试，即便隐藏网络 cause）；无 status 时兜底启发 = 顶层 code ∈ 网络码 / name 命中 SDK Timeout（`*Timeout*`）/ 沿 `cause` 链（≤5 层）找网络码。向后兼容：原"无 status/code 判不可重试"的输入语义不变。
+  - `services/chatGraph.js`：(a) toolExecutorNode 顶部补 `const signal = config?.configurable?.abortSignal`（bug 修复），其 catch 顶部 `if (signal?.aborted) throw err`（对齐 generalChat :1128 既有 rethrow-on-abort 惯用法）；(b) `executeToolCalls` 加第 6 参 `signal`（默认沿用旧 `requestContext?.signal` 保持兼容），knowledgeAgentNode 调用处传 `config` 的真实 signal；(c) 三处裸点包 `withRetry`（工具 `retries:1` 对齐既有 executeToolCalls/toolExecutorNode 先例，knowledge solo 流 `retries:2` 对齐 synthesizer 等兄弟流）+ 对应 catch 加 abort rethrow。
+  - `services/resilience.test.js`：+7 纯语义单测 —— classifyError：SDK Timeout name / 单层 cause / 两层嵌套 cause / 400 隐藏网络 cause 仍不可重试；withRetry：429+`retryAfter` 被咨询（首参为 classified）、5xx 重试耗尽 rethrow classified（恰调 `retries+1` 次）、`deadlineMs` 耗尽 → `RETRY_DEADLINE_EXCEEDED`（无多余尝试）。原有 "退避中 abort 立即 ABORTED" 用例保留。
+- **明确不改 / 延后（R2 清单）**：LangChain 内建 `maxRetries` 与 withRetry 叠加的预算协调（共享 `buildChatOpenAIConfig` 被 legacy 路径复用，牵一发动全身）；rag 全链路 / eval judge·generator·reflection / mcp connect·listTools / bocha fetch 接线；**graph 可靠性矩阵**（fake makeLlm 按次抛 429/5xx/timeout/ABORT 驱动真实节点 + HTTP `reader.cancel` 半开 abort + "B 用户不受 A 取消影响"）。`requestContext` 保持无 signal（身份 vs 传输分离，abort 走 `config`）。
+- **验证**：`node --check` ×3 OK；定向 resilience **11/11**；全量 backend **34 files / 524 tests 全绿**（原 34/517，+7）；`git diff --check` OK（仅预期 LF/CRLF 警告）；dev `agent_data.db` 不被触碰（W3.3-J per-worker 临时库）。
+
 ## 回滚与遗留风险
 
 - 所有新增行为使用环境变量或兼容 fallback；必要时可关闭新开关并保留旧数据。
