@@ -242,6 +242,84 @@ export class ApprovalService {
             action: this._getAction({ userId, tenantId }, approval.action_id),
         };
     }
+
+    /**
+     * R2 — Atomically claim an APPROVED action for execution. Exactly one caller
+     * wins (single UPDATE … WHERE status='approved'): concurrent resumes/reconnects
+     * can never run the same side effect twice. Returns a claim verdict; execution
+     * must call `completeAction` to settle it.
+     *
+     * @returns {{ claimed: boolean, reason: string }}
+     */
+    claimActionExecution(scope, actionId) {
+        ensureSchema();
+        const { userId, tenantId } = requireCodingScope(scope, "action");
+        const id = String(actionId);
+        const changed = db.prepare(
+            `UPDATE coding_actions SET status = 'executing', updated_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND owner_user_id = ? AND tenant_id = ? AND status = 'approved'`,
+        ).run(id, userId, tenantId).changes;
+        if (changed) {
+            const row = db.prepare(
+                "SELECT run_id FROM coding_actions WHERE id = ? AND owner_user_id = ? AND tenant_id = ?",
+            ).get(id, userId, tenantId);
+            this._append({ userId, tenantId }, row.run_id, {
+                type: "action.executing", payload: { actionId: id },
+            });
+            return { claimed: true, reason: "claimed" };
+        }
+        const current = db.prepare(
+            "SELECT status FROM coding_actions WHERE id = ? AND owner_user_id = ? AND tenant_id = ?",
+        ).get(id, userId, tenantId);
+        if (!current) throw codingError("NOT_FOUND", "action not found", 404);
+        if (current.status === "executing" || current.status === "executed" || current.status === "failed") {
+            return { claimed: false, reason: "already_settled" };
+        }
+        if (current.status === "requested") return { claimed: false, reason: "not_approved" };
+        if (current.status === "denied") return { claimed: false, reason: "denied" };
+        return { claimed: false, reason: current.status };
+    }
+
+    /**
+     * R2 — Settle a claimed (executing) action: `executed` (with optional artifact)
+     * or `failed` (with errorCode). No-op when the action is already settled.
+     */
+    completeAction(scope, actionId, { ok = true, errorCode = null, artifactId = null } = {}) {
+        ensureSchema();
+        const { userId, tenantId } = requireCodingScope(scope, "action");
+        const id = String(actionId);
+        const runRow = db.prepare(
+            "SELECT run_id, status FROM coding_actions WHERE id = ? AND owner_user_id = ? AND tenant_id = ?",
+        ).get(id, userId, tenantId);
+        if (!runRow) throw codingError("NOT_FOUND", "action not found", 404);
+        if (runRow.status === "executed" || runRow.status === "failed") return this._getAction({ userId, tenantId }, id);
+
+        const changed = db.prepare(
+            `UPDATE coding_actions
+             SET status = ?, error_code = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND owner_user_id = ? AND tenant_id = ? AND status = 'executing'`,
+        ).run(ok ? "executed" : "failed", ok ? null : String(errorCode || "EXECUTION_FAILED").slice(0, 128), id, userId, tenantId).changes;
+        if (!changed) {
+            // Action was not in 'executing' (e.g. denied meanwhile) — leave as is.
+            return this._getAction({ userId, tenantId }, id);
+        }
+        this._append({ userId, tenantId }, runRow.run_id, {
+            type: ok ? "action.executed" : "action.exec_failed",
+            payload: { actionId: id, artifactId: artifactId || null, errorCode: ok ? null : errorCode || null },
+        });
+        return this._getAction({ userId, tenantId }, id);
+    }
+
+    /** Actions that were owner-approved but not yet claimed/settled (resume candidates). */
+    pendingApprovedActions(scope, runId) {
+        ensureSchema();
+        const { userId, tenantId } = requireCodingScope(scope, "action");
+        return db.prepare(
+            `SELECT * FROM coding_actions
+             WHERE run_id = ? AND owner_user_id = ? AND tenant_id = ? AND status = 'approved'
+             ORDER BY seq ASC`,
+        ).all(String(runId), userId, tenantId).map(toAction);
+    }
 }
 
 export const defaultApprovalService = new ApprovalService();

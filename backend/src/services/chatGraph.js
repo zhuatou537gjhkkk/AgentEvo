@@ -1538,6 +1538,19 @@ async function knowledgeAgentNode(state, config) {
 // ═══════════════════════════════════════════════════════
 
 async function codeAgentNode(state, config) {
+    // Phase 7 / R2 thin adapter: when a server-verified coding task is attached to
+    // the graph run (explicit project + coding run + policy, resolved server-side —
+    // never from client/model intent), the code node runs the BOUNDED coding loop
+    // (CodeAgentService) over the run's disposable worktree. Otherwise the node is
+    // the original text-only code agent, byte-for-byte unchanged.
+    const coding = config?.configurable?.codingTask;
+    if (coding?.active === true && typeof coding?.decider === "function") {
+        return runCodingAgentNode(state, config, coding);
+    }
+    return runTextCodeAgentNode(state, config);
+}
+
+async function runTextCodeAgentNode(state, config) {
     const solo = isSoloRun(state);
     console.log(`[graph][code] starting (mode=${solo ? 'solo' : 'parallel'})`);
 
@@ -1665,6 +1678,85 @@ async function codeAgentNode(state, config) {
         currentAgent: "code",
         tokenUsage: parallelUsage,
     };
+}
+
+// ═══════════════════════════════════════════════════════
+// 编码 Agent (R2)：薄 adapter 的 workspace 分支 —— 有界 ReAct
+// ═══════════════════════════════════════════════════════
+
+/**
+ * Phase 7 / R2 — bounded coding run as a `code_agent` node body.
+ *
+ * `coding` is a SERVER-VERIFIED task descriptor (`config.configurable.codingTask`):
+ * `{ active:true, scope:{userId,tenantId}, run, project, goal, decider, budget }`.
+ * It exists only when an explicit coding run + project + policy passed the
+ * server gate — never constructed from client/model intent. Runs the bounded
+ * CodeAgentService loop (context→plan→action→observe→verify→summary) against the
+ * run's disposable worktree; every write/exec op is an action/approval/artifact.
+ *
+ * If the loop pauses for an owner decision the node returns a *waiting* partial
+ * (the run's durable `waiting_approval` state + transcript); a later live turn
+ * resumes the exact approved action. Result fields stay graph-compatible so the
+ * main Synthesizer merges them exactly as it does the text-only node.
+ */
+async function runCodingAgentNode(state, config, coding) {
+    const sse = config?.configurable?.sse;
+    const agentType = "code";
+    emitAgentStart(sse, state, agentType);
+    let plan = emitPlanProgress(sse, state.plan, 'agent_start');
+
+    const { defaultCodingAgentService } = await import("../coding/codingAgent.js");
+    const session = defaultCodingAgentService.begin(coding.scope, {
+        run: coding.run,
+        project: coding.project,
+        goal: coding.goal ?? state.userInput,
+        decide: coding.decider,
+        budget: coding.budget,
+        onEvent: coding.onEvent || null,
+    });
+    const snapshot = await defaultCodingAgentService.run(session);
+    const summaryText = snapshot.summary || (snapshot.result?.codeResults) || `编码任务已暂停（${snapshot.phase}）`;
+
+    const updatedSubTasks = (state.subTasks || []).map((s) => {
+        if (state.currentSubTask && s.id === state.currentSubTask.id) {
+            const done = snapshot.phase === "done";
+            return { ...s, status: done ? "completed" : (snapshot.phase === "awaiting_owner_decision" ? "waiting_approval" : s.status) };
+        }
+        return s;
+    });
+
+    // Only the terminal summary is streamed as a normal text chunk — no new SSE
+    // type is introduced here, so the frontend whitelist/FSM stay compatible.
+    if (sse) {
+        if (snapshot.phase === "done") {
+            if (summaryText) sse.textChunk(summaryText);
+            plan = emitPlanProgress(sse, plan, 'all_done');
+        } else if (snapshot.phase === "awaiting_owner_decision") {
+            sse.textChunk(`⏸ 编码任务需要你批准下一步操作（run ${coding.run.id}，action ${snapshot.pending?.actionId}）。请在运行面板中决定。`);
+        } else {
+            sse.textChunk(`编码任务停止：${snapshot.haltReason || snapshot.phase}`);
+            plan = emitPlanProgress(sse, plan, 'all_done');
+        }
+        sse.agentEnd(agentType);
+    }
+
+    const base = {
+        plan,
+        currentAgent: "code",
+        tokenUsage: null,
+        subTasks: updatedSubTasks,
+    };
+
+    // Plan 模式：结果进入 planResults（与文本节点一致）。
+    if (state.currentSubTask) {
+        return {
+            ...base,
+            planResults: snapshot.phase === "done"
+                ? { [state.currentSubTask.id]: summaryText }
+                : (state.planResults || {}),
+        };
+    }
+    return { ...base, codeResults: summaryText };
 }
 
 // ═══════════════════════════════════════════════════════
@@ -2578,4 +2670,6 @@ export {
     defaultMakeLlm,
     resolveMakeLlm,
     isErrorResultText,
+    codeAgentNode,
+    runCodingAgentNode,
 };

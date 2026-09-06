@@ -11,6 +11,7 @@ import { sendError, svcFn } from "./deps.js";
 import { notFoundResource } from "../security/resourceScope.js";
 import { codingCapabilities, codingEventLogEnabled, codingWorkspaceEnabled } from "../coding/flags.js";
 import { scopeFromRequest } from "../security/resourceScope.js";
+import { prepareRunOpRequest } from "../coding/runner/protocol.js";
 
 function workspaceGate(req, res, next) {
     if (!codingWorkspaceEnabled()) {
@@ -48,7 +49,22 @@ function services(req) {
         approvals: svcFn(req, "approvalService"),
         registry: svcFn(req, "codingRuntimeRegistry"),
         workspace: svcFn(req, "workspaceRunner"),
+        // R2 — disposable worktree lifecycle + run-scoped ops + artifact ledger.
+        worktrees: svcFn(req, "worktreeManager"),
+        runRunner: svcFn(req, "codingRunRunner"),
+        artifacts: svcFn(req, "codingArtifactService"),
     };
+}
+
+/** Load the owner-scoped run + its project record for run-scoped ops. */
+function fetchRunProject(req, res, services) {
+    const scope = scopeFromRequest(req);
+    const run = services.runs.getRun(scope, req.params.runId);
+    if (!run) { notFoundResource(res, "coding run not found"); return null; }
+    const project = run.projectId ? services.projects.get(scope, run.projectId) : null;
+    if (run.projectId && !project) { notFoundResource(res, "coding project not found"); return null; }
+    if (!project) { res.status(400).json({ ok: false, error: "RUN_NO_PROJECT", errorCode: "RUN_NO_PROJECT", message: "this run has no project — workspace ops require one", retryable: false }); return null; }
+    return { scope, run, project };
 }
 
 function positiveInt(value, fallback) {
@@ -317,6 +333,89 @@ export function registerCodingRoutes(router, { requireAuth }) {
                 reason: req.body?.reason ?? null,
             });
             return res.json({ ok: true, ...result });
+        } catch (error) {
+            return sendError(res, req.requestId, error);
+        }
+    });
+
+    // ── R2 run-scoped workspace: provision / ops / resume / teardown / artifacts ──
+    // Writes + commands flow through the run action executor (action/approval/
+    // artifact transcript) and land ONLY in the run's disposable worktree. Reads
+    // are dispatched by the read runner at the worktree (or main) root. The
+    // project /ops surface above stays read-only — this is the write path.
+
+    coding.post("/runs/:runId/provision", async (req, res) => {
+        const ctx = fetchRunProject(req, res, services(req));
+        if (!ctx) return;
+        try {
+            const run = await services(req).worktrees.provision(ctx.scope, { project: ctx.project, run: ctx.run });
+            return res.json({ ok: true, run });
+        } catch (error) {
+            return sendError(res, req.requestId, error);
+        }
+    });
+
+    coding.post("/runs/:runId/teardown", async (req, res) => {
+        const ctx = fetchRunProject(req, res, services(req));
+        if (!ctx) return;
+        try {
+            const run = await services(req).worktrees.teardown(ctx.scope, { project: ctx.project, run: ctx.run });
+            return res.json({ ok: true, run });
+        } catch (error) {
+            return sendError(res, req.requestId, error);
+        }
+    });
+
+    // One run-scoped op. `wait:true` blocks a live turn until an owner decision
+    // when the preset requires approval; `wait` omitted/false returns
+    // awaiting_approval without executing. Read ops are immediate.
+    coding.post("/runs/:runId/ops", async (req, res) => {
+        const ctx = fetchRunProject(req, res, services(req));
+        if (!ctx) return;
+        const { op, args } = req.body || {};
+        try {
+            const request = prepareRunOpRequest(op, args);
+            const wait = req.body?.wait === true;
+            const result = await services(req).runRunner.runOp(ctx.scope, {
+                run: ctx.run,
+                project: ctx.project,
+                request,
+                opts: { wait },
+            });
+            return res.json({ ok: true, ...result });
+        } catch (error) {
+            return sendError(res, req.requestId, error);
+        }
+    });
+
+    // Resume an owner-approved action with live args (idempotent: the atomic
+    // claim guarantees the side effect runs at most once across reconnects).
+    coding.post("/runs/:runId/actions/:actionId/execute", async (req, res) => {
+        const ctx = fetchRunProject(req, res, services(req));
+        if (!ctx) return;
+        const { op, args } = req.body || {};
+        try {
+            const request = prepareRunOpRequest(op, args);
+            const result = await services(req).runRunner.resumeApproved(ctx.scope, {
+                run: ctx.run,
+                project: ctx.project,
+                request,
+                actionId: req.params.actionId,
+            });
+            return res.json({ ok: true, ...result });
+        } catch (error) {
+            return sendError(res, req.requestId, error);
+        }
+    });
+
+    coding.get("/runs/:runId/artifacts", (req, res) => {
+        try {
+            const ctx = fetchRunProject(req, res, services(req));
+            if (!ctx) return;
+            const items = services(req).artifacts.listForRun(ctx.scope, ctx.run.id, {
+                limit: positiveInt(req.query.limit, 500),
+            });
+            return res.json({ ok: true, artifacts: items, count: items.length });
         } catch (error) {
             return sendError(res, req.requestId, error);
         }

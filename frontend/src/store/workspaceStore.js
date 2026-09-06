@@ -12,6 +12,8 @@ import {
     friendlyWorkspaceError,
     buildRepoContextRef,
     lineWindowLabel,
+    frameGitDiff,
+    worktreeStatusLabel,
 } from '../utils/workspaceModel';
 import { setPendingRepoContext } from './chatStore';
 
@@ -72,6 +74,21 @@ const initial = {
     runEvents: { runId: null, events: [], afterSeq: 0, loading: false, error: null },
     runActionId: null,
 
+    // ── R2 write-run control (Phase 7 / R2, run-scoped ops) ──
+    selectedRunId: null,
+    runDetail: null,            // fresh run row (worktreeStatus/branch/baseCommit...)
+    runDetailLoading: false,
+    runDetailError: null,
+    runOpsBusy: false,          // a run-scoped write/exec/execute call is in flight
+    runActions: { items: [], loading: false, error: null },
+    runApprovals: { items: [], loading: false, error: null },
+    runArtifacts: { items: [], loading: false, error: null },
+    runGit: { status: null, loading: false, error: null },
+    runDiff: { text: '', filesChanged: [], truncated: false, byteLength: null, loading: false, error: null },
+    runFileView: { path: null, lines: [], startLine: 1, lineCount: 0, truncated: false, loading: false, error: null },
+    pendingRunOps: {},          // runId → { actionId, approvalId, op, args } live args for a paused action
+    lastCommandOutputs: [],     // newest first, capped; live stdout/stderr after an approved exec
+
     // attach chip
     attach: null,
     attachLabel: null,
@@ -83,6 +100,23 @@ const initial = {
 
 let toastTimer = null;
 
+/** Empty R2 run-control transient (used when switching project/run). */
+const EMPTY_RUN_CONTROL = {
+    selectedRunId: null,
+    runDetail: null,
+    runDetailLoading: false,
+    runDetailError: null,
+    runOpsBusy: false,
+    runActions: { items: [], loading: false, error: null },
+    runApprovals: { items: [], loading: false, error: null },
+    runArtifacts: { items: [], loading: false, error: null },
+    runGit: { status: null, loading: false, error: null },
+    runDiff: { text: '', filesChanged: [], truncated: false, byteLength: null, loading: false, error: null },
+    runFileView: { path: null, lines: [], startLine: 1, lineCount: 0, truncated: false, loading: false, error: null },
+    pendingRunOps: {},
+    lastCommandOutputs: [],
+};
+
 export const useWorkspaceStore = create((set, get) => {
     const showToast = (text, kind = 'info') => {
         set({ toastKind: kind, toastText: text });
@@ -93,6 +127,7 @@ export const useWorkspaceStore = create((set, get) => {
     const fail = (error) => friendlyWorkspaceError(error);
 
     const resetProjectState = () => set({
+        ...EMPTY_RUN_CONTROL,
         workspace: null,
         openError: null,
         treeBase: '',
@@ -410,6 +445,387 @@ export const useWorkspaceStore = create((set, get) => {
                 } });
             } catch (error) {
                 set({ runEvents: { ...get().runEvents, loading: false, error: fail(error) } });
+            }
+        },
+
+        // ═══════════════════════════════════════════════════════════
+        // R2 write-run control (Phase 7 / R2) — run-scoped ops/approvals.
+        // The server is authoritative for capability/preset; the panel only
+        // mirrors run.preset and gates on /coding/capabilities. Live op args are
+        // held in memory (pendingRunOps, keyed by run) so approve→execute can
+        // re-supply the IDENTICAL op+args — never reconstructed from the row.
+        // ═══════════════════════════════════════════════════════════
+
+        resetRunControlState() {
+            set({ ...EMPTY_RUN_CONTROL });
+        },
+        async openRunDetail(runId) {
+            const id = String(runId || '');
+            if (!id) return;
+            set({ selectedRunId: id });
+            await get().refreshRunDetail(id);
+        },
+        closeRunDetail() {
+            set({ ...EMPTY_RUN_CONTROL });
+        },
+        /** Reconnect-safe re-pull: run + actions + approvals + artifacts + events. */
+        async refreshRunDetail(runId) {
+            const id = String(runId || get().selectedRunId || '');
+            if (!id) return null;
+            set({ runDetailLoading: true, runDetailError: null });
+            try {
+                const body = await workspaceApi.fetchRun(id);
+                const run = body.run || null;
+                set({ runDetail: run, runDetailLoading: false });
+            } catch (error) {
+                set({ runDetailLoading: false, runDetailError: fail(error) });
+            }
+            await Promise.all([
+                get().reloadRunActions(id),
+                get().reloadRunApprovals(id),
+                get().reloadRunArtifacts(id),
+            ]);
+            get().loadRunEvents(id);
+            return get().runDetail;
+        },
+        async reloadRunActions(runId) {
+            const id = String(runId || get().selectedRunId || '');
+            if (!id) return [];
+            set({ runActions: { ...get().runActions, loading: true, error: null } });
+            try {
+                const body = await workspaceApi.listRunActions(id);
+                set({ runActions: { items: body.actions || [], loading: false, error: null } });
+                return body.actions || [];
+            } catch (error) {
+                set({ runActions: { items: [], loading: false, error: fail(error) } });
+                return [];
+            }
+        },
+        async reloadRunApprovals(runId) {
+            const id = String(runId || get().selectedRunId || '');
+            if (!id) return [];
+            set({ runApprovals: { ...get().runApprovals, loading: true, error: null } });
+            try {
+                const body = await workspaceApi.listRunApprovals(id);
+                set({ runApprovals: { items: body.approvals || [], loading: false, error: null } });
+                return body.approvals || [];
+            } catch (error) {
+                set({ runApprovals: { items: [], loading: false, error: fail(error) } });
+                return [];
+            }
+        },
+        async reloadRunArtifacts(runId) {
+            const id = String(runId || get().selectedRunId || '');
+            if (!id) return [];
+            set({ runArtifacts: { ...get().runArtifacts, loading: true, error: null } });
+            try {
+                const body = await workspaceApi.listRunArtifacts(id);
+                set({ runArtifacts: { items: body.artifacts || [], loading: false, error: null } });
+                return body.artifacts || [];
+            } catch (error) {
+                set({ runArtifacts: { items: [], loading: false, error: fail(error) } });
+                return [];
+            }
+        },
+
+        /** Create a write-enabled run (edit/trusted). Server gates on writeTools. */
+        async createWriteRun(mode) {
+            const preset = ['edit', 'trusted'].includes(String(mode || '')) ? String(mode) : null;
+            if (!preset) {
+                showToast('请选择 edit 或 trusted 模式', 'error');
+                return null;
+            }
+            const projectId = get().selectedProjectId;
+            if (!projectId) {
+                showToast('请先选择并信任一个项目', 'error');
+                return null;
+            }
+            if ((get().capabilities || {}).writeTools !== true) {
+                showToast('服务端未启用文件写入能力，无法创建写 run（CODING_WRITE_TOOLS_ENABLED）', 'error');
+                return null;
+            }
+            try {
+                const body = await workspaceApi.createRun({ projectId, sessionId: null, mode: preset });
+                const run = body.run || null;
+                showToast(
+                    preset === 'trusted' ? '已创建 trusted write run（文件写入自动批准，命令仍需审批）' : '已创建 edit write run（文件写入需 owner 审批）',
+                    'ok',
+                );
+                await get().loadRuns();
+                if (run?.id) await get().openRunDetail(run.id);
+                return run;
+            } catch (error) {
+                showToast(fail(error), 'error');
+                return null;
+            }
+        },
+        async provisionRun(runId) {
+            const id = String(runId || '');
+            if (!id) return null;
+            set({ runOpsBusy: true });
+            try {
+                const body = await workspaceApi.provisionRun(id);
+                const run = body.run || null;
+                if (run) set({ runDetail: run });
+                const ws = String(run?.worktreeStatus || '');
+                if (ws === 'ready') {
+                    showToast(`工作树已就绪：${run.worktreeBranch || '-'} @ base ${String(run.baseCommit || '').slice(0, 8)}`, 'ok');
+                } else if (ws === 'unsupported') {
+                    showToast('该项目不是 Git 工作树顶层：保持只读，无法写入/执行', 'info');
+                } else {
+                    showToast('工作树状态：' + worktreeStatusLabel(ws), 'info');
+                }
+                await get().loadRuns();
+                return run;
+            } catch (error) {
+                showToast(fail(error), 'error');
+                return null;
+            } finally {
+                set({ runOpsBusy: false });
+            }
+        },
+        async teardownRun(runId) {
+            const id = String(runId || '');
+            if (!id) return null;
+            set({ runOpsBusy: true });
+            try {
+                const body = await workspaceApi.teardownRun(id);
+                const run = body.run || null;
+                if (run) set({ runDetail: run });
+                showToast('工作树已拆除（主 checkout 不受影响）', 'info');
+                await get().loadRuns();
+                return run;
+            } catch (error) {
+                showToast(fail(error), 'error');
+                return null;
+            } finally {
+                set({ runOpsBusy: false });
+            }
+        },
+        async runStart(runId) {
+            const id = String(runId || '');
+            if (!id) return null;
+            set({ runOpsBusy: true });
+            try {
+                const body = await workspaceApi.startRun(id);
+                const run = body.run || null;
+                if (run) set({ runDetail: run });
+                showToast('run 已启动', 'ok');
+                return run;
+            } catch (error) {
+                showToast(fail(error), 'error');
+                return null;
+            } finally {
+                set({ runOpsBusy: false });
+            }
+        },
+        async runCancel(runId) {
+            const id = String(runId || '');
+            if (!id) return null;
+            set({ runOpsBusy: true });
+            try {
+                const body = await workspaceApi.cancelRun(id);
+                const run = body.run || null;
+                if (run) set({ runDetail: run });
+                showToast('run 已取消（进程树已终止）', 'info');
+                return run;
+            } catch (error) {
+                showToast(fail(error), 'error');
+                return null;
+            } finally {
+                set({ runOpsBusy: false });
+            }
+        },
+
+        // ── R2 run-scoped reads (worktree root once provisioned) ──
+        async refreshRunGit(runId) {
+            const id = String(runId || '');
+            if (!id) return;
+            set({ runGit: { ...get().runGit, loading: true, error: null } });
+            try {
+                const body = await workspaceApi.runRunOp(id, 'git.status', {});
+                set({ runGit: { status: body?.data || null, loading: false, error: null } });
+            } catch (error) {
+                set({ runGit: { status: null, loading: false, error: fail(error) } });
+            }
+            await get().showRunDiff(id, null);
+        },
+        async showRunDiff(runId, path) {
+            const id = String(runId || '');
+            if (!id) return;
+            set({ runDiff: { text: '', filesChanged: [], truncated: false, byteLength: null, loading: true, error: null } });
+            try {
+                const body = await workspaceApi.runRunOp(id, 'git.diff', { ...(path ? { path } : {}) });
+                const framed = frameGitDiff(body?.data || {});
+                set({ runDiff: {
+                    text: framed.text,
+                    filesChanged: framed.filesChanged,
+                    truncated: framed.truncated,
+                    byteLength: framed.byteLength,
+                    loading: false,
+                    error: null,
+                } });
+            } catch (error) {
+                set({ runDiff: { text: '', filesChanged: [], truncated: false, byteLength: null, loading: false, error: fail(error) } });
+            }
+        },
+        async readRunFile(runId, path, startLine) {
+            const id = String(runId || '');
+            if (!id || !path) return;
+            set({ runFileView: { path, lines: [], startLine: 1, lineCount: 0, truncated: false, loading: true, error: null } });
+            try {
+                const body = await workspaceApi.runRunOp(id, 'read_file', {
+                    path,
+                    start_line: Math.max(1, Number(startLine) || 1),
+                    max_lines: 300,
+                });
+                const data = body?.data || {};
+                set({ runFileView: {
+                    path: data.path || path,
+                    startLine: Number(data.startLine) || 1,
+                    lineCount: Number(data.lineCount) || 0,
+                    lines: Array.isArray(data.lines) ? data.lines : [],
+                    truncated: data.truncated === true,
+                    loading: false,
+                    error: null,
+                } });
+            } catch (error) {
+                set({ runFileView: { path, lines: [], startLine: 1, lineCount: 0, truncated: false, loading: false, error: fail(error) } });
+            }
+        },
+
+        /** Remove the paused live args for a run/action (settled or denied). */
+        _dropPendingForAction(runId, actionId) {
+            const pending = { ...(get().pendingRunOps || {}) };
+            const held = pending[runId];
+            if (held && actionId && held.actionId === actionId) delete pending[runId];
+            set({ pendingRunOps: pending });
+        },
+        _rememberRunCommand(runId, actionId, data = {}) {
+            const entry = {
+                runId: String(runId || ''),
+                actionId: actionId || null,
+                at: new Date().toISOString(),
+                executable: data?.executable || null,
+                code: data?.code == null ? null : Number(data.code),
+                stdout: String(data?.stdout || ''),
+                stderr: String(data?.stderr || ''),
+                timedOut: data?.timedOut === true,
+                cancelled: data?.cancelled === true,
+                truncated: data?.truncated === true,
+            };
+            set({ lastCommandOutputs: [entry, ...(get().lastCommandOutputs || [])].slice(0, 6) });
+        },
+
+        /**
+         * Run one run-scoped op. Read ops resolve immediately ({effect:'read'});
+         * write/exec resolve executed (auto/approved) or awaiting_approval — the
+         * latter stores the live op+args under pendingRunOps[runId] for resume.
+         */
+        async submitRunOp(runId, op, args = {}, opts = {}) {
+            const id = String(runId || '');
+            if (!id) return { ok: false };
+            if (get().runOpsBusy) return { ok: false, busy: true };
+            set({ runOpsBusy: true });
+            try {
+                const body = await workspaceApi.runRunOp(id, op, args, opts.wait === true);
+                if (!body || body.ok === false) return { ok: false };
+                if (body.effect === 'read') {
+                    return { ok: true, effect: 'read', op: body.op || op, data: body.data || {} };
+                }
+                if (body.status === 'awaiting_approval') {
+                    const action = body.action || {};
+                    const approval = body.approval || {};
+                    set({ pendingRunOps: { ...(get().pendingRunOps || {}), [id]: { actionId: action.id, approvalId: approval.id, op, args } } });
+                    if (body.run) set({ runDetail: body.run });
+                    await Promise.all([get().reloadRunActions(id), get().reloadRunApprovals(id)]);
+                    return { ok: true, status: 'awaiting_approval', action, approval, body };
+                }
+                if (body.status === 'executed') {
+                    if (body.run) set({ runDetail: body.run });
+                    get()._dropPendingForAction(id, body.action?.id);
+                    const data = body.data || {};
+                    if (String(op) === 'run_command') get()._rememberRunCommand(id, body.action?.id, data);
+                    await Promise.all([
+                        get().reloadRunActions(id),
+                        get().reloadRunApprovals(id),
+                        get().reloadRunArtifacts(id),
+                    ]);
+                    return { ok: true, status: 'executed', data, action: body.action || null, artifact: body.artifact || null, body };
+                }
+                return { ok: true, body };
+            } catch (error) {
+                return { ok: false, error };
+            } finally {
+                set({ runOpsBusy: false });
+            }
+        },
+
+        /** Owner decides one approval: approve records intent; deny clears live args. */
+        async decideRunApproval(runId, approvalId, approve, reason = null) {
+            const aId = String(approvalId || '');
+            if (!aId) return { ok: false };
+            set({ runOpsBusy: true });
+            try {
+                const body = await workspaceApi.decideApproval(aId, Boolean(approve), reason);
+                const action = body?.action || null;
+                if (!approve && action?.id) get()._dropPendingForAction(String(runId || ''), action.id);
+                await Promise.all([
+                    get().reloadRunApprovals(String(runId || '')),
+                    get().reloadRunActions(String(runId || '')),
+                ]);
+                return { ok: true, approval: body?.approval || null, action, body };
+            } catch (error) {
+                return { ok: false, error };
+            } finally {
+                set({ runOpsBusy: false });
+            }
+        },
+
+        /** 批准并执行：decide approve, then execute with the identical live op+args. */
+        async approveAndExecuteRunOp(runId, actionId) {
+            const id = String(runId || '');
+            const held = (get().pendingRunOps || {})[id];
+            if (!held || (actionId && held.actionId !== actionId)) {
+                showToast('该审批的实时参数已丢失（重连后参数不落库），请重新发起该操作以执行', 'error');
+                return { ok: false, reason: 'no_pending_args' };
+            }
+            const decided = await get().decideRunApproval(id, held.approvalId, true, null);
+            if (!decided?.ok) {
+                if (decided?.error) showToast(fail(decided.error), 'error');
+                return { ok: false };
+            }
+            return get().executePendingRunOp(id, held.actionId);
+        },
+
+        /** Execute an approved-but-unexecuted action with its stored live args. */
+        async executePendingRunOp(runId, actionId) {
+            const id = String(runId || '');
+            const held = (get().pendingRunOps || {})[id];
+            if (!held || (actionId && held.actionId !== actionId)) {
+                showToast('该操作的实时参数已丢失（重连后参数不落库），请重新发起以执行', 'error');
+                return { ok: false, reason: 'no_pending_args' };
+            }
+            set({ runOpsBusy: true });
+            try {
+                const body = await workspaceApi.executeApprovedAction(id, held.actionId, held.op, held.args);
+                const pending = { ...(get().pendingRunOps || {}) };
+                delete pending[id];
+                set({ pendingRunOps: pending });
+                if (body?.run) set({ runDetail: body.run });
+                const status = body?.status || 'executed';
+                const data = body?.data || {};
+                if (status === 'executed' && String(held.op) === 'run_command') get()._rememberRunCommand(id, held.actionId, data);
+                await Promise.all([
+                    get().reloadRunActions(id),
+                    get().reloadRunApprovals(id),
+                    get().reloadRunArtifacts(id),
+                ]);
+                return { ok: true, status, data, action: body?.action || null, artifact: body?.artifact || null, settled: data?.settled === true, body };
+            } catch (error) {
+                return { ok: false, error };
+            } finally {
+                set({ runOpsBusy: false });
             }
         },
 

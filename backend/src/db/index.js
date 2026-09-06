@@ -386,6 +386,22 @@ function ensureScopedSchema(defaultUserId) {
     )`).run();
     db.prepare("CREATE INDEX IF NOT EXISTS idx_coding_artifacts_scope_run ON coding_artifacts(owner_user_id, tenant_id, run_id)").run();
 
+    // ── Phase 7 / R2 — write-enabled run: preset + worktree identity ──
+    // Additive columns on coding_runs. Server-decided facts only: preset is the
+    // locked permission level (observe|edit|trusted), base_commit/base_branch
+    // identify the point the run's disposable worktree was created from, and
+    // worktree_path/branch/status track its lifecycle. `none` = never provisioned,
+    // `ready` = git worktree live, `unsupported` = non-git (read-only MVP),
+    // `failed`/`removed` = provisioning failed / torn down. All default-off so an
+    // un-migrated older binary never reads a wrong shape (NULLs → `none`).
+    addColumn("coding_runs", "preset", "TEXT NOT NULL DEFAULT 'observe'");
+    addColumn("coding_runs", "worktree_path", "TEXT");
+    addColumn("coding_runs", "worktree_branch", "TEXT");
+    addColumn("coding_runs", "base_branch", "TEXT");
+    addColumn("coding_runs", "base_commit", "TEXT");
+    addColumn("coding_runs", "worktree_status", "TEXT NOT NULL DEFAULT 'none'");
+    addColumn("coding_runs", "provisioned_at", "DATETIME");
+
     const seedPath = path.resolve(__dirname, "../mcp/servers.json");
     try {
         const seeds = JSON.parse(fs.readFileSync(seedPath, "utf8")).servers || [];
@@ -419,6 +435,8 @@ function ensureScopedSchema(defaultUserId) {
         .run("W4-R5-S1", JSON.stringify({ policy: "additive advisory-lock table upload_key_locks (durable same-key cross-process upload lock); no data rewrite" }));
     db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
         .run("R0-CODING-1", JSON.stringify({ policy: "additive owner-scoped coding_projects/runs/events/actions/approvals/artifacts; no legacy rewrite; secrets/provider errors never persisted", tables: 6 }));
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("R2-CODING-1", JSON.stringify({ policy: "additive coding_runs preset + worktree identity columns; no data rewrite", columns: ["preset", "worktree_path", "worktree_branch", "base_branch", "base_commit", "worktree_status", "provisioned_at"] }));
 
 }
 

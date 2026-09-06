@@ -7,8 +7,16 @@ import { request } from './chat.js';
 
 const CODING_BASE = '/coding';
 
+/**
+ * Resolve the shared transport result to its JSON envelope. `request()` returns
+ * the raw `Response` on success; parse `.json()` when present so every wrapper
+ * resolves the `{ ok, ... }` body its consumers read fields off directly.
+ */
 async function unwrap(promise) {
     const body = await promise;
+    if (body && typeof body.json === 'function') {
+        return body.json();
+    }
     return body;
 }
 
@@ -88,4 +96,82 @@ export function cancelRun(runId) {
 
 export function fetchRunEvents(runId, afterSeq = 0) {
     return unwrap(request(`${CODING_BASE}/runs/${encodeURIComponent(runId)}/events?after_seq=${Number(afterSeq) || 0}`));
+}
+
+// ── R2 run-scoped write/exec: provision / teardown / ops / approvals / artifacts ──
+// Writes + commands land ONLY in the run's disposable worktree through the action
+// executor; reads target the run's resolved root (worktree when provisioned).
+
+/** POST /coding/runs/:id/provision — create the run's disposable worktree. */
+export function provisionRun(runId) {
+    return unwrap(request(`${CODING_BASE}/runs/${encodeURIComponent(runId)}/provision`, {
+        method: 'POST',
+    }));
+}
+
+/** POST /coding/runs/:id/teardown — remove the run's disposable worktree. */
+export function teardownRun(runId) {
+    return unwrap(request(`${CODING_BASE}/runs/${encodeURIComponent(runId)}/teardown`, {
+        method: 'POST',
+    }));
+}
+
+/**
+ * POST /coding/runs/:id/ops — one run-scoped op.
+ * Read ops → { effect:'read', op, data }. Write/exec → { status:'executed' |
+ * 'awaiting_approval', run, action, approval, artifact?, data? }. `wait` omitted/
+ * false never blocks: approve-mode ops return awaiting_approval immediately.
+ */
+export function runRunOp(runId, op, args = {}, wait = false) {
+    return unwrap(request(`${CODING_BASE}/runs/${encodeURIComponent(runId)}/ops`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ op, args, wait: Boolean(wait) }),
+    }));
+}
+
+/**
+ * POST /coding/runs/:id/actions/:actionId/execute — resume an owner-approved
+ * action with the IDENTICAL live op+args the caller originally submitted
+ * (args are never reconstructed server-side; the atomic claim runs at most once).
+ */
+export function executeApprovedAction(runId, actionId, op, args = {}) {
+    return unwrap(request(
+        `${CODING_BASE}/runs/${encodeURIComponent(runId)}/actions/${encodeURIComponent(actionId)}/execute`,
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ op, args }),
+        },
+    ));
+}
+
+/** GET /coding/runs/:id/actions → { actions, count }. */
+export function listRunActions(runId) {
+    return unwrap(request(`${CODING_BASE}/runs/${encodeURIComponent(runId)}/actions`));
+}
+
+/** GET /coding/runs/:id/approvals?status= → { approvals, count }. */
+export function listRunApprovals(runId, { status } = {}) {
+    const query = status ? `?status=${encodeURIComponent(status)}` : '';
+    return unwrap(request(`${CODING_BASE}/runs/${encodeURIComponent(runId)}/approvals${query}`));
+}
+
+/** POST /coding/approvals/:approvalId/decision — owner approves or denies. */
+export function decideApproval(approvalId, approve, reason = null) {
+    return unwrap(request(`${CODING_BASE}/approvals/${encodeURIComponent(approvalId)}/decision`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ approve: Boolean(approve), reason: reason || null }),
+    }));
+}
+
+/** GET /coding/runs/:id/artifacts → { artifacts, count }. */
+export function listRunArtifacts(runId) {
+    return unwrap(request(`${CODING_BASE}/runs/${encodeURIComponent(runId)}/artifacts`));
+}
+
+/** GET /coding/runs/:id — fresh run row (reconnect re-pull). */
+export function fetchRun(runId) {
+    return unwrap(request(`${CODING_BASE}/runs/${encodeURIComponent(runId)}`));
 }

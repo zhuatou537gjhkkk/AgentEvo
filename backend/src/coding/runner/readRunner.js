@@ -241,8 +241,19 @@ export class WorkspaceReadRunner {
     }
 
     async invoke(project, op, args) {
-        const { op: cleanOp, args: clean } = prepareOpRequest(op, args);
         const canonicalRoot = resolveProjectRoot(project);
+        return this.invokeAtRoot(canonicalRoot, project, op, args);
+    }
+
+    /**
+     * Read-op dispatch against an EXPLICIT canonical root (R2 run-scoped reads
+     * target the run's disposable worktree; project reads target the registered
+     * root). `project` is only used for owner-agnostic audit labels — capability
+     * (trust/terminal/allowed-roots) is resolved by the caller before this is
+     * reached (resolveProjectRoot for project mode, WorktreeManager for run mode).
+     */
+    async invokeAtRoot(canonicalRoot, project, op, args) {
+        const { op: cleanOp, args: clean } = prepareOpRequest(op, args);
 
         let data;
         switch (cleanOp) {

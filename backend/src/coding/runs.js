@@ -14,7 +14,7 @@
  * R0 exercises created → running → cancelled/terminal via start/cancel.
  */
 import db, { initDB } from "../db/index.js";
-import { codingCapabilities } from "./flags.js";
+import { codingCapabilities, codingWriteToolsEnabled } from "./flags.js";
 import { codingEventLogEnabled } from "./flags.js";
 import defaultEventStore from "./events.js";
 import { codingError, newId, requireCodingScope, sanitizeStored } from "./util.js";
@@ -32,8 +32,10 @@ const RUN_STATUS = new Set([
     "completed", "failed", "cancelled",
 ]);
 const TERMINAL_RUN_STATUS = new Set(["completed", "failed", "cancelled"]);
-// R0 contract: only observe mode is available (no write/exec tooling yet).
-const ALLOWED_MODES = new Set(["observe"]);
+// R2: presets. `observe` is the only mode available before CODING_WRITE_TOOLS_ENABLED;
+// `edit` (write needs approval) and `trusted` (write auto-approved by policy) are
+// write-enabled run modes — their creation is gated server-side by the write flag.
+const ALLOWED_MODES = new Set(["observe", "edit", "trusted"]);
 const STARTABLE_FROM = new Set(["created", "preparing", "planning"]);
 const EVENT_FOR = {
     running: "run.started",
@@ -50,10 +52,18 @@ function toRun(row) {
         sessionId: row.session_id,
         status: row.status,
         mode: row.mode,
+        preset: row.preset || row.mode || "observe",
         snapshot: (() => { try { return JSON.parse(row.snapshot_json); } catch { return {}; } })(),
         eventSeq: Number(row.event_seq),
         cancelled: Number(row.cancelled) === 1,
         errorCode: row.error_code,
+        // R2 write-enabled run identity (server-decided; NULLs → empty defaults)
+        worktreePath: row.worktree_path || null,
+        worktreeBranch: row.worktree_branch || null,
+        baseBranch: row.base_branch || null,
+        baseCommit: row.base_commit || null,
+        worktreeStatus: row.worktree_status || "none",
+        provisionedAt: row.provisioned_at || null,
         createdAt: row.created_at,
         startedAt: row.started_at,
         completedAt: row.completed_at,
@@ -71,6 +81,7 @@ export class CodingRunService {
         return {
             scope: { owner: "personal", tenantId, userId },
             mode,
+            preset: mode, // R2: preset == run mode (observe|edit|trusted)
             project: project
                 ? { id: project.id, name: project.name, status: project.status, trusted: Number(project.trusted) === 1 }
                 : null,
@@ -106,19 +117,30 @@ export class CodingRunService {
         const { userId, tenantId } = scoped;
         const cleanMode = String(mode || "observe");
         if (!ALLOWED_MODES.has(cleanMode)) {
-            throw codingError("MODE_NOT_AVAILABLE", `mode '${cleanMode}' is not available in R0 (observe only)`, 400);
+            throw codingError("MODE_NOT_AVAILABLE", `mode '${cleanMode}' is not available (observe|edit|trusted)`, 400);
+        }
+        // A write-enabled preset is a server capability decision: without the
+        // write-tools flag the run cannot be created in edit/trusted even if a
+        // client asks for it (LLM/client intent is never an authorization).
+        if (cleanMode !== "observe" && !codingWriteToolsEnabled()) {
+            throw codingError("WRITE_TOOLS_DISABLED", "write-enabled run modes require CODING_WRITE_TOOLS_ENABLED", 403);
         }
         this._assertSessionOwned(scoped, sessionId);
         const project = this._resolveProject(scoped, projectId);
         if (projectId != null && !project) throw codingError("PROJECT_NOT_FOUND", "project not found or not owned", 404);
+        // A write-enabled run must name a project — there is nothing to write to
+        // otherwise. Trust is enforced later at provision time (resolveProjectRoot).
+        if (cleanMode !== "observe" && !project) {
+            throw codingError("RUN_REQUIRES_PROJECT", "write-enabled run modes require a project", 400);
+        }
 
         const id = newId("run_");
         const snapshot = sanitizeStored(this._buildSnapshot({ userId, tenantId, project, mode: cleanMode }));
         db.prepare(
             `INSERT INTO coding_runs
-                (id, owner_user_id, tenant_id, session_id, project_id, status, mode, snapshot_json, event_seq, cancelled)
-             VALUES (?, ?, ?, ?, ?, 'created', ?, ?, 0, 0)`,
-        ).run(id, userId, tenantId, sessionId == null ? null : Number(sessionId), project?.id || null, cleanMode, snapshot);
+                (id, owner_user_id, tenant_id, session_id, project_id, status, mode, preset, snapshot_json, event_seq, cancelled)
+             VALUES (?, ?, ?, ?, ?, 'created', ?, ?, ?, 0, 0)`,
+        ).run(id, userId, tenantId, sessionId == null ? null : Number(sessionId), project?.id || null, cleanMode, cleanMode, snapshot);
 
         this._append(scoped, id, {
             type: "run.created",
@@ -208,6 +230,61 @@ export class CodingRunService {
             payload: { from: current.status, to, errorCode: errorCode || null },
         });
         return this.getRun({ userId, tenantId }, id);
+    }
+
+    /**
+     * Persist the server-decided worktree identity of a write-enabled run
+     * (base commit/branch = the disposable worktree was created from these).
+     * Allowed on any run state so teardown-after-cancel can record `removed`.
+     */
+    setWorktree(scope, runId, { path = null, branch = null, baseBranch = null, baseCommit = null, status = "none", provisionedAt = null } = {}) {
+        ensureSchema();
+        const { userId, tenantId } = requireCodingScope(scope, "run");
+        const id = String(runId);
+        const changed = db.prepare(
+            `UPDATE coding_runs
+             SET worktree_path = ?, worktree_branch = ?, base_branch = ?, base_commit = ?,
+                 worktree_status = ?, provisioned_at = COALESCE(?, provisioned_at),
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND owner_user_id = ? AND tenant_id = ?`,
+        ).run(
+            path ? String(path).slice(0, 2048) : null,
+            branch ? String(branch).slice(0, 200) : null,
+            baseBranch ? String(baseBranch).slice(0, 200) : null,
+            baseCommit ? String(baseCommit).slice(0, 64) : null,
+            ["none", "provisioning", "ready", "unsupported", "failed", "removed"].includes(String(status)) ? String(status) : "none",
+            provisionedAt ? String(provisionedAt).slice(0, 40) : null,
+            id, userId, tenantId,
+        ).changes;
+        if (!changed) throw codingError("NOT_FOUND", "coding run not found", 404);
+        return this.getRun({ userId, tenantId }, id);
+    }
+
+    /** Convenience: flip only the worktree lifecycle bit (no identity rewrite). */
+    updateWorktreeStatus(scope, runId, status) {
+        ensureSchema();
+        const { userId, tenantId } = requireCodingScope(scope, "run");
+        const id = String(runId);
+        const clean = ["none", "provisioning", "ready", "unsupported", "failed", "removed"].includes(String(status)) ? String(status) : "none";
+        const changed = db.prepare(
+            `UPDATE coding_runs SET worktree_status = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND owner_user_id = ? AND tenant_id = ?`,
+        ).run(clean, id, userId, tenantId).changes;
+        if (!changed) throw codingError("NOT_FOUND", "coding run not found", 404);
+        return this.getRun({ userId, tenantId }, id);
+    }
+
+    /** Pending write/exec run lifecycles: waiting_approval ⇄ running (approval resume). */
+    waitForApproval(scope, runId) {
+        return this._transition(scope, runId, "waiting_approval", { allowFrom: new Set(["running", "verifying", "planning", "waiting_approval"]) });
+    }
+
+    resumeRun(scope, runId) {
+        return this._transition(scope, runId, "running", { allowFrom: new Set(["waiting_approval", "running"]) });
+    }
+
+    verifying(scope, runId) {
+        return this._transition(scope, runId, "verifying", { allowFrom: new Set(["running", "waiting_approval"]) });
     }
 }
 

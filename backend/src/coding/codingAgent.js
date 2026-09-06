@@ -1,0 +1,408 @@
+/**
+ * Phase 7 / R2 — CodeAgentService: a bounded, resumable coding loop.
+ *
+ * The MVP "Local Coding Agent" turn: context → plan → action → observe →
+ * verify → summary, with hard budgets on turns / actions / wall-clock /
+ * transcript size / repeated failure. It is the graph-side seam that the main
+ * Graph's `code_agent` node (a thin adapter) calls when a request is an
+ * explicit, server-verified coding run. It drives ops through the SAME
+ * owner-scoped run surface as the run endpoints
+ * (CodingRunWorkspaceRunner.runOp / resumeApproved), so every side effect lands
+ * in the run's disposable worktree and is recorded as an action/approval/
+ * artifact — nothing here touches the filesystem or the main checkout.
+ *
+ * Decision layer is INJECTED (`decide`), which keeps the loop deterministic and
+ * LLM-agnostic: the tests drive it with a scripted decider; a real model-tool
+ * harness supplies it later. The loop is resumable: when an op requires an
+ * owner decision it stops at `awaiting_approval` with the pending action;
+ * whoever decides (owner UI or a live turn) resumes with the identical op/args
+ * via `resumeApproved`, then calls `run()` again. The atomic claim in the
+ * approval service guarantees a resume never duplicates the side effect.
+ *
+ * Result shape stays graph-compatible: `{ codeResults, planResults, subTasks,
+ * plan, tokenUsage }` so the main Synthesizer merges it exactly like the
+ * text-only code node.
+ */
+import { codingError, requireCodingScope } from "./util.js";
+import { defaultRunWorkspaceRunner } from "./runWorkspaceRunner.js";
+import { defaultRunService } from "./runs.js";
+import { defaultApprovalService } from "./approvals.js";
+import { codingWorkspaceEnabled, codingWriteToolsEnabled } from "./flags.js";
+import { defaultProjectService } from "./projects.js";
+
+const CODE_BUDGET_DEFAULTS = Object.freeze({
+    maxTurns: 8,            // decider calls before the loop halts
+    maxActions: 24,         // executed ops (read+write+exec) per session
+    maxWallMs: 5 * 60 * 1000, // hard wall-clock ceiling
+    maxTranscriptChars: 24 * 1024, // transcript summary bound (never file content)
+    maxRepeatedFailure: 2,  // same op+args failing twice → halt (bounded retry)
+    maxVerifyRuns: 3,       // how many times the session may re-run a verify op
+});
+
+function clampBudget(budget = {}) {
+    const out = { ...CODE_BUDGET_DEFAULTS };
+    for (const key of Object.keys(CODE_BUDGET_DEFAULTS)) {
+        const value = budget[key];
+        if (Number.isFinite(value)) out[key] = Math.max(1, Math.trunc(value));
+    }
+    return out;
+}
+
+/** op + args → a stable signature for repeated-failure detection. */
+function opSignature(op, args) {
+    return `${String(op)}:${String(args?.path || args?.executable || args?.cwdRelative || "")}`;
+}
+
+function newStepId(stepIndex) {
+    return `step_${String(stepIndex + 1).padStart(2, "0")}`;
+}
+
+export class CodeAgentService {
+    /**
+     * @param {object} [deps]
+     */
+    constructor({
+        runRunner = defaultRunWorkspaceRunner,
+        runService = defaultRunService,
+        approvals = defaultApprovalService,
+    } = {}) {
+        this.runRunner = runRunner;
+        this.runService = runService;
+        this.approvals = approvals;
+    }
+
+    /**
+     * Begin a bounded coding session. The session object is plain in-memory
+     * state owned by the caller (a /chat node turn or a test); run/resume step
+     * through it and produce graph-compatible partial results when done.
+     *
+     * @param {object} scope authenticated owner scope
+     * @param {object} spec
+     * @param {object} spec.run owner-scoped coding run record
+     * @param {object} spec.project owner-scoped coding project record
+     * @param {string} spec.goal the user's coding goal
+     * @param {Function} spec.decide decision layer:
+     *   `async (ctx) => ({type:"op", op, args, note?})`
+     *                     run one workspace op (read immediate; write/exec may pause)
+     *   `async (ctx) => ({type:"verify", op, args})`
+     *                     run an op whose output is recorded under "verify"
+     *   `async (ctx) => ({type:"note", text})` append a step note
+     *   `async (ctx) => ({type:"done", summary})` finish
+     *   ctx = { goal, steps: [{type, op?, note?, ok?, summary?, at}], stepIndex }
+     * @param {object} [spec.budget]
+     * @param {(evt: object) => void} [spec.onEvent]
+     * @returns {object} session
+     */
+    begin(scope, { run, project, goal, decide, budget = {}, onEvent = null } = {}) {
+        const scoped = requireCodingScope(scope, "codingAgent");
+        if (!run?.id) throw codingError("NOT_FOUND", "coding run not found", 404);
+        if (!project?.id) throw codingError("NOT_FOUND", "coding project not found", 404);
+        if (typeof decide !== "function") {
+            throw codingError("CODING_AGENT_NO_DECIDER", "a decide() function is required to run a bounded coding session", 400);
+        }
+        return {
+            scoped,
+            scope,
+            run,
+            project,
+            goal: String(goal || ""),
+            decide,
+            budget: clampBudget(budget),
+            onEvent,
+            startedAt: Date.now(),
+            steps: [],
+            pending: null,      // { actionId, op, args } when awaiting_owner_decision
+            phase: "running",   // running | awaiting_owner_decision | done | budget_halted | failed
+            haltReason: null,
+            failureCounts: new Map(), // opSignature → consecutive failures
+            actionCount: 0,
+            turnCount: 0,
+            transcriptChars: 0,
+            summary: null,
+            finalResult: null,
+        };
+    }
+
+    _emit(session, evt) {
+        if (typeof session.onEvent === "function") session.onEvent(evt);
+    }
+
+    _appendStep(session, step) {
+        session.steps.push({ at: new Date().toISOString(), ...step });
+        const text = step.note || step.summary || step.op || step.type || "";
+        session.transcriptChars += Buffer.byteLength(String(text), "utf8");
+    }
+
+    _checkBudgets(session, step) {
+        if (session.actionCount >= session.budget.maxActions) {
+            session.phase = "budget_halted";
+            session.haltReason = "maxActions";
+        } else if (session.turnCount >= session.budget.maxTurns) {
+            session.phase = "budget_halted";
+            session.haltReason = "maxTurns";
+        } else if (Date.now() - session.startedAt > session.budget.maxWallMs) {
+            session.phase = "budget_halted";
+            session.haltReason = "maxWallMs";
+        } else if (session.transcriptChars > session.budget.maxTranscriptChars) {
+            session.phase = "budget_halted";
+            session.haltReason = "transcriptChars";
+        } else if (step && step.ok === false) {
+            const signature = opSignature(step.op, step.args);
+            const failures = (session.failureCounts.get(signature) || 0) + 1;
+            session.failureCounts.set(signature, failures);
+            if (failures >= session.budget.maxRepeatedFailure) {
+                session.phase = "budget_halted";
+                session.haltReason = "repeatedFailure";
+            }
+        }
+    }
+
+    /**
+     * Advance the session until it needs an owner decision, halts on a budget,
+     * fails, or completes. Idempotent re-entry: after an external resume, call
+     * `run(session)` again to keep stepping from where it stopped.
+     *
+     * @returns {Promise<object>} a status snapshot: { phase, pending?, result? }
+     */
+    async run(session) {
+        if (!session || session.phase === "done" || session.phase === "failed") {
+            return this._snapshot(session);
+        }
+        session.phase = "running";
+        while (session.phase === "running") {
+            session.turnCount += 1;
+            this._checkBudgets(session);
+            if (session.phase !== "running") break;
+
+            const decision = await session.decide(this._ctx(session));
+            if (!decision || typeof decision !== "object") {
+                session.phase = "failed";
+                session.haltReason = "invalidDecision";
+                break;
+            }
+            const { type, summary } = decision;
+
+            if (type === "done") {
+                session.summary = String(summary || "").slice(0, session.budget.maxTranscriptChars);
+                session.phase = "done";
+                session.finalResult = this._toGraphResult(session);
+                this._emit(session, { type: "session.done", summary: session.summary });
+                break;
+            }
+            if (type === "note") {
+                this._appendStep(session, { type: "note", note: String(decision.text || "") });
+                continue;
+            }
+            if (type === "op" || type === "verify") {
+                const op = decision.op;
+                const args = decision.args || {};
+                const outcome = await this._executeOp(session, op, args, type);
+                if (session.phase !== "running") break; // paused for decision / halted
+                const step = {
+                    type: outcome.effect === "read" || type === "op" ? "op" : "verify",
+                    op,
+                    note: decision.note || null,
+                    ...(outcome.errorCode ? { errorCode: outcome.errorCode } : {}),
+                };
+                if (outcome.errorCode) step.ok = false;
+                this._appendStep(session, step);
+                this._checkBudgets(session, step);
+                continue;
+            }
+            session.phase = "failed";
+            session.haltReason = "invalidDecision";
+            break;
+        }
+        return this._snapshot(session);
+    }
+
+    /**
+     * Resume a session that stopped at `awaiting_owner_decision`. The caller
+     * re-supplies the identical op/args (never reconstructed from the redacted
+     * durable row) and the run-scoped runner's atomic claim executes the action
+     * at most once, then the loop keeps going.
+     *
+     * @returns {Promise<object>} status snapshot after continuing to the next stop.
+     */
+    async resume(session, { op, args } = {}) {
+        const pending = session?.pending;
+        if (!pending) return this._snapshot(session);
+        const request = { op: op || pending.op, args: args || pending.args };
+        const resumed = await this.runRunner.resumeApproved(session.scope, {
+            run: session.run,
+            project: session.project,
+            request,
+            actionId: pending.actionId,
+        });
+        session.actionCount += 1;
+        this._appendStep(session, {
+            type: "op",
+            op: request.op,
+            note: "resumed after owner approval",
+            ok: resumed?.status === "executed",
+        });
+        this._emit(session, { type: "action.resumed", actionId: pending.actionId, status: resumed?.status });
+        session.pending = null;
+        session.phase = "running";
+        return this.run(session);
+    }
+
+    async _executeOp(session, op, args, kind) {
+        const { scope, run, project } = session;
+        let outcome;
+        try {
+            outcome = await this.runRunner.runOp(scope, {
+                run,
+                project,
+                request: { op, args },
+                opts: { wait: false }, // never block a server turn: pause for a decision instead
+            });
+        } catch (error) {
+            // A rejected/denied/broken op is a bounded step failure, not a fatal one:
+            // the decision layer sees ok:false (and repeated failures trip a budget).
+            const errorCode = error?.code || "EXECUTION_FAILED";
+            this._emit(session, { type: "op.rejected", op, errorCode });
+            return { effect: "write", op, ok: false, errorCode };
+        }
+        session.actionCount += 1;
+
+        // Reads execute immediately and are "observed".
+        if (outcome?.effect === "read") {
+            this._emit(session, { type: "op.observed", op, path: args.path || null });
+            return { effect: "read", op, ok: outcome.ok !== false };
+        }
+        // Write/exec: executed right away when server policy auto-approved.
+        if (outcome?.status === "executed") {
+            this._emit(session, {
+                type: "action.executed",
+                actionId: outcome.action?.id || null,
+                artifactId: outcome.artifact?.id || null,
+                op,
+            });
+            return { effect: "write", op, ok: true, kind };
+        }
+        // Owner decision required → pause the loop with the pending action.
+        if (outcome?.status === "awaiting_approval") {
+            session.pending = { actionId: outcome.action.id, op, args };
+            session.phase = "awaiting_owner_decision";
+            this._emit(session, {
+                type: "approval_requested",
+                runId: String(run.id),
+                approvalId: outcome.approval?.id || null,
+                actionId: outcome.action.id,
+                op,
+            });
+            return { effect: "write", op, ok: false, awaiting: true };
+        }
+        // settle/denied/other — surface the errorCode if present.
+        const errorCode = outcome?.errorCode || outcome?.action?.errorCode;
+        this._emit(session, { type: "op.rejected", op, errorCode });
+        return { effect: "write", op, ok: false, errorCode: errorCode || "EXECUTION_NOT_RUN" };
+    }
+
+    _ctx(session) {
+        return {
+            goal: session.goal,
+            stepIndex: session.steps.length,
+            turn: session.turnCount,
+            steps: session.steps.map((s) => ({
+                type: s.type,
+                op: s.op || null,
+                ok: s.ok ?? null,
+                errorCode: s.errorCode || null,
+                note: s.note || s.summary || null,
+            })),
+        };
+    }
+
+    _snapshot(session) {
+        return {
+            phase: session.phase,
+            haltReason: session.haltReason || null,
+            pending: session.pending ? { actionId: session.pending.actionId, op: session.pending.op } : null,
+            result: session.phase === "done" ? session.finalResult : null,
+            turnCount: session.turnCount,
+            actionCount: session.actionCount,
+            summary: session.summary || null,
+        };
+    }
+
+    /**
+     * Graph-compatible partial result: the Synthesizer merges `codeResults`
+     * text plus a single completed `subTask` whose result is in `planResults`
+     * (Plan mode) — exactly the shape the text-only code node returns.
+     */
+    _toGraphResult(session) {
+        const summaryText = session.summary || session.steps.map((s) => s.note || s.summary || s.op || "").filter(Boolean).join("\n");
+        const id = newStepId(0);
+        const subTasks = [{
+            id,
+            title: "coding",
+            type: "agent",
+            agent: "code",
+            status: "completed",
+            result: summaryText,
+        }];
+        return {
+            codeResults: summaryText,
+            planResults: { [id]: summaryText },
+            subTasks,
+            plan: [],
+            tokenUsage: null,
+            summary: summaryText,
+            stepCount: session.steps.length,
+        };
+    }
+}
+
+/**
+ * Server-side /chat coding-execution gate (roadmap R2: execution is enabled on
+ * `/chat` ONLY when an explicit project + coding run + server trust/policy pass).
+ *
+ * The plain chat text path has no execution capability at all; the only /chat-
+ * adjacent execution surface is the graph's `code_agent` coding branch, which is
+ * fed a `config.configurable.codingTask` descriptor that THIS function authorises.
+ * The descriptor is never built from client/model intent — only from the run's
+ * durable owner-scoped record + the live feature flags. Observe runs and
+ * untrusted/terminal projects can never produce a coding execution.
+ *
+ * @returns {Promise<{active:boolean, reason?:string, scope?:object, run?:object,
+ *   project?:object, preset?:string, goal?:string, budget?:object|null}>}
+ */
+export async function resolveCodingRunTask(
+    { runService = defaultRunService, projectService = defaultProjectService } = {},
+    scope,
+    { runId = null, goal = "", budget = null } = {},
+) {
+    if (runId == null) return { active: false, reason: "no_run_id" };
+    if (!codingWorkspaceEnabled() || !codingWriteToolsEnabled()) {
+        return { active: false, reason: "coding_disabled" };
+    }
+    const scoped = requireCodingScope(scope, "coding gate");
+    const run = runService.getRun(scoped, runId);
+    if (!run) return { active: false, reason: "run_not_found" };
+    const preset = run.preset || run.mode;
+    if (preset !== "edit" && preset !== "trusted") return { active: false, reason: "observe" };
+    if (run.status === "completed" || run.status === "failed" || run.status === "cancelled") {
+        return { active: false, reason: "run_terminal" };
+    }
+    if (!run.projectId) return { active: false, reason: "run_has_no_project" };
+    const project = projectService.get(scoped, run.projectId);
+    if (!project) return { active: false, reason: "project_not_found" };
+    if (String(project.status || "") !== "trusted" || Number(project.trusted) !== 1) {
+        return { active: false, reason: "project_not_trusted" };
+    }
+    return {
+        active: true,
+        reason: null,
+        scope: scoped,
+        run,
+        project,
+        preset,
+        goal: String(goal || ""),
+        budget: budget || null,
+    };
+}
+
+export const defaultCodingAgentService = new CodeAgentService();
+export default defaultCodingAgentService;

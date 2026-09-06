@@ -27,6 +27,9 @@ function ensureSchema() {
 // lifecycle is tracked on the coding_projects row itself, not as run events.
 const EVENT_TYPES = new Set([
     "run.created", "run.started", "run.completed", "run.failed", "run.cancelled", "run.status",
+    // R2 — disposable-worktree lifecycle + action execution transcript.
+    "run.worktree_ready", "run.worktree_removed", "run.worktree_unsupported", "run.worktree_failed",
+    "action.executed", "action.executing", "action.exec_failed", "action.auto_approved",
     "action.requested", "action.decided",
     "approval.requested", "approval.approved", "approval.denied", "approval.expired",
 ]);

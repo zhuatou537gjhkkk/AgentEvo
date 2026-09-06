@@ -95,15 +95,17 @@ function isDeviceLike(raw) {
 }
 
 /**
- * Validate + normalize a user-supplied relative subpath under `canonicalRoot`.
- * Returns the logical posix segments AND the canonical absolute path. The caller
- * must open only the returned canonical path — never the un-resolved join.
+ * Reject + split a user-supplied relative subpath under `canonicalRoot` into its
+ * validated clean segments. Shared by the existing-path resolver (resolveSubpath)
+ * and the R2 write-target resolver (resolveWriteTarget) so rejections never
+ * diverge. Returns `{ segs, rel }`; throws on traversal/absolute/UNC/device/
+ * control/over-length. A `.` segment is dropped; `..` is never tolerated.
  *
- * @returns {{ rel: string, abs: string, segs: string[] }}
+ * @returns {{ segs: string[], rel: string }}
  */
-export function resolveSubpath(canonicalRoot, rawPath) {
+export function parseRelSegments(canonicalRoot, rawPath) {
     if (rawPath == null || rawPath === "") {
-        return { rel: "", abs: canonicalRoot, segs: [] };
+        return { segs: [], rel: "" };
     }
     if (typeof rawPath !== "string") {
         throw codingError("INVALID_WORKSPACE_ARGS", "path must be a string", 400);
@@ -147,6 +149,21 @@ export function resolveSubpath(canonicalRoot, rawPath) {
         }
     }
     const cleanSegs = segs.filter((s) => s !== ".");
+    return { segs: cleanSegs, rel: cleanSegs.join("/") };
+}
+
+/**
+ * Validate + normalize a user-supplied relative subpath under `canonicalRoot`.
+ * Returns the logical posix segments AND the canonical absolute path. The caller
+ * must open only the returned canonical path — never the un-resolved join.
+ *
+ * @returns {{ rel: string, abs: string, segs: string[], exists: true }}
+ */
+export function resolveSubpath(canonicalRoot, rawPath) {
+    const { segs: cleanSegs, rel } = parseRelSegments(canonicalRoot, rawPath);
+    if (cleanSegs.length === 0) {
+        return { rel: "", abs: canonicalRoot, segs: [], exists: true };
+    }
     const logical = path.join(canonicalRoot, ...cleanSegs);
 
     // Resolve symlinks/junctions at the FINAL target, then enforce containment.
@@ -157,7 +174,43 @@ export function resolveSubpath(canonicalRoot, rawPath) {
     if (!isPathWithin(canonicalRoot, canonical)) {
         throw codingError("PATH_ESCAPE", "path escapes the project root", 403);
     }
-    return { rel: cleanSegs.join("/"), abs: canonical, segs: cleanSegs };
+    return { rel, abs: canonical, segs: cleanSegs, exists: true };
+}
+
+/**
+ * R2 write-target resolver: same rejections as resolveSubpath but the FINAL
+ * target may not exist yet (create_file/apply-to-new). Every EXISTING ancestor
+ * is canonicalized and containment-checked as we walk, so a symlink/junction
+ * parent can never redirect the write outside the root; the returned `abs` is
+ * rooted at the canonical deepest-existing ancestor plus the remaining segments.
+ *
+ * @param {{ allowMissing?: boolean }} [opts] allowMissing=false keeps the
+ *   read-only behavior (missing final target → WORKSPACE_PATH_NOT_FOUND).
+ * @returns {{ rel: string, abs: string, segs: string[], exists: boolean }}
+ */
+export function resolveWriteTarget(canonicalRoot, rawPath, { allowMissing = true } = {}) {
+    const { segs: cleanSegs, rel } = parseRelSegments(canonicalRoot, rawPath);
+    if (cleanSegs.length === 0) {
+        return { rel: "", abs: canonicalRoot, segs: [], exists: true };
+    }
+    let cur = canonicalRoot;
+    for (let i = 0; i < cleanSegs.length; i += 1) {
+        const next = path.join(cur, cleanSegs[i]);
+        const canon = canonicalExisting(next);
+        if (canon) {
+            if (!isPathWithin(canonicalRoot, canon)) {
+                throw codingError("PATH_ESCAPE", "path escapes the project root", 403);
+            }
+            cur = canon;
+            continue;
+        }
+        if (!allowMissing) {
+            throw codingError("WORKSPACE_PATH_NOT_FOUND", "path does not exist", 404);
+        }
+        const remainder = cleanSegs.slice(i);
+        return { rel, abs: path.join(cur, ...remainder), segs: cleanSegs, exists: false };
+    }
+    return { rel, abs: cur, segs: cleanSegs, exists: true };
 }
 
 /**

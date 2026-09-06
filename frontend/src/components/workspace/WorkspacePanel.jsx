@@ -7,6 +7,24 @@ import {
     runStatusLabel,
     canOpenWorkspace,
     flattenTreeForDisplay,
+    canWriteToWorkspace,
+    canRunCommands,
+    presetLabel,
+    presetHint,
+    worktreeStatusLabel,
+    actionStatusMeta,
+    approvalStatusMeta,
+    isOpenApproval,
+    actionToolLabel,
+    isCommandAction,
+    isFileArtifact,
+    artifactChangedFiles,
+    gitStatusPaths,
+    changedFilesForRun,
+    maskSensitiveArgs,
+    approvalCommandArgs,
+    friendlyWorkspaceError,
+    buildRunSummary,
 } from '../../utils/workspaceModel';
 
 function formatBytes(value) {
@@ -393,6 +411,9 @@ function RunTab() {
 
     return (
         <div className="flex flex-col gap-1.5 p-2">
+            <RunWriteSection />
+            <div className="my-1 border-t border-[var(--glass-border)]" />
+            <div className="text-[0.68rem] font-semibold text-[var(--text-muted)]">只读快照 run（记录，不执行代码）</div>
             <div className="flex items-center gap-1.5">
                 <button
                     type="button"
@@ -409,7 +430,9 @@ function RunTab() {
             </div>
             {runs.error && <div className="text-xs text-red-500">{runs.error}</div>}
             <div className="flex flex-col">
-                {runs.items.map((run) => {
+                {runs.items
+                    .filter((r) => String(r.mode || r.preset || 'observe') === 'observe')
+                    .map((run) => {
                     const terminal = ['completed', 'failed', 'cancelled'].includes(String(run.status));
                     const active = run.status === 'running';
                     const busy = runActionId === run.id;
@@ -544,6 +567,768 @@ function ViewerPane() {
                     </div>
                 </div>
             )}
+        </div>
+    );
+}
+
+// ═══════════════════════════════════════════════════════════
+// R2 write-run console (Phase 7 / R2) — run-scoped write/exec.
+// The server is authoritative: capability = /coding/capabilities;
+// preset policy (observe/edit/trusted) decides whether a write pauses
+// awaiting_approval or auto-executes. Live op args live only in
+// pendingRunOps (client memory) so approve→execute re-sends the same args.
+// ═══════════════════════════════════════════════════════════
+
+const TONE_TEXT = {
+    ok: 'text-emerald-500',
+    error: 'text-red-500',
+    warn: 'text-amber-400',
+    accent: 'text-[var(--brand-start)]',
+    muted: 'text-[var(--text-muted)]',
+};
+
+function ToneChip({ tone = 'muted', children }) {
+    return <span className={`shrink-0 rounded bg-[var(--panel-soft)] px-1 py-px text-[0.62rem] ${TONE_TEXT[tone] || TONE_TEXT.muted}`}>{children}</span>;
+}
+
+function isRunActive(status) {
+    return ['running', 'executing', 'waiting_approval', 'planning', 'preparing', 'verifying'].includes(String(status || ''));
+}
+
+function isRunTerminal(status) {
+    return ['completed', 'failed', 'cancelled'].includes(String(status || ''));
+}
+
+/** Approval card for one open (requested) approval with 批准/拒绝/批准并执行. */
+function RunApprovalQueue({ runId }) {
+    const runApprovals = useWorkspaceStore((s) => s.runApprovals);
+    const runOpsBusy = useWorkspaceStore((s) => s.runOpsBusy);
+    const pendingRunOps = useWorkspaceStore((s) => s.pendingRunOps);
+    const decideRunApproval = useWorkspaceStore((s) => s.decideRunApproval);
+    const approveAndExecuteRunOp = useWorkspaceStore((s) => s.approveAndExecuteRunOp);
+    const reloadRunApprovals = useWorkspaceStore((s) => s.reloadRunApprovals);
+
+    const open = runApprovals.items.filter((a) => isOpenApproval(a));
+    if (open.length === 0) return null;
+
+    const actionFor = (approval) => {
+        const s = useWorkspaceStore.getState();
+        return (s.runActions.items || []).find((a) => a.id === approval.actionId) || null;
+    };
+
+    const describe = (action, approval) => {
+        if (action && isCommandAction(action)) {
+            const safe = approvalCommandArgs(action);
+            const args = Array.isArray(safe.args) ? safe.args : [];
+            return `命令 ${safe.executable || '?'} ${args.join(' ')}`;
+        }
+        return `文件 ${action?.input?.path || approval?.reason || '未知路径'}`;
+    };
+
+    return (
+        <div className="flex flex-col gap-1">
+            <div className="text-[0.66rem] text-[var(--text-muted)]">审批队列（{open.length}）</div>
+            {open.map((approval) => {
+                const action = actionFor(approval);
+                const meta = approvalStatusMeta(approval.status);
+                const held = pendingRunOps[runId];
+                const canResume = held && held.approvalId === approval.id;
+                const busy = runOpsBusy;
+                return (
+                    <div key={approval.id} className="flex flex-col gap-1 rounded-lg border border-amber-400/30 bg-[var(--panel-soft)] px-2 py-1.5">
+                        <div className="flex items-center gap-1.5 text-xs">
+                            <ToneChip tone={meta.tone}>{meta.label}</ToneChip>
+                            <span className="text-[0.62rem] text-[var(--text-muted)]">{action ? actionToolLabel(action.tool) : '操作'}</span>
+                            <span className="min-w-0 flex-1" />
+                        </div>
+                        <div className="break-all text-xs text-[var(--text-main)]">{describe(action, approval)}</div>
+                        {approval.reason && <div className="break-all text-[0.62rem] text-[var(--text-muted)]">原因：{approval.reason}</div>}
+                        <div className="flex flex-wrap items-center gap-1.5">
+                            {canResume && (
+                                <button
+                                    type="button"
+                                    disabled={busy}
+                                    onClick={() => approveAndExecuteRunOp(runId, held.actionId)}
+                                    className="btn-gradient rounded-md px-2 py-0.5 text-[0.64rem] font-semibold disabled:opacity-50"
+                                >
+                                    批准并执行
+                                </button>
+                            )}
+                            <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => decideRunApproval(runId, approval.id, true)}
+                                className="rounded-md border border-[var(--glass-border)] px-2 py-0.5 text-[0.64rem] text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-50"
+                            >
+                                仅批准
+                            </button>
+                            <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => decideRunApproval(runId, approval.id, false)}
+                                className="rounded-md border border-[var(--glass-border)] px-2 py-0.5 text-[0.64rem] text-[var(--text-muted)] hover:text-red-500 disabled:opacity-50"
+                            >
+                                拒绝
+                            </button>
+                            <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => reloadRunApprovals(runId)}
+                                title="刷新审批状态"
+                                className="rounded-md border border-[var(--glass-border)] px-1.5 py-0.5 text-[0.62rem] text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-50"
+                            >
+                                ⟳
+                            </button>
+                        </div>
+                    </div>
+                );
+            })}
+        </div>
+    );
+}
+
+/** Actions ledger — each action row with its status chip. */
+function RunActionsLedger({ runId }) {
+    const runActions = useWorkspaceStore((s) => s.runActions);
+    const pendingRunOps = useWorkspaceStore((s) => s.pendingRunOps);
+    const reloadRunActions = useWorkspaceStore((s) => s.reloadRunActions);
+
+    const pending = pendingRunOps[runId];
+    const reconnectLoss = runActions.items.filter(
+        (a) => a.status === 'approved' && !(pending && pending.actionId === a.id),
+    );
+
+    const describe = (action) => {
+        if (!action) return '';
+        if (isCommandAction(action)) {
+            const safe = approvalCommandArgs(action);
+            const args = Array.isArray(safe.args) ? safe.args : [];
+            return `${safe.executable || '?'} ${args.join(' ')}`;
+        }
+        return String(action.input?.path || action.input?.op || action.tool || '');
+    };
+
+    return (
+        <div className="flex flex-col gap-1">
+            <div className="flex items-center gap-1.5 text-[0.66rem] text-[var(--text-muted)]">
+                <span>已执行操作（{runActions.items.length}）</span>
+                <button type="button" onClick={() => reloadRunActions(runId)} className="rounded border border-[var(--glass-border)] px-1 py-px text-[0.6rem] hover:text-[var(--text-main)]">刷新</button>
+            </div>
+            {reconnectLoss.length > 0 && (
+                <div className="rounded border border-amber-400/30 bg-[var(--panel-soft)] px-1.5 py-1 text-[0.62rem] text-amber-400">
+                    {reconnectLoss.length} 个已批准但未执行的操作：实时参数不落库，重连后需重新发起该操作以执行。
+                </div>
+            )}
+            <div className="flex max-h-40 flex-col overflow-auto">
+                {runActions.items.map((action) => {
+                    const meta = actionStatusMeta(action.status);
+                    return (
+                        <div key={action.id} className="flex items-center gap-1.5 py-0.5 text-xs">
+                            <ToneChip tone={meta.tone}>{meta.label}</ToneChip>
+                            <span className="text-[0.62rem] text-[var(--text-muted)]">{actionToolLabel(action.tool)}</span>
+                            <span className="min-w-0 flex-1 truncate text-[var(--text-main)]" title={describe(action)}>
+                                {describe(action)}
+                            </span>
+                        </div>
+                    );
+                })}
+                {runActions.items.length === 0 && <div className="py-1 text-[0.62rem] text-[var(--text-muted)]">还没有操作</div>}
+            </div>
+        </div>
+    );
+}
+
+/** Artifacts + changed-files (union of file-artifact paths and git status/diff). */
+function RunArtifactsBlock({ runId, readEnabled }) {
+    const runArtifacts = useWorkspaceStore((s) => s.runArtifacts);
+    const runGit = useWorkspaceStore((s) => s.runGit);
+    const runDiff = useWorkspaceStore((s) => s.runDiff);
+    const readRunFile = useWorkspaceStore((s) => s.readRunFile);
+    const showRunDiff = useWorkspaceStore((s) => s.showRunDiff);
+    const reloadRunArtifacts = useWorkspaceStore((s) => s.reloadRunArtifacts);
+
+    const fileArts = runArtifacts.items.filter((a) => isFileArtifact(a));
+    const cmdArts = runArtifacts.items.filter((a) => !isFileArtifact(a));
+    const changed = [
+        ...new Set([
+            ...artifactChangedFiles(runArtifacts.items),
+            ...gitStatusPaths(runGit.status),
+            ...(runDiff.filesChanged || []),
+        ]),
+    ];
+
+    return (
+        <div className="flex flex-col gap-1">
+            <div className="flex items-center gap-1.5 text-[0.66rem] text-[var(--text-muted)]">
+                <span>产物（{fileArts.length} 文件 · {cmdArts.length} 命令）</span>
+                <button type="button" onClick={() => reloadRunArtifacts(runId)} className="rounded border border-[var(--glass-border)] px-1 py-px text-[0.6rem] hover:text-[var(--text-main)]">刷新</button>
+            </div>
+            <div className="flex flex-wrap gap-1">
+                {fileArts.slice(-12).map((a) => (
+                    <span key={a.id} title={`${a.kind} · ${a.path}`} className="max-w-full truncate rounded bg-[var(--panel-soft)] px-1.5 py-px text-[0.62rem] text-emerald-500">
+                        {a.path}
+                    </span>
+                ))}
+                {cmdArts.slice(-4).map((a) => (
+                    <span key={a.id} title={`command · ${a.meta?.executable || ''} exit=${a.meta?.exitCode ?? ''}`} className="rounded bg-[var(--panel-soft)] px-1.5 py-px text-[0.62rem] text-[var(--brand-start)]">
+                        ⌘ {a.meta?.executable || '?'}
+                    </span>
+                ))}
+            </div>
+            <div className="flex flex-col gap-0.5">
+                {changed.length > 0 && (
+                    <div className="text-[0.66rem] text-[var(--text-muted)]">改动文件（{changed.length}）：</div>
+                )}
+                {changed.map((path) => (
+                    <div key={path} className="flex items-center gap-1.5 text-[0.64rem]">
+                        <span className="min-w-0 flex-1 truncate text-[var(--text-main)]">{path}</span>
+                        <button
+                            type="button"
+                            disabled={!readEnabled}
+                            onClick={() => readRunFile(runId, path, 1)}
+                            className="shrink-0 rounded border border-[var(--glass-border)] px-1 py-px text-[0.6rem] text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-40"
+                        >
+                            读
+                        </button>
+                        <button
+                            type="button"
+                            disabled={!readEnabled}
+                            onClick={() => showRunDiff(runId, path)}
+                            className="shrink-0 rounded border border-[var(--glass-border)] px-1 py-px text-[0.6rem] text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-40"
+                        >
+                            diff
+                        </button>
+                    </div>
+                ))}
+                {changed.length === 0 && <div className="text-[0.62rem] text-[var(--text-muted)]">没有可显示的改动</div>}
+            </div>
+        </div>
+    );
+}
+
+/** Final client-side run-summary card (built from buildRunSummary). */
+function RunSummaryCard({ run }) {
+    const runActions = useWorkspaceStore((s) => s.runActions);
+    const runApprovals = useWorkspaceStore((s) => s.runApprovals);
+    const runArtifacts = useWorkspaceStore((s) => s.runArtifacts);
+    const runGit = useWorkspaceStore((s) => s.runGit);
+    const lastCommandOutputs = useWorkspaceStore((s) => s.lastCommandOutputs);
+
+    const s = buildRunSummary({
+        run,
+        actions: runActions.items,
+        approvals: runApprovals.items,
+        artifacts: runArtifacts.items,
+        gitStatus: runGit.status,
+        commandOutputs: lastCommandOutputs.filter((o) => o.runId === run.id),
+    });
+
+    return (
+        <div className="flex flex-col gap-1 rounded-lg border border-[var(--glass-border-active)] bg-[var(--surface-elevated)] px-2 py-1.5">
+            <div className="flex items-center gap-1.5 text-xs">
+                <ToneChip tone={run.status === 'completed' ? 'ok' : 'error'}>{runStatusLabel(run.status)}</ToneChip>
+                <span className="text-[var(--text-main)]">run 总结</span>
+                <span className="min-w-0 flex-1" />
+                <span className="text-[0.62rem] text-[var(--text-muted)]">{presetLabel(s.preset)}</span>
+            </div>
+            <div className="text-[0.66rem] text-[var(--text-muted)]">
+                执行 {s.counts.executed} · 失败 {s.counts.failed} · 批准 {s.counts.approved} · 拒绝 {s.counts.denied} · 改动 {s.counts.changedFiles} 文件
+            </div>
+            {s.changedFiles.length > 0 && (
+                <div className="max-h-24 overflow-auto text-[0.64rem]">
+                    {s.changedFiles.map((p) => <div key={p} className="truncate text-[var(--text-main)]">{p}</div>)}
+                </div>
+            )}
+            {s.commandOutputs.length > 0 && (
+                <div className="flex flex-col gap-0.5 border-t border-[var(--glass-border)] pt-1 text-[0.62rem]">
+                    <span className="text-[var(--text-muted)]">最近命令输出：</span>
+                    {s.commandOutputs.map((o, i) => (
+                        <div key={i} className="text-[var(--text-muted)]">
+                            {o.executable} → exit {o.code ?? '?'}{o.timedOut ? '（超时）' : ''}{o.cancelled ? '（已取消）' : ''}
+                            {o.stdout ? `：${o.stdout}` : ''}{o.stderr ? ` stderr：${o.stderr}` : ''}
+                        </div>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+}
+
+/** Run-scoped reads: git.status / git.diff + runDiff frame. */
+function RunGitReadBlock({ runId, readEnabled }) {
+    const runGit = useWorkspaceStore((s) => s.runGit);
+    const runDiff = useWorkspaceStore((s) => s.runDiff);
+    const refreshRunGit = useWorkspaceStore((s) => s.refreshRunGit);
+    const showRunDiff = useWorkspaceStore((s) => s.showRunDiff);
+
+    const summary = summarizeGitStatus(runGit.status);
+
+    return (
+        <div className="flex flex-col gap-1">
+            <div className="flex items-center gap-1.5">
+                <button
+                    type="button"
+                    disabled={!readEnabled || runGit.loading}
+                    onClick={() => refreshRunGit(runId)}
+                    className="rounded-lg border border-[var(--glass-border)] px-2 py-1 text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-50"
+                >
+                    Git 状态 + diff
+                </button>
+            </div>
+            {runGit.error && <div className="text-xs text-red-500">{runGit.error}</div>}
+            {runGit.status && !runGit.error && (
+                <div className="text-[0.66rem] text-[var(--text-muted)]">
+                    {runGit.status.branch ? `分支 ${runGit.status.branch}` : 'detached'}
+                    {runGit.status.commit ? ` · ${shortId(runGit.status.commit)}` : ''}
+                    {' · '}{summary.clean ? '干净' : `${summary.counts.modified} 改 ${summary.counts.added} 增 ${summary.counts.deleted} 删 ${summary.counts.untracked} 未跟踪`}
+                </div>
+            )}
+            <div className="flex flex-col">
+                {(runGit.status?.entries || []).map((entry, index) => {
+                    const cls = classifyGitEntry(entry);
+                    return (
+                        <button
+                            type="button"
+                            key={`${entry.path}:${index}`}
+                            disabled={!readEnabled}
+                            onClick={() => showRunDiff(runId, entry.path)}
+                            title={`${cls.title} — 点击查看 diff`}
+                            className="ws-row-clickable flex items-center gap-1.5 rounded px-1.5 py-px text-left text-[0.64rem] disabled:opacity-40"
+                        >
+                            <span className="w-4 shrink-0 text-center text-[var(--brand-start)]">{cls.mark}</span>
+                            <span className="min-w-0 flex-1 truncate text-[var(--text-main)]">{cls.path}</span>
+                        </button>
+                    );
+                })}
+            </div>
+            {runDiff.loading && <div className="py-1 text-xs text-[var(--text-muted)]">读取 diff...</div>}
+            {runDiff.error && <div className="text-xs text-red-500">{runDiff.error}</div>}
+            {!runDiff.loading && !runDiff.error && runDiff.text && (
+                <div className="flex flex-col gap-0.5">
+                    <div className="text-[0.62rem] text-[var(--text-muted)]">
+                        diff{runDiff.filesChanged.length > 0 ? `（${runDiff.filesChanged.length} 文件）` : ''}{runDiff.truncated ? ' · 已截断' : ''}
+                    </div>
+                    <div className="ws-code-block max-h-40 overflow-auto rounded-lg border border-[var(--glass-border)] bg-[var(--glass-bg-strong)] p-1.5 text-[var(--text-main)]">
+                        {runDiff.text}
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
+/** File ops: read into editor → write_file; delete_file; apply_patch. */
+function RunFileEditOps({ runId, writeEnabled, readEnabled }) {
+    const [path, setPath] = useState('');
+    const [body, setBody] = useState('');
+    const [patch, setPatch] = useState('');
+    const [note, setNote] = useState(null);
+    const runOpsBusy = useWorkspaceStore((s) => s.runOpsBusy);
+    const submitRunOp = useWorkspaceStore((s) => s.submitRunOp);
+    const readRunFile = useWorkspaceStore((s) => s.readRunFile);
+
+    const busy = runOpsBusy;
+
+    const readFile = async () => {
+        setNote(null);
+        if (!path) { setNote({ kind: 'error', text: '先填文件路径' }); return; }
+        await readRunFile(runId, path, 1);
+        const fv = useWorkspaceStore.getState().runFileView;
+        if (fv.error) setNote({ kind: 'error', text: fv.error });
+        else {
+            setBody((fv.lines || []).join('\n'));
+            setNote({ kind: 'ok', text: `已读取 ${fv.lineCount} 行` });
+        }
+    };
+
+    const writeFile = async () => {
+        setNote(null);
+        if (!path) { setNote({ kind: 'error', text: '先填文件路径' }); return; }
+        const res = await submitRunOp(runId, 'write_file', { path, content: body });
+        if (!res?.ok) setNote({ kind: 'error', text: res?.error ? friendlyWorkspaceError(res.error) : '提交失败' });
+        else if (res.status === 'awaiting_approval') setNote({ kind: 'warn', text: '已提交审批 — 在上方审批卡批准并执行' });
+        else if (res.status === 'executed') setNote({ kind: 'ok', text: '已写入工作树' });
+    };
+
+    const deleteFile = async () => {
+        setNote(null);
+        if (!path) { setNote({ kind: 'error', text: '先填文件路径' }); return; }
+        const res = await submitRunOp(runId, 'delete_file', { path });
+        if (!res?.ok) setNote({ kind: 'error', text: res?.error ? friendlyWorkspaceError(res.error) : '提交失败' });
+        else if (res.status === 'awaiting_approval') setNote({ kind: 'warn', text: '删除已提交审批' });
+        else if (res.status === 'executed') { setNote({ kind: 'ok', text: '文件已删除' }); setBody(''); }
+    };
+
+    const applyPatch = async () => {
+        setNote(null);
+        if (!path) { setNote({ kind: 'error', text: '先填文件路径' }); return; }
+        if (!patch.trim()) { setNote({ kind: 'error', text: '先粘贴 unified diff' }); return; }
+        const res = await submitRunOp(runId, 'apply_patch', { path, patch });
+        if (!res?.ok) setNote({ kind: 'error', text: res?.error ? friendlyWorkspaceError(res.error) : '提交失败' });
+        else if (res.status === 'awaiting_approval') setNote({ kind: 'warn', text: 'patch 已提交审批' });
+        else if (res.status === 'executed') { setNote({ kind: 'ok', text: 'patch 已应用' }); setPatch(''); }
+    };
+
+    return (
+        <div className="flex flex-col gap-1 rounded-lg border border-[var(--glass-border)] bg-[var(--panel-soft)] px-2 py-1.5">
+            <div className="text-[0.66rem] text-[var(--text-muted)]">文件编辑（写工作树）</div>
+            <div className="flex items-center gap-1.5">
+                <input
+                    value={path}
+                    onChange={(e) => setPath(e.target.value)}
+                    placeholder="相对路径，如 src/a.js"
+                    className="w-full min-w-0 flex-1 rounded-lg border border-[var(--glass-border)] bg-[var(--glass-bg-strong)] px-2 py-1 text-xs text-[var(--text-main)] outline-none"
+                />
+                <button type="button" disabled={!readEnabled || busy} onClick={readFile} className="rounded-md border border-[var(--glass-border)] px-2 py-1 text-[0.64rem] text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-40">
+                    读取
+                </button>
+            </div>
+            <textarea
+                value={body}
+                onChange={(e) => setBody(e.target.value)}
+                placeholder="编辑内容（读取后可直接改，再写回）"
+                rows={5}
+                spellCheck={false}
+                className="ws-code-block resize-y rounded-lg border border-[var(--glass-border)] bg-[var(--glass-bg-strong)] px-2 py-1 font-mono text-[0.66rem] text-[var(--text-main)] outline-none"
+            />
+            <div className="flex flex-wrap items-center gap-1.5">
+                <button type="button" disabled={!writeEnabled || busy} onClick={writeFile} className="btn-gradient rounded-md px-2 py-1 text-[0.64rem] font-semibold disabled:opacity-50">
+                    写回 write_file
+                </button>
+                <button type="button" disabled={!writeEnabled || busy} onClick={deleteFile} className="rounded-md border border-red-500/40 px-2 py-1 text-[0.64rem] text-red-400 hover:text-red-500 disabled:opacity-50">
+                    删除文件
+                </button>
+            </div>
+            <textarea
+                value={patch}
+                onChange={(e) => setPatch(e.target.value)}
+                placeholder="可粘贴 unified diff 应用到该文件（apply_patch）"
+                rows={3}
+                spellCheck={false}
+                className="ws-code-block resize-y rounded-lg border border-[var(--glass-border)] bg-[var(--glass-bg-strong)] px-2 py-1 font-mono text-[0.66rem] text-[var(--text-main)] outline-none"
+            />
+            <button type="button" disabled={!writeEnabled || busy} onClick={applyPatch} className="self-start rounded-md border border-[var(--glass-border)] px-2 py-1 text-[0.64rem] text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-50">
+                应用 apply_patch
+            </button>
+            {note && (
+                <div className={`text-[0.62rem] ${note.kind === 'error' ? 'text-red-500' : note.kind === 'warn' ? 'text-amber-400' : 'text-emerald-500'}`}>
+                    {note.text}
+                </div>
+            )}
+        </div>
+    );
+}
+
+/** Command form: structured executable + args[] (+ cwd). */
+function RunCommandOps({ runId, writeEnabled }) {
+    const [executable, setExecutable] = useState('');
+    const [argsText, setArgsText] = useState('');
+    const [cwd, setCwd] = useState('');
+    const [note, setNote] = useState(null);
+    const runOpsBusy = useWorkspaceStore((s) => s.runOpsBusy);
+    const capabilities = useWorkspaceStore((s) => s.capabilities);
+    const submitRunOp = useWorkspaceStore((s) => s.submitRunOp);
+    const lastCommandOutputs = useWorkspaceStore((s) => s.lastCommandOutputs);
+
+    const busy = runOpsBusy;
+    const cmdOk = canRunCommands(capabilities);
+    const outputs = lastCommandOutputs.filter((o) => o.runId === runId).slice(0, 3);
+
+    const run = async () => {
+        setNote(null);
+        if (!cmdOk) { setNote({ kind: 'error', text: '服务端未启用命令执行能力（commandTools=false）' }); return; }
+        if (!executable.trim()) { setNote({ kind: 'error', text: '先填可执行文件名（如 node / git）' }); return; }
+        const args = argsText.trim() ? argsText.trim().split(/\s+/).filter(Boolean) : [];
+        const res = await submitRunOp(runId, 'run_command', {
+            executable: executable.trim(),
+            args,
+            cwdRelative: cwd.trim() || '',
+        });
+        if (!res?.ok) setNote({ kind: 'error', text: res?.error ? friendlyWorkspaceError(res.error) : '提交失败' });
+        else if (res.status === 'awaiting_approval') setNote({ kind: 'warn', text: '命令已提交审批 — 在上方审批卡批准并执行' });
+        else if (res.status === 'executed') {
+            const d = res.data || {};
+            setNote({
+                kind: d.code === 0 ? 'ok' : 'error',
+                text: `exit ${d.code}${d.timedOut ? '（超时）' : ''}${d.cancelled ? '（已取消）' : ''}`,
+            });
+        }
+    };
+
+    return (
+        <div className="flex flex-col gap-1 rounded-lg border border-[var(--glass-border)] bg-[var(--panel-soft)] px-2 py-1.5">
+            <div className="text-[0.66rem] text-[var(--text-muted)]">
+                运行命令（白名单内，owner 审批）{cmdOk ? '' : ' — 未启用，仅展示'}
+            </div>
+            {!cmdOk && <div className="text-[0.62rem] text-red-500">服务端未启用命令执行能力，无法提交命令。</div>}
+            <div className="flex items-center gap-1.5">
+                <input
+                    value={executable}
+                    onChange={(e) => setExecutable(e.target.value)}
+                    placeholder="executable（如 node / git）"
+                    className="w-1/3 min-w-0 rounded-lg border border-[var(--glass-border)] bg-[var(--glass-bg-strong)] px-2 py-1 text-xs text-[var(--text-main)] outline-none"
+                />
+                <input
+                    value={cwd}
+                    onChange={(e) => setCwd(e.target.value)}
+                    placeholder="cwd（可选，相对工作树根）"
+                    className="w-1/4 min-w-0 rounded-lg border border-[var(--glass-border)] bg-[var(--glass-bg-strong)] px-2 py-1 text-xs text-[var(--text-muted)] outline-none"
+                />
+                <button type="button" disabled={!writeEnabled || busy || !cmdOk} onClick={run} className="btn-gradient rounded-md px-2 py-1 text-[0.64rem] font-semibold disabled:opacity-50">
+                    运行
+                </button>
+            </div>
+            <input
+                value={argsText}
+                onChange={(e) => setArgsText(e.target.value)}
+                placeholder="参数（空格分隔），如 -e console.log(1+1)"
+                className="rounded-lg border border-[var(--glass-border)] bg-[var(--glass-bg-strong)] px-2 py-1 text-xs text-[var(--text-main)] outline-none"
+            />
+            {outputs.length > 0 && (
+                <div className="flex flex-col gap-0.5 border-t border-[var(--glass-border)] pt-1">
+                    <span className="text-[0.6rem] text-[var(--text-muted)]">最近命令（live 输出仅在本次会话保存）：</span>
+                    {outputs.map((o, i) => (
+                        <div key={i} className="flex flex-col text-[0.62rem] text-[var(--text-muted)]">
+                            <span>
+                                {o.executable}{o.stdout ? `（exit ${o.code}）：${o.stdout}` : ` exit ${o.code}`}{o.timedOut ? '（超时）' : ''}{o.truncated ? '（已截断）' : ''}
+                            </span>
+                            {o.stderr && <span className="text-red-400">stderr：{o.stderr}</span>}
+                        </div>
+                    ))}
+                </div>
+            )}
+            {note && (
+                <div className={`text-[0.62rem] ${note.kind === 'error' ? 'text-red-500' : note.kind === 'warn' ? 'text-amber-400' : 'text-emerald-500'}`}>
+                    {note.text}
+                </div>
+            )}
+        </div>
+    );
+}
+
+/** Provision / start / cancel row for the selected run. */
+function RunLifecycleBar({ run }) {
+    const runOpsBusy = useWorkspaceStore((s) => s.runOpsBusy);
+    const provisionRun = useWorkspaceStore((s) => s.provisionRun);
+    const teardownRun = useWorkspaceStore((s) => s.teardownRun);
+    const runStart = useWorkspaceStore((s) => s.runStart);
+    const runCancel = useWorkspaceStore((s) => s.runCancel);
+    const refreshRunDetail = useWorkspaceStore((s) => s.refreshRunDetail);
+    const loadRuns = useWorkspaceStore((s) => s.loadRuns);
+
+    const busy = runOpsBusy;
+    const terminal = isRunTerminal(run.status);
+    const active = isRunActive(run.status);
+    const unsupported = run.worktreeStatus === 'unsupported';
+    const ready = run.worktreeStatus === 'ready';
+
+    const refreshAll = async () => {
+        await refreshRunDetail(run.id);
+        await loadRuns();
+    };
+
+    return (
+        <div className="flex flex-col gap-1">
+            <div className="flex flex-wrap items-center gap-1.5">
+                {!terminal && run.status === 'created' && (
+                    <button type="button" disabled={busy} onClick={async () => { await runStart(run.id); await refreshAll(); }} className="btn-gradient rounded-md px-2 py-1 text-[0.64rem] font-semibold disabled:opacity-50">
+                        启动 run
+                    </button>
+                )}
+                {!terminal && !unsupported && !ready && (
+                    <button type="button" disabled={busy} onClick={async () => { await provisionRun(run.id); await refreshAll(); }} className="btn-gradient rounded-md px-2 py-1 text-[0.64rem] font-semibold disabled:opacity-50">
+                        准备工作树
+                    </button>
+                )}
+                {!terminal && ready && (
+                    <button type="button" disabled={busy} onClick={async () => { await teardownRun(run.id); await refreshAll(); }} className="rounded-md border border-[var(--glass-border)] px-2 py-1 text-[0.64rem] text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-50">
+                        拆除工作树
+                    </button>
+                )}
+                {!terminal && (active || run.status === 'created') && (
+                    <button type="button" disabled={busy} onClick={async () => { await runCancel(run.id); await refreshAll(); }} className="rounded-md border border-red-500/40 px-2 py-1 text-[0.64rem] text-red-400 hover:text-red-500 disabled:opacity-50">
+                        取消 run
+                    </button>
+                )}
+                {!terminal && (
+                    <button type="button" disabled={busy} onClick={refreshAll} className="rounded-md border border-[var(--glass-border)] px-2 py-1 text-[0.64rem] text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-50">
+                        ⟳ 刷新（重连）
+                    </button>
+                )}
+            </div>
+            {unsupported && (
+                <div className="rounded border border-red-500/30 bg-[var(--panel-soft)] px-1.5 py-1 text-[0.62rem] text-red-500">
+                    该项目不是 Git 工作树顶层（worktreeStatus=unsupported）：保持只读，无法写入/执行。
+                </div>
+            )}
+            {ready && (
+                <div className="flex items-center gap-1.5 text-[0.62rem] text-[var(--text-muted)]">
+                    <span className="rounded bg-[var(--panel-soft)] px-1 text-emerald-500">工作树就绪</span>
+                    {run.worktreeBranch && <span>分支 {run.worktreeBranch}</span>}
+                    {run.baseBranch && <span>· base {run.baseBranch}</span>}
+                    {run.baseCommit && <span>@ {shortId(run.baseCommit)}</span>}
+                </div>
+            )}
+        </div>
+    );
+}
+
+/** Console for the selected write-run (mirrors server-authoritative run state). */
+function RunWriteConsole() {
+    const selectedRunId = useWorkspaceStore((s) => s.selectedRunId);
+    const runDetail = useWorkspaceStore((s) => s.runDetail);
+    const runDetailLoading = useWorkspaceStore((s) => s.runDetailLoading);
+    const runDetailError = useWorkspaceStore((s) => s.runDetailError);
+    const runOpsBusy = useWorkspaceStore((s) => s.runOpsBusy);
+    const runs = useWorkspaceStore((s) => s.runs);
+    const capabilities = useWorkspaceStore((s) => s.capabilities);
+    const openRunDetail = useWorkspaceStore((s) => s.openRunDetail);
+
+    const run = runDetail || runs.items.find((r) => r.id === selectedRunId) || null;
+    if (!selectedRunId || (!run && !runDetailLoading)) {
+        return (
+            <div className="rounded border border-[var(--glass-border)] bg-[var(--panel-soft)] px-2 py-1.5 text-[0.64rem] text-[var(--text-muted)]">
+                点上方某个写 run 打开控制台，或新建一个。写 run 在独立工作树里操作，不碰你的主 checkout。
+            </div>
+        );
+    }
+    if (!run && runDetailLoading) {
+        return <div className="py-2 text-center text-xs text-[var(--text-muted)]">加载 run 详情...</div>;
+    }
+    if (!run) {
+        return <div className="py-2 text-center text-xs text-red-500">{runDetailError || 'run 不存在或已被移除'}</div>;
+    }
+
+    const terminal = isRunTerminal(run.status);
+    const writeMode = ['edit', 'trusted'].includes(String(run.mode || run.preset));
+    const ready = run.worktreeStatus === 'ready';
+    const unsupported = run.worktreeStatus === 'unsupported';
+    const canWrite = canWriteToWorkspace(capabilities);
+    const canCmd = canRunCommands(capabilities);
+    const writeEnabled = Boolean(writeMode && canWrite && ready && !terminal && !unsupported);
+    const readEnabled = Boolean(!terminal);
+    const cmdEnabled = writeEnabled && canCmd;
+
+    return (
+        <div className="flex flex-col gap-1.5 rounded-lg border border-[var(--glass-border-active)] bg-[var(--surface-elevated)] px-2 py-1.5">
+            <div className="flex items-center gap-1.5 text-xs">
+                <span className="text-[var(--text-main)]">{shortId(run.id)}</span>
+                <ToneChip tone="accent">{presetLabel(run.mode || run.preset)}</ToneChip>
+                <ToneChip tone={run.status === 'waiting_approval' ? 'warn' : 'muted'}>{runStatusLabel(run.status)}</ToneChip>
+                <span className="min-w-0 flex-1" />
+                {!terminal && (
+                    <button type="button" onClick={() => openRunDetail(run.id)} title="重新拉取该 run 全部状态" className="rounded-md border border-[var(--glass-border)] px-1.5 py-0.5 text-[0.6rem] text-[var(--text-muted)] hover:text-[var(--text-main)]">
+                        ⟳ 重连刷新
+                    </button>
+                )}
+            </div>
+
+            <RunLifecycleBar run={run} />
+            <RunApprovalQueue runId={run.id} />
+
+            {!terminal && writeEnabled && (
+                <RunFileEditOps key={run.id} runId={run.id} writeEnabled={writeEnabled} readEnabled={readEnabled} />
+            )}
+            {!terminal && cmdEnabled && (
+                <RunCommandOps key={run.id} runId={run.id} writeEnabled={writeEnabled} />
+            )}
+            {!terminal && !writeEnabled && !unsupported && (
+                <div className="text-[0.62rem] text-[var(--text-muted)]">
+                    尚未就绪（工作树状态 {worktreeStatusLabel(run.worktreeStatus)}）：先在工作树就绪后即可编辑文件 / 执行命令。
+                </div>
+            )}
+
+            {!terminal && (
+                <>
+                    <RunGitReadBlock runId={run.id} readEnabled={readEnabled} />
+                    <RunArtifactsBlock runId={run.id} readEnabled={readEnabled} />
+                    <RunActionsLedger runId={run.id} />
+                </>
+            )}
+
+            {terminal && <RunSummaryCard run={run} />}
+        </div>
+    );
+}
+
+/** R2 write-run section: create (edit/trusted) + picker + console. */
+function RunWriteSection() {
+    const capabilities = useWorkspaceStore((s) => s.capabilities);
+    const projects = useWorkspaceStore((s) => s.projects);
+    const selectedProjectId = useWorkspaceStore((s) => s.selectedProjectId);
+    const workspace = useWorkspaceStore((s) => s.workspace);
+    const runs = useWorkspaceStore((s) => s.runs);
+    const selectedRunId = useWorkspaceStore((s) => s.selectedRunId);
+    const createWriteRun = useWorkspaceStore((s) => s.createWriteRun);
+    const openRunDetail = useWorkspaceStore((s) => s.openRunDetail);
+    const loadRuns = useWorkspaceStore((s) => s.loadRuns);
+
+    const canWrite = canWriteToWorkspace(capabilities);
+    const selected = projects.find((p) => p.id === selectedProjectId) || null;
+    const writeRuns = runs.items.filter((r) => ['edit', 'trusted'].includes(String(r.mode || r.preset)));
+    const canCreate = Boolean(canWrite && workspace && selected?.trusted);
+
+    return (
+        <div className="flex flex-col gap-1.5">
+            <div className="flex items-center gap-1.5 text-[0.68rem] font-semibold text-[var(--brand-start)]">
+                <span>写 run 控制台</span>
+                <span className="min-w-0 flex-1" />
+                <button type="button" onClick={loadRuns} disabled={runs.loading} className="rounded-md border border-[var(--glass-border)] px-1.5 py-0.5 text-[0.6rem] font-normal text-[var(--text-muted)] hover:text-[var(--text-main)] disabled:opacity-50">
+                    刷新列表
+                </button>
+            </div>
+            {!canWrite && (
+                <div className="rounded border border-red-500/30 bg-[var(--panel-soft)] px-1.5 py-1 text-[0.62rem] text-red-500">
+                    服务端未启用文件写入工具（CODING_WRITE_TOOLS_ENABLED=false）：无法创建写 run，本区仅读。
+                </div>
+            )}
+            {canWrite && canCreate && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                    <button
+                        type="button"
+                        disabled={runs.loading}
+                        onClick={() => createWriteRun('edit')}
+                        title={presetHint('edit')}
+                        className="btn-gradient rounded-md px-2 py-1 text-[0.64rem] font-semibold disabled:opacity-50"
+                    >
+                        ＋ edit run（审批）
+                    </button>
+                    <button
+                        type="button"
+                        disabled={runs.loading}
+                        onClick={() => createWriteRun('trusted')}
+                        title={presetHint('trusted')}
+                        className="rounded-md border border-[var(--brand-start)] px-2 py-1 text-[0.64rem] text-[var(--brand-start)] hover:bg-[var(--panel-soft)] disabled:opacity-50"
+                    >
+                        ＋ trusted run（自动）
+                    </button>
+                </div>
+            )}
+            {canWrite && !canCreate && (
+                <div className="text-[0.62rem] text-[var(--text-muted)]">需先在上方“信任并打开”一个 Git 项目（observe 仅读；edit/trusted 写入独立工作树）。</div>
+            )}
+            {writeRuns.length > 0 && (
+                <div className="flex flex-wrap gap-1">
+                    {writeRuns.map((run) => {
+                        const sel = run.id === selectedRunId;
+                        return (
+                            <button
+                                type="button"
+                                key={run.id}
+                                onClick={() => openRunDetail(run.id)}
+                                title={run.worktreeStatus === 'ready' ? `工作树 ${run.worktreeBranch || ''}` : `工作树状态 ${worktreeStatusLabel(run.worktreeStatus)}`}
+                                className={`rounded-md border px-1.5 py-0.5 text-[0.62rem] ${sel ? 'border-[var(--brand-start)] bg-[var(--panel-soft)] text-[var(--brand-start)]' : 'border-[var(--glass-border)] text-[var(--text-muted)] hover:text-[var(--text-main)]'}`}
+                            >
+                                {shortId(run.id)}·{presetLabel(run.mode || run.preset)}·{runStatusLabel(run.status)}
+                            </button>
+                        );
+                    })}
+                </div>
+            )}
+            {writeRuns.length === 0 && !runs.loading && (
+                <div className="text-[0.62rem] text-[var(--text-muted)]">还没有写 run，点上方按钮新建（会先进入审批态而非直接执行）。</div>
+            )}
+            <RunWriteConsole />
         </div>
     );
 }

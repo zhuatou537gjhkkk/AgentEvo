@@ -88,6 +88,10 @@ import { defaultEventStore } from "./coding/events.js";
 import { defaultApprovalService } from "./coding/approvals.js";
 import { defaultRuntimeRegistry } from "./coding/runtimeRegistry.js";
 import { defaultWorkspaceRunner } from "./coding/runner/readRunner.js";
+import { defaultWorktreeService } from "./coding/worktrees.js";
+import { defaultArtifactService } from "./coding/artifacts.js";
+import { defaultActionExecutor } from "./coding/actionExecutor.js";
+import { defaultRunWorkspaceRunner } from "./coding/runWorkspaceRunner.js";
 import { defaultRepoContextService } from "./coding/repoContext.js";
 
 // Default service bindings; createApp can override the request-visible bag.
@@ -198,6 +202,12 @@ const defaultDependencies = {
         codingRuntimeRegistry: defaultRuntimeRegistry,
         // Phase 7 / R1 — read-only workspace runner (allowed-root + trust gated).
         workspaceRunner: defaultWorkspaceRunner,
+        // Phase 7 / R2 — disposable git worktree lifecycle for write-enabled runs.
+        worktreeManager: defaultWorktreeService,
+        // Phase 7 / R2 — artifact ledger + run-scoped action executor + run surface.
+        codingArtifactService: defaultArtifactService,
+        actionExecutor: defaultActionExecutor,
+        codingRunRunner: defaultRunWorkspaceRunner,
         repoContextService: defaultRepoContextService,
     },
 };
