@@ -126,14 +126,14 @@ function makeFakeMakeLlm() {
     return { makeLlm, summaryInputs };
 }
 
-/** Flaky web_search func：前 failTimes 次抛带 status 的 503（secret 进 message），之后成功。 */
-function makeFlakyTool({ failTimes, secret, onFirstCall }) {
+/** Flaky web_search func：前 failTimes 次抛带 status 的错误（secret 进 message），之后成功。 */
+function makeFlakyTool({ failTimes, secret, onFirstCall, status = 503 }) {
     let calls = 0;
     const func = async () => {
         calls += 1;
         if (calls === 1) onFirstCall?.();
         if (calls <= failTimes) {
-            throw Object.assign(new Error(`bocha upstream raw (${secret})`), { status: 503 });
+            throw Object.assign(new Error(`bocha upstream raw (${secret})`), { status });
         }
         return "模拟检索结果（命中条目 x3）";
     };
@@ -222,6 +222,31 @@ describe("graph real-tool reliability matrix — searchAgent × web_search flaky
         expect(body).toContain("data: [DONE]");
         expect(body).not.toContain(SECRET);
         // 具体降级原因只进入 searchResults fallback JSON → search LLM input，secret 不进
+        const joined = fake.summaryInputs.join("\n");
+        expect(joined).toContain("联网检索暂时不可用");
+        expect(joined).toContain('"ok":false');
+        expect(joined).not.toContain(SECRET);
+        expect(rolesOf(ALICE.id, sessionId)).toEqual(["user", "assistant"]);
+    });
+
+    it("persistent 429 → classify retryable, exhausted (calls==2), generic tool_error + {ok:false} fallback, no secret", async () => {
+        // 429（上游限流）与 503 同属可重试族；断言 429 在真实节点链路同样耗尽降级。
+        const flaky = makeFlakyTool({ failTimes: Number.MAX_SAFE_INTEGER, secret: SECRET, status: 429 });
+        webSearchTool.func = flaky.func;
+        const fake = makeFakeMakeLlm();
+        base = await bootApp(fake);
+        const sessionId = newSession(ALICE.id);
+
+        const resp = await postSearchChat(ALICE, sessionId, QUERY);
+        expect(resp.status).toBe(200);
+        const body = await resp.text();
+
+        expect(flaky.calls).toBe(2); // retries:1 → 尝试 2 次后耗尽
+        expect(body).toContain('"tool_error"');
+        expect(body).toContain("工具暂时不可用");
+        expect(body).toContain("搜索Agent回答");
+        expect(body).toContain("data: [DONE]");
+        expect(body).not.toContain(SECRET);
         const joined = fake.summaryInputs.join("\n");
         expect(joined).toContain("联网检索暂时不可用");
         expect(joined).toContain('"ok":false');
