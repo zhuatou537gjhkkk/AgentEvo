@@ -311,3 +311,15 @@
 - [x] 测试 +4 文件 / +15 用例（budgetRetryWiring 5 / chatSseContract 2 / webSearchRetry 6 / chatForcedSearchRetry 2）。
 - [x] 全量 backend **39 files / 543 tests 全绿**（原 35/528，+4/+15）；frontend 9 files / 155 tests 保险复跑全绿；`node --check` + `git diff --check` OK；dev 库不被触碰。
 - [ ] **残余/延后**：SSE #2（streamEvents error 分支，延后专门 legacy 波）；真实工具 flaky 集成缝；durable 同 key 跨进程锁（需分布式锁）、软点→404、组织 RBAC、多实例 RAG、W5-W8/P2 继续延后。
+
+## 23. W4-R4：重试/SSE 收口扫尾 — SSE #2 + 真实工具 flaky 矩阵 + registry 契约 + 死角护栏（2026-09-06）
+
+关闭 §22 残余的 SSE #2、真实工具 flaky 集成缝，并把 C1 死角（config-default 无 withRetry）账清到零 + 源级护栏锁死。用户 4 决策选本波（"接下来还有什么可做的？一次三四个" → W4-R4）。完整记录见主日志 `2026-09-production-hardening.md` W4-R4 段。
+
+- [x] **T1（SSE #2，生产改动）** `services/chat.js`：legacy 两条 `AgentExecutor.streamEvents` for-await 顶部各加 error 族事件升级（`on_chain_error`/`on_chat_model_error`/`on_llm_error` → throw sanitized Error `{code:"UPSTREAM_UNAVAILABLE", retryable:true, cause}`，raw 只进 console+cause，收敛到既有 catch error envelope + res.end() **无 [DONE]**）；成功终态 `persistMessage` 前加空输出守卫（`!fullText` → `EMPTY_OUTPUT` 失败终态，不落空 assistant、不发假 [DONE]）。
+- [x] **T1 测试** `routes/chatStreamEventsError.test.js`（deep-chat fake bag + scripted fake executor，`USE_LANGGRAPH=false`）3 用例：迭代中途抛 503（先部分 text）→ 保留 text + `UPSTREAM_UNAVAILABLE` envelope、无 [DONE]、零 assistant 落库、无 secret；`on_chain_error` 事件后正常收尾 → 升级 error envelope（改造前假 [DONE]）；零 text 正常收尾 → `EMPTY_OUTPUT` 失败终态。
+- [x] **T2（零生产改动）** `services/chatGraphToolReliability.test.js`：patch 真实 `bochaSearchTool.func`（tools.js 模块级对象即 registry 同一实例）驱动真实 searchAgentNode × DynamicTool.invoke × withRetry 端到端。fake makeLlm 按 `opts.streaming` 分流（router 非流式 → search JSON `intents:["search"]` solo；search summarizer 流式 → 可 concat AIMessageChunk）。3 用例：flaky 一次 → 真重试（calls==2）+ tool_end + 结果注入 + [DONE]；恒 503 耗尽 → calls==2、SSE `tool_error`（固定通用文案，不泄细节）+ `{ok:false,"联网检索暂时不可用"}` 进 search LLM input 降级、solo 仍出回答；退避中 `reader.cancel` → abort 唤醒 calls==1、无假 assistant、无 [DONE]。
+- [x] **T3（零生产改动）** `mcp/registryInvokeRetry.test.js`：fresh ToolRegistry + flaky DynamicTool，走真实 `invokeTool → withRetry(retries:1)` 全链 4 用例：fail-once resolve（calls==2）；恒 503 耗尽 rethrow `classifyError`（retryable + `UPSTREAM_UNAVAILABLE`、calls==2）；退避中 abort → `ABORTED`/499、calls==1；缺工具同步 reject。
+- [x] **T4（生产改动 + 护栏）** `eval/reflection.js` reflectionLlm.invoke、`services/memory.js` llmMemoryConsolidation 的 llm.invoke 各包 `withRetry(retries:2)`（DEAD CODE 注释标注 maxRetries:0 理由）。新建 `services/retryInvariant.test.js` 源级护栏 4 用例：allowlist 含 `new ChatOpenAI(` 必含 `withRetry(` 调用；reflection/memory 各自唯一裸 invoke 在 withRetry 包裹区间内；src 全量扫描（除 learning/）ChatOpenAI 构造模块皆在 allowlist。
+- [x] 全量 backend **43 files / 557 tests 全绿**（原 39/543，+4/+14）；frontend 9 files / 155 tests 保险复跑全绿；`git diff --check` OK；dev 库不被触碰。
+- [ ] **残余/延后**：durable 同 key 跨进程锁（需分布式锁）、软点→404、组织 RBAC、多实例 RAG、W5-W8/P2 继续延后。W4 全部明确残余已清零。

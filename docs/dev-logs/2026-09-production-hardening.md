@@ -340,6 +340,22 @@ W4-R 全貌（withRetry 全链路 + 可靠性矩阵）拆 2 小波；本段 = **
 - **验证**：`node --check` 全部改动文件通过；定向 4 组新测试全绿；全量 backend **39 files / 543 tests 全绿**（原 35/528，+4/+15）；frontend 9 files / 155 tests 全绿（本波未改前端，保险复跑）；`git diff --check` exit=0（仅预期 LF/CRLF 警告）；dev `agent_data.db` 不被触碰（W3.3-J per-worker 临时库）。
 - **残余（roadmap §22）**：SSE #2（streamEvents error 分支）延后专门 legacy 波；executor 预算保留模型层单层属设计决策；真实工具 flaky 集成缝仍缺；durable 同 key 跨进程锁、组织 RBAC、多实例 RAG、W5-W8/P2 继续延后。
 
+### W4-R4：重试/SSE 收口扫尾 — SSE #2 + 真实工具 flaky 矩阵 + registry 契约 + 死角护栏（2026-09-06）
+
+关闭 §22 全部明确残余。用户决策（"接下来还有什么可做的？一次三四个" → AskUserQuestion → **W4-R4 收口扫尾**）。4 任务：T1 SSE#2 legacy streamEvents 错误分支、T2 graph 真实工具 flaky 集成矩阵、T3 registry.invokeTool withRetry 集成契约、T4 C1 死角清账 + 源级护栏。生产改动 3 文件 + 测试 4 文件；零 /chat 协议/前端/FSM 改动。
+
+- **T1（生产）SSE #2** —— `services/chat.js` 两条 `AgentExecutor.streamEvents` for-await（Region A enableWebSearch / Region B 其余，共享成功终态尾与唯一 catch）：顶部各插 error 族事件升级块（`on_chain_error`/`on_chat_model_error`/`on_llm_error` → `throw {code:"UPSTREAM_UNAVAILABLE", retryable:true, cause}`，raw provider 只进 console+cause）—— 单路径收敛到既有 catch（error envelope + `res.end()`，**无 [DONE]**，R3 #1 已保证单写）；成功终态 `persistMessage` 前加空输出守卫（`!fullText` → `EMPTY_OUTPUT` 失败终态，emitThought error + toPublicError 帧 + end，**不落空 assistant、不发假 [DONE]**）。不改 `on_tool_error`（classic executor 工具错转 observation 属正常降级）。
+- **T1 测试** `routes/chatStreamEventsError.test.js`（沿用 deep-chat fake bag + scripted fake executor：streamEvents 按脚本 yield / `{throw}`）：① 先部分 text 再迭代抛 503 → 保留 text + `UPSTREAM_UNAVAILABLE` envelope、无 [DONE]、零 assistant 落库、零 secret；② `on_chain_error` 事件后正常收尾 → 升级终态（改造前假 [DONE]）；③ 零 text 正常收尾 → `EMPTY_OUTPUT` error envelope、无 [DONE]、零 assistant。
+- **T2（零生产改动）真实工具 flaky 矩阵** —— 侦察确认 graph `web_search` = `mcp/tools.js` `bochaSearchTool` **同一对象**（registerLocalTools 存原始实例，仅 description 被 getter 覆写，func 可写）→ 无新生产 seam：`webSearchTool.func = flakyFunc`（beforeEach 存原 / afterEach 还原）。新测试 `services/chatGraphToolReliability.test.js` 照 chatGraphReliability 形态（real DB + `createApp({services:{makeLlm}})` + `USE_LANGGRAPH=true` + HTTP + body `enable_web_search:true,plan_mode:false,enable_memory:false`）。fake makeLlm 按 `opts.streaming` 分流：router 非流式 invoke → search JSON（`intents:["search"]` → solo）；search summarizer 流式 → 单 AIMessageChunk（可 concat）。3 用例：
+  1. **flaky 一次成功**：calls==2（节点 withRetry retries:1 真重试）、tool_end + 结果注入、[DONE]、secret 不进 body/LLM input。
+  2. **恒 503 耗尽降级**：calls==2、SSE `tool_error`（固定通用文案）+ `{ok:false,errorCode:"MCP_TOOL_FAILED",message:"联网检索暂时不可用"}` 进 search LLM input 降级、solo 仍出"搜索Agent回答"、正常 [DONE]、无 hang、无 secret。
+  3. **退避中半开 abort**：flaky 即时抛 + onFirstCall 信号 → 读首帧后 `reader.cancel()` → sleep 400ms（>最大退避 ~240ms）→ calls==1、仅 user、无 [DONE]、solo 从未运行。
+  - **harness 排障两处（如实记录）**：① 最初 `bootApp` 把整个 `{makeLlm,summaryInputs}` 对象当作 `services.makeLlm` 传 → `config.configurable.makeLlm` 非函数 → `resolveMakeLlm(...) is not a function`（graph stream 抛 INTERNAL_ERROR，thought 帧先出后 error 收尾）→ 改为传 `fake.makeLlm` 即绿。② `sse.toolError` 第三参 error 只喂 trace span，**SSE 帧永远写固定 `"工具暂时不可用"`** → 具体降级原因只在 searchResults fallback JSON（进 LLM input），测试断言相应落到 `tool_error` 帧 = 固定文案 + LLM input = 具体文案。
+- **T3（零生产改动）registry 契约** —— `mcp/registryInvokeRetry.test.js`（fresh ToolRegistry + flaky DynamicTool func 数调用按次抛 status:503，走真实 `invokeTool → getTool → DynamicTool.invoke → withRetry(retries:1)`）4 用例：fail-once resolve calls==2；恒 503 耗尽 reject `classifyError`（retryable + `UPSTREAM_UNAVAILABLE`、calls==2）；退避中 abort → reject `ABORTED`/499、calls==1（第二次未触发）；缺工具同步 reject。raw invokeTool 耗尽 rethrow 属设计（调用方负责脱敏），secret 断言归 T1/T2。
+- **T4（生产 + 护栏）C1 死角清账** —— `eval/reflection.js` `reflectionLlm.invoke`、`services/memory.js` `llmMemoryConsolidation` 的 `llm.invoke` 各包 `withRetry((_,rs)=>…,{retries:2})`（两处均 DEAD CODE，注释标注"若接线必须保留 withRetry —— maxRetries:0 默认"）。新护栏 `services/retryInvariant.test.js`（纯 readFileSync 源级，不加载运行模块）4 用例：allowlist（app/chatUtils/chatGraph/judge/generator/optimize/reflection）含 `new ChatOpenAI(` 必含 `withRetry(` **调用**；reflection/memory 各自唯一裸 invoke 落在最近 withRetry( 后 400 字符包裹区间内；src 全量扫描（除 learning/ 教学代码）凡含 `new ChatOpenAI(` 的模块都在 allowlist —— 新构造点不静默漏网。
+- **验证**：`node --check` 各改动文件 OK；定向 T1 3/3 → T2 3/3 → T3 4/4 → T4 4/4（T2 最先行以 de-risk）；全量 backend **43 files / 557 tests 全绿**（原 39/543，+4/+14）；frontend 9 files / 155 tests 保险复跑全绿（本波未改前端）；`git diff --check` exit=0（仅预期 LF/CRLF 警告）；dev `agent_data.db` 不被触碰。
+- **残余/延后**：W4 明确残余清零。durable 同 key 跨进程锁（需分布式锁服务）、软点→404（API 行为变更，FE 兼容优先保持现状）、组织 RBAC、多实例 RAG、W5-W8/P2 继续延后。
+
 ## 回滚与遗留风险
 
 - 所有新增行为使用环境变量或兼容 fallback；必要时可关闭新开关并保留旧数据。
