@@ -25,6 +25,13 @@ export const codingCommandToolsEnabled = () => flagEnabled("CODING_COMMAND_TOOLS
 // decisions from the decider — the single-op loop path is untouched.
 export const codingBatchReadsEnabled = () => flagEnabled("CODING_BATCH_READS");
 
+// Phase 7 / R4 (roadmap #8) — code_agent reuse of the SHARED project-code
+// retrieval. Default OFF. Even with this flag ON nothing happens unless a
+// `retrieval` service was also injected into the CodeAgentService constructor,
+// so the production singleton (constructed with no deps) stays byte-for-byte
+// identical on its legacy path.
+export const projectRagReuseEnabled = () => flagEnabled("CODING_RAG_REUSE_ENABLED");
+
 export const CODING_FLAG_NAMES = [
     "CODING_WORKSPACE_ENABLED",
     "CODING_EVENT_LOG_ENABLED",
@@ -32,6 +39,7 @@ export const CODING_FLAG_NAMES = [
     "CODING_WRITE_TOOLS_ENABLED",
     "CODING_COMMAND_TOOLS_ENABLED",
     "CODING_BATCH_READS",
+    "CODING_RAG_REUSE_ENABLED",
 ];
 
 /** Server-decided capability snapshot — never computed from client/model input. */

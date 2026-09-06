@@ -43,6 +43,7 @@ import {
     PLAN_MODE_INSTRUCTION,
 } from "./chatUtils.js";
 import { dagSchedulerEnabled, contextProvenanceEnabled, agentRetrievalEnabled } from "./graphFlags.js";
+import { projectRagEnabled } from "../rag/flags.js";
 import { postProcessSearchResults } from "./agentRetrieval.js";
 import {
     SUBTASK_OK,
@@ -245,6 +246,15 @@ const AgentState = Annotation.Root({
     currentSubTask: Annotation({
         default: () => null,
         reducer: (_, update) => update,
+    }),
+
+    // Phase 7 / R4 — owner-supplied project id for project-code RAG routing
+    // (roadmap R4 #7). Always null unless the caller explicitly attaches a
+    // project (R1 repo_context / codingTask carry projectId). knowledgeAgentNode
+    // only consults it when PROJECT_RAG_ENABLED + a retrievalService is injected.
+    projectId: Annotation({
+        default: () => null,
+        reducer: (a, b) => b ?? a,
     }),
 
     // Phase 7 / R3 — provenance result packets per subTaskId + router complexity.
@@ -571,6 +581,34 @@ function defaultMakeLlm(opts) {
 
 function resolveMakeLlm(config) {
     return config?.configurable?.makeLlm || defaultMakeLlm;
+}
+
+/**
+ * Phase 7 / R4 — default shared project-code retrieval bound into the graph
+ * config (`config.configurable.retrievalService`). It is only ever *called* by
+ * knowledgeAgentNode's R4 branch, which additionally requires PROJECT_RAG_ENABLED
+ * AND `state.projectId`, so the lazy import of the sibling `../rag/retrieval.js`
+ * never runs in the default-off regime. Tests inject a deterministic fake through
+ * `options.deps.services.projectRetrieval`; the production singleton falls back
+ * here (the real sibling module when present). No ChatOpenAI / makeLlm seam is
+ * introduced — this function is text/retrieval only.
+ */
+async function defaultProjectRetrieval({ scope = {}, projectId = null, query = "", mode = "knowledge", opts = {} } = {}) {
+    const requestUserId = Number(scope?.userId ?? getRequestContext()?.userId);
+    if (!Number.isInteger(requestUserId) || requestUserId <= 0 || !projectId) {
+        return { status: "noop", text: "", items: [], metrics: null, errorCode: null };
+    }
+    const retrieval = await import("../rag/retrieval.js");
+    if (typeof retrieval?.retrieveProjectCode !== "function") {
+        return { status: "error", text: "", items: [], metrics: null, errorCode: "PROJECT_RAG_UNAVAILABLE" };
+    }
+    return retrieval.retrieveProjectCode({
+        scope: { userId: requestUserId, tenantId: scope?.tenantId ?? `user:${requestUserId}` },
+        projectId,
+        query: String(query || ""),
+        deps: {},
+        opts,
+    });
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1519,6 +1557,121 @@ async function searchAgentNode(state, config) {
 // 节点 5: KnowledgeAgentNode — 知识库检索 Agent
 // ═══════════════════════════════════════════════════════
 
+/**
+ * Phase 7 / R4 (roadmap #7) — the project-code RAG body of knowledgeAgentNode.
+ * Gated at the call site by PROJECT_RAG_ENABLED + `state.projectId` + an injected
+ * `config.configurable.retrievalService`. Calls the SHARED project retrieval once
+ * (`retrieveProjectCode` shape: { status:'ok'|'no_match'|'error', text, items,
+ * metrics, errorCode }) and returns the SAME graph-compatible shape the existing
+ * node returns for the active mode:
+ *   - currentSubTask present → planResults + agentResults (with artifact.retrieval
+ *     provenance) + subTasks + plan + currentAgent + tokenUsage:null;
+ *   - otherwise (solo / legacy parallel) → text-only AIMessage + knowledgeResults.
+ * Never invokes an LLM / emits SSE text chunks for the branch (parity with the
+ * normal non-solo knowledge flow). Requires a live request context (authenticated
+ * owner) for the retrieval scope; the call site already guarantees that.
+ */
+async function runKnowledgeProjectRagBranch(state, config, sse, plan, agentType, requestUserId) {
+    const retrievalService = config?.configurable?.retrievalService;
+    const goal = state.currentSubTask?.goal;
+    const query = goal
+        ? `子任务目标：${goal}\n（原始用户问题：${state.userInput}）`
+        : String(state.userInput || "");
+    const requestContext = getRequestContext() || {};
+
+    let retrievalOutcome;
+    try {
+        retrievalOutcome = (await retrievalService({
+            scope: { userId: requestUserId, tenantId: requestContext?.tenantId || `user:${requestUserId}` },
+            projectId: state.projectId,
+            query,
+            mode: "knowledge",
+        })) || {};
+    } catch (error) {
+        console.log(`[graph][knowledge] project RAG branch error: ${error?.message}`);
+        retrievalOutcome = { status: "error", mode: "hybrid", text: "", items: [], metrics: null, errorCode: "PROJECT_RAG_QUERY_FAILED" };
+    }
+
+    const items = Array.isArray(retrievalOutcome?.items) ? retrievalOutcome.items : [];
+    const artifact = {
+        retrieval: {
+            mode: retrievalOutcome?.mode || "hybrid",
+            projectId: state.projectId,
+            items: items.map((item) => ({
+                file: item?.provenance?.file ?? item?.filePath ?? null,
+                startLine: item?.provenance?.startLine ?? item?.startLine ?? null,
+                endLine: item?.provenance?.endLine ?? item?.endLine ?? null,
+                commit: item?.provenance?.commit ?? item?.commit ?? null,
+            })),
+        },
+    };
+
+    let text;
+    let errorCode = null;
+    if (retrievalOutcome?.status === "ok") {
+        text = String(retrievalOutcome?.text ?? "");
+    } else if (retrievalOutcome?.status === "no_match") {
+        text = "未检索到相关知识片段（项目代码库无匹配）";
+    } else {
+        errorCode = retrievalOutcome?.errorCode || "PROJECT_RAG_QUERY_FAILED";
+        // Keep the message readable AND recognisably an error result (isErrorResultText
+        // matches the `知识库检索出错:` prefix), so DAG gating stays correct.
+        text = `知识库检索出错:${errorCode}（知识库检索暂时不可用）`;
+    }
+    // Same settle logic as the existing node: DAG ON derives completed|failed from
+    // the result text; DAG OFF (legacy) always completes — identical semantics.
+    const outcome = subTaskSettledStatus(text);
+
+    // Plan / subTask mode — settle the current subTask like the existing node's
+    // non-solo branch, plus provenance-bearing AgentResult for R3 consumers.
+    if (state.currentSubTask) {
+        const subTaskId = state.currentSubTask.id;
+        const updatedSubTasks = (state.subTasks || []).map((s) =>
+            s.id === subTaskId
+                ? { ...s, status: outcome, ...(outcome === "failed" ? { statusReason: "项目代码库检索失败或不可用" } : {}) }
+                : s
+        );
+        plan = emitPlanProgress(sse, plan, "tools_done");
+        if (sse) sse.agentEnd(agentType);
+        console.log(`[graph][knowledge] project RAG status=${retrievalOutcome?.status} mode=${artifact.retrieval.mode} items=${items.length} → subTask ${subTaskId} (${outcome})`);
+        return {
+            planResults: { [subTaskId]: text },
+            agentResults: { [subTaskId]: toAgentResult({ agentType: "knowledge", subTaskId, status: outcome, text, artifact, errorCode }) },
+            subTasks: updatedSubTasks,
+            plan,
+            currentAgent: agentType,
+            tokenUsage: null,
+        };
+    }
+
+    // No currentSubTask — mirror the EXISTING node's solo-vs-parallel shapes exactly
+    // (identical field sets; the only difference is we never stream SSE text chunks
+    // or run a second LLM — the retrieval text IS the answer). Solo (single intent):
+    // append an AIMessage (final-text collect) + knowledgeResults. Parallel
+    // fan-out: expose only knowledgeResults for the synthesizer, like the existing
+    // parallel tail — no stray AIMessage on the shared messages channel.
+    const solo = isSoloRun(state);
+    plan = emitPlanProgress(sse, plan, solo ? "all_done" : "tools_done");
+    if (sse) sse.agentEnd(agentType);
+    if (solo) {
+        console.log(`[graph][knowledge] project RAG status=${retrievalOutcome?.status} mode=${artifact.retrieval.mode} items=${items.length} → direct`);
+        return {
+            messages: [new AIMessage({ content: text })],
+            knowledgeResults: text,
+            plan,
+            currentAgent: agentType,
+            tokenUsage: null,
+        };
+    }
+    console.log(`[graph][knowledge] project RAG status=${retrievalOutcome?.status} mode=${artifact.retrieval.mode} items=${items.length} → parallel`);
+    return {
+        knowledgeResults: text,
+        plan,
+        currentAgent: agentType,
+        tokenUsage: null,
+    };
+}
+
 async function knowledgeAgentNode(state, config) {
     const solo = isSoloRun(state);
     console.log(`[graph][knowledge] starting (mode=${solo ? 'solo' : 'parallel'})`);
@@ -1531,6 +1684,23 @@ async function knowledgeAgentNode(state, config) {
 
     // Plan 模式：确保首个步骤为 in_progress
     let plan = emitPlanProgress(sse, state.plan, 'agent_start');
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Phase 7 / R4 (roadmap #7) — project-code RAG branch. DEFAULT OFF.
+    // Runs only when ALL of: PROJECT_RAG_ENABLED AND `state.projectId` AND a
+    // retrievalService function injected via config.configurable. The node then
+    // calls the shared project-code retrieval ONCE and early-returns an
+    // AgentResult carrying provenance (artifact.retrieval.items) — no second
+    // LLM summary, no SSE text stream (mirrors the normal non-solo knowledge
+    // flow). When any precondition is absent execution falls through to the
+    // existing LLM+tools flow byte-for-byte. No new ChatOpenAI / makeLlm site.
+    // ═══════════════════════════════════════════════════════════════════════
+    const requestUserId = Number(getRequestContext()?.userId);
+    if (projectRagEnabled() && state.projectId
+        && typeof config?.configurable?.retrievalService === "function"
+        && Number.isInteger(requestUserId) && requestUserId > 0) {
+        return runKnowledgeProjectRagBranch(state, config, sse, plan, agentType, requestUserId);
+    }
 
     const kbTool = toolRegistry.getTool("search_knowledge_base", getRequestContext());
     if (!kbTool) {
@@ -2877,6 +3047,13 @@ async function chatWithGraphImpl(userId, session_id, userMessage, image, systemP
             }
         }
 
+        // Phase 7 / R4 (roadmap #7) — owner-supplied project id for the (default-OFF)
+        // project-code RAG routing. Stored on the initial AgentState (`projectId`
+        // annotation) AND mirrored onto config.configurable so node code can read
+        // either. Sources, in order: repo_context refs (R1) → explicit options.projectId.
+        // Always null unless a caller actually attaches a project.
+        const r4ProjectId = options?.repoContext?.projectId ?? options?.projectId ?? null;
+
         // CONTEXT_BUILDER_ENABLED=false → 跳过优化上下文；CONTEXT_PROVENANCE_ENABLED=true
         // → 走 provenance 管道（hash/range 去重 + per-source budget + loop 压缩），
         // 并产出 contextDigest 供 planner/synthesizer 读取；两者都不设 → legacy build（字符串）。
@@ -2927,6 +3104,8 @@ async function chatWithGraphImpl(userId, session_id, userMessage, image, systemP
             optimizedContext,
             // Phase 7 / R3: provenance 上下文摘要（sha256 短指纹；CONTEXT_PROVENANCE_ENABLED 时填充）
             contextDigest,
+            // Phase 7 / R4: owner-supplied project id for project-code RAG (default null)
+            projectId: r4ProjectId,
         };
 
         const config = {
@@ -2935,6 +3114,12 @@ async function chatWithGraphImpl(userId, session_id, userMessage, image, systemP
                 sse: graphSse, // SSE emitter 通过 config 传入节点
                 abortSignal: abortController.signal, // 允许节点感知客户端断连
                 makeLlm, // LLM 构造工厂：默认真实 ChatOpenAI，测试可注入 fake
+                // Phase 7 / R4 (roadmap #7): project-code retrieval service seam.
+                // knowledgeAgentNode ONLY invokes it when PROJECT_RAG_ENABLED AND
+                // `state.projectId` is set (both default off), so defaultProjectRetrieval's
+                // lazy `import('../rag/retrieval.js')` is never evaluated on the legacy path.
+                projectId: r4ProjectId,
+                retrievalService: options?.deps?.services?.projectRetrieval || defaultProjectRetrieval,
             },
         };
 
@@ -3087,6 +3272,9 @@ export {
     isErrorResultText,
     codeAgentNode,
     runCodingAgentNode,
+    // Phase 7 / R4 — project-code RAG branch inside the knowledge node (default OFF).
+    knowledgeAgentNode,
+    runKnowledgeProjectRagBranch,
     // Phase 7 / R3 — DAG scheduler + helpers (pure, vitest-friendly).
     // estimateTaskComplexity / subTaskOutcomeFromText 已内联 export，不在此重复。
     orderSubTasksByType,

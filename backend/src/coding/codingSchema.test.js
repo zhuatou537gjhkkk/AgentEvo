@@ -154,3 +154,55 @@ describe("CodingEventStore seq allocation + replay safety", () => {
         expect(error.code).toBe("NOT_FOUND");
     });
 });
+
+// ───────────────────────── Phase 7 / R4 — durable knowledge schema ─────────────────────────
+
+const R4_TABLES = [
+    "knowledge_documents", "knowledge_chunks", "knowledge_query_log", "project_memory",
+];
+
+describe("R4 durable knowledge schema + migration ledger", () => {
+    it("creates the four R4 tables idempotently and carries the scoping columns", () => {
+        initDB();
+        initDB();
+        const names = db.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('knowledge_documents','knowledge_chunks','knowledge_query_log','project_memory') ORDER BY name",
+        ).all().map((row) => row.name);
+        expect(names).toEqual([...R4_TABLES].sort());
+        // exactly the three knowledge_* tables (no stray/duplicated DDL)
+        const knowledgeTables = db.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'knowledge_%' ORDER BY name",
+        ).all().map((row) => row.name);
+        expect(knowledgeTables).toHaveLength(3);
+        const again = db.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('knowledge_documents','knowledge_chunks','knowledge_query_log','project_memory') ORDER BY name",
+        ).all().map((row) => row.name);
+        expect(again).toEqual(names);
+    });
+
+    it("knowledge_documents/chunks/project_memory carry owner/tenant/project + revision/invalidation metadata", () => {
+        const docCols = db.prepare("PRAGMA table_info(knowledge_documents)").all().map((c) => c.name);
+        for (const col of ["owner_user_id", "tenant_id", "project_id", "file_path", "file_hash", "status", "revision", "revision_of", "source_run_id", "source_commit"]) {
+            expect(docCols).toContain(col);
+        }
+        const chunkCols = db.prepare("PRAGMA table_info(knowledge_chunks)").all().map((c) => c.name);
+        for (const col of ["owner_user_id", "tenant_id", "project_id", "document_id", "chunk_index", "start_line", "end_line", "content_hash", "symbols", "stale", "embedding"]) {
+            expect(chunkCols).toContain(col);
+        }
+        const memCols = db.prepare("PRAGMA table_info(project_memory)").all().map((c) => c.name);
+        for (const col of ["layer", "content", "importance", "confidence", "source_run_id", "files_json", "commit_ref", "invalidated", "invalidated_at", "invalidate_reason"]) {
+            expect(memCols).toContain(col);
+        }
+    });
+
+    it("ledgers R4-KNOWLEDGE-1 exactly once, even when initDB runs repeatedly", () => {
+        const count = () => db.prepare(
+            "SELECT COUNT(*) AS c FROM security_migration_audit WHERE migration = 'R4-KNOWLEDGE-1'",
+        ).get().c;
+        initDB();
+        expect(count()).toBe(1);
+        // UNIQUE(migration) + INSERT OR IGNORE means a manual duplicate stays ignored
+        db.prepare("INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES ('R4-KNOWLEDGE-1', '{}')").run();
+        expect(count()).toBe(1);
+    });
+});

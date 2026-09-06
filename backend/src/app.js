@@ -56,6 +56,7 @@ import {
     getLatestUploadedSource,
     getActiveLargeFile
 } from "./rag/index.js";
+import { durableRagEnabled } from "./rag/flags.js";
 import { saveUploadedImage, getUploadedImageDataUrl } from "./images/store.js";
 import { MemoryService } from "./services/memory.js";
 import evalRoutes from "./eval/evalRoutes.js";
@@ -82,6 +83,7 @@ import { registerObservabilityRoutes } from "./routes/observabilityRoutes.js";
 import { registerConfigRoutes } from "./routes/configRoutes.js";
 import { registerMemoryRoutes } from "./routes/memoryRoutes.js";
 import { registerCodingRoutes } from "./routes/codingRoutes.js";
+import { registerRagRoutes } from "./routes/ragRoutes.js";
 import { defaultProjectService } from "./coding/projects.js";
 import { defaultRunService } from "./coding/runs.js";
 import { defaultEventStore } from "./coding/events.js";
@@ -410,6 +412,10 @@ function registerAllRoutes(instance, { buildCompactionSummary = defaultBuildComp
     // project/run/event/approval records + instance-local runtime registry).
     // Agent turns still enter the main Graph through /chat; flags default off.
     registerCodingRoutes(appRouter, { requireAuth });
+    // Phase 7 / R4 — project-code RAG registrar (owner-scoped index/query/rebuild
+    // + telemetry over the durable project RAG stack). All /rag capabilities are
+    // default OFF (see rag/flags.js); routes self-gate to 403 while dark.
+    registerRagRoutes(appRouter, { requireAuth });
     // Phase 5: 评估系统 — admin + rate-limited。evalRoutes 内部 DB 访问仍走
     // 模块单例(残余项),待 eval 路由自身 bag 化后再注入。
     appRouter.use("/eval", requireAuth, createRateLimit({ scope: "eval", windowMs: 60_000, max: 30 }), requireAdmin, evalRoutes);
@@ -1424,6 +1430,56 @@ app.post("/test-db", requireAuth, (req, res) => {
     });
 });
 
+/**
+ * Phase 7 / R4 (roadmap #9) — durable dual-write hook for the legacy document
+ * upload endpoints. Called AFTER the legacy in-memory index has succeeded, and
+ * ONLY when RAG_DURABLE_ENABLED is set (default OFF → early return → the legacy
+ * path is byte-for-byte identical). Best-effort and never failing: a durable
+ * write error is logged and swallowed so the upload request contract is
+ * unchanged even while the durable store is still being built out. The
+ * implementation resolves injected bag service first (createApp
+ * dependencies.services.durableSyncWrite), else lazily imports the sibling
+ * ../rag/durableSync.js module — no static dependency on a still-under-construction
+ * module, and nothing is evaluated while the flag is dark.
+ */
+async function dualWriteDurableUpload(req, { text, fileName }) {
+    if (!durableRagEnabled()) return { written: false, reason: "disabled" };
+    const dependencies = getDependencies(req);
+    let write = null;
+    const injected = dependencies?.services?.durableSyncWrite || dependencies?.services?.maybeDualWriteUpload;
+    if (typeof injected === "function") {
+        write = injected;
+    } else if (injected && typeof injected.maybeDualWriteUpload === "function") {
+        write = injected.maybeDualWriteUpload;
+    } else {
+        try {
+            const durableSync = await import("./rag/durableSync.js");
+            write = typeof durableSync?.maybeDualWriteUpload === "function" ? durableSync.maybeDualWriteUpload : null;
+        } catch (error) {
+            console.log(`[rag][durable] durableSync unavailable for dual-write: ${error?.message}`);
+            return { written: false, reason: "unavailable" };
+        }
+    }
+    if (!write) return { written: false, reason: "unavailable" };
+    const embedder = dependencies?.services?.ragEmbedder || null;
+    const scope = {
+        userId: Number(req.user?.id),
+        tenantId: req.user?.tenantId || req.requestContext?.tenantId || `user:${req.user?.id}`,
+    };
+    try {
+        const result = await write({
+            scope,
+            text,
+            fileName,
+            ...(embedder ? { embedder } : {}),
+        });
+        return { written: Boolean(result?.written), reason: result?.reason || "indexed", result };
+    } catch (error) {
+        console.log(`[rag][durable] dual-write skipped after error: ${error?.message}`);
+        return { written: false, reason: "error" };
+    }
+}
+
 app.post("/upload", requireAuth, createRateLimit({ scope: "upload", windowMs: 60_000, max: 10 }), (req, res, next) => {
     documentUploadMiddleware(req, res, (uploadError) => {
         if (uploadError) {
@@ -1460,6 +1516,14 @@ app.post("/upload", requireAuth, createRateLimit({ scope: "upload", windowMs: 60
             );
             settleUploadReservation(req.user.id, uploadKey, req.file.buffer.length);
             return indexed;
+        });
+        // Phase 7 / R4 (roadmap #9): best-effort durable dual-write AFTER the
+        // legacy in-memory index. RAG_DURABLE_ENABLED-off → no-op. Any durable
+        // error is swallowed inside dualWriteDurableUpload — the upload response
+        // and quota lock are already decided here.
+        await dualWriteDurableUpload(req, {
+            text: req.file.buffer.toString("utf8"),
+            fileName: req.file.originalname,
         });
         return res.json({
             ok: true,
@@ -1700,6 +1764,19 @@ app.post("/upload/merge", requireAuth, createRateLimit({ scope: "upload-merge", 
                     });
                 }
                 mergeCommitted = true;
+                // Phase 7 / R4 (roadmap #9): best-effort durable dual-write AFTER
+                // the legacy merge+index commits. Reads the still-present merged
+                // file; RAG_DURABLE_ENABLED-off → no-op; errors swallowed so the
+                // merged-file cleanup and commit response below are unaffected.
+                try {
+                    const mergedText = await fse.readFile(mergedFilePath, "utf8");
+                    await dualWriteDurableUpload(req, {
+                        text: mergedText,
+                        fileName: normalizedFileName,
+                    });
+                } catch (dualError) {
+                    console.log(`[rag][durable] merge dual-write skipped: ${dualError?.message}`);
+                }
                 await fse.remove(hashDir);
                 await fse.remove(mergedFilePath);
                 return res.json({ ok: true, message: "document indexed", data: { ...ragResult, hash: normalizedHash } });

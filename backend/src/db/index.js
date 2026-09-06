@@ -402,6 +402,100 @@ function ensureScopedSchema(defaultUserId) {
     addColumn("coding_runs", "worktree_status", "TEXT NOT NULL DEFAULT 'none'");
     addColumn("coding_runs", "provisioned_at", "DATETIME");
 
+    // ── Phase 7 / R4 — durable knowledge + project memory (additive) ──
+    // Durable project code RAG: document rows carry file-hash + revision so a
+    // changed file supersedes (marks stale) its prior revision's chunks; chunk
+    // rows persist text + symbols + embedding (JSON float array) so the vector
+    // index is rebuilt lazily from this same DB after a restart. project_memory
+    // separates run working / project episodic / project semantic from the
+    // existing user-level agent_memory. knowledge_query_log is append-only
+    // telemetry for hit/no-match/groundedness/latency. All rows owner/tenant/
+    // project scoped; no secret/provider-raw data crosses the write boundary.
+    db.prepare(`CREATE TABLE IF NOT EXISTS knowledge_documents (
+        id TEXT PRIMARY KEY,
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        doc_type TEXT NOT NULL DEFAULT 'project_file',
+        file_path TEXT NOT NULL,
+        file_name TEXT NOT NULL,
+        file_hash TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'active',
+        revision INTEGER NOT NULL DEFAULT 1,
+        revision_of TEXT,
+        source_run_id TEXT,
+        source_session_id INTEGER,
+        source_commit TEXT,
+        meta TEXT NOT NULL DEFAULT '{}',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (owner_user_id, tenant_id, project_id, file_path, revision),
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_knowledge_docs_scope_project ON knowledge_documents(owner_user_id, tenant_id, project_id, status)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_knowledge_docs_scope_path ON knowledge_documents(owner_user_id, tenant_id, project_id, file_path, status)").run();
+
+    db.prepare(`CREATE TABLE IF NOT EXISTS knowledge_chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id TEXT NOT NULL,
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        chunk_index INTEGER NOT NULL,
+        start_line INTEGER,
+        end_line INTEGER,
+        content TEXT NOT NULL,
+        content_hash TEXT,
+        symbols TEXT NOT NULL DEFAULT '',
+        token_count INTEGER NOT NULL DEFAULT 0,
+        stale INTEGER NOT NULL DEFAULT 0,
+        embedding TEXT,
+        meta TEXT NOT NULL DEFAULT '{}',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id),
+        FOREIGN KEY (document_id) REFERENCES knowledge_documents(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_scope_project ON knowledge_chunks(owner_user_id, tenant_id, project_id, stale)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_doc ON knowledge_chunks(document_id, chunk_index)").run();
+
+    db.prepare(`CREATE TABLE IF NOT EXISTS project_memory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        run_id TEXT,
+        layer TEXT NOT NULL DEFAULT 'episodic',
+        content TEXT NOT NULL,
+        importance REAL NOT NULL DEFAULT 0.5,
+        confidence REAL NOT NULL DEFAULT 0.5,
+        source_run_id TEXT,
+        files_json TEXT NOT NULL DEFAULT '[]',
+        commit_ref TEXT,
+        invalidated INTEGER NOT NULL DEFAULT 0,
+        invalidated_at DATETIME,
+        invalidate_reason TEXT,
+        meta TEXT NOT NULL DEFAULT '{}',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_project_memory_scope_layer ON project_memory(owner_user_id, tenant_id, project_id, layer, invalidated)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_project_memory_run ON project_memory(owner_user_id, tenant_id, run_id)").run();
+
+    db.prepare(`CREATE TABLE IF NOT EXISTS knowledge_query_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL,
+        project_id TEXT,
+        mode TEXT NOT NULL,
+        status TEXT NOT NULL,
+        source TEXT,
+        items INTEGER NOT NULL DEFAULT 0,
+        latency_ms REAL NOT NULL DEFAULT 0,
+        groundedness REAL,
+        query_preview TEXT NOT NULL DEFAULT '',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_knowledge_query_log_scope_at ON knowledge_query_log(owner_user_id, tenant_id, created_at)").run();
+
     const seedPath = path.resolve(__dirname, "../mcp/servers.json");
     try {
         const seeds = JSON.parse(fs.readFileSync(seedPath, "utf8")).servers || [];
@@ -437,6 +531,8 @@ function ensureScopedSchema(defaultUserId) {
         .run("R0-CODING-1", JSON.stringify({ policy: "additive owner-scoped coding_projects/runs/events/actions/approvals/artifacts; no legacy rewrite; secrets/provider errors never persisted", tables: 6 }));
     db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
         .run("R2-CODING-1", JSON.stringify({ policy: "additive coding_runs preset + worktree identity columns; no data rewrite", columns: ["preset", "worktree_path", "worktree_branch", "base_branch", "base_commit", "worktree_status", "provisioned_at"] }));
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("R4-KNOWLEDGE-1", JSON.stringify({ policy: "additive owner/tenant/project-scoped knowledge_documents/knowledge_chunks/project_memory/knowledge_query_log; file-hash revisions supersede old chunks (stale); durable vectors persisted as chunk embedding JSON in the same DB for restart rebuild; no legacy rewrite", tables: 4 }));
 
 }
 

@@ -27,7 +27,7 @@ import { codingError, requireCodingScope } from "./util.js";
 import { defaultRunWorkspaceRunner } from "./runWorkspaceRunner.js";
 import { defaultRunService } from "./runs.js";
 import { defaultApprovalService } from "./approvals.js";
-import { codingWorkspaceEnabled, codingWriteToolsEnabled, codingBatchReadsEnabled } from "./flags.js";
+import { codingWorkspaceEnabled, codingWriteToolsEnabled, codingBatchReadsEnabled, projectRagReuseEnabled } from "./flags.js";
 import { defaultProjectService } from "./projects.js";
 import { defaultOpScheduler } from "./opScheduler.js";
 
@@ -67,6 +67,7 @@ export class CodeAgentService {
         runService = defaultRunService,
         approvals = defaultApprovalService,
         opScheduler = defaultOpScheduler,
+        retrieval = null,
     } = {}) {
         this.runRunner = runRunner;
         this.runService = runService;
@@ -75,6 +76,17 @@ export class CodeAgentService {
         // decider emits a multi-op `ops` decision AND CODING_BATCH_READS is enabled —
         // the single-op loop path never consults it, so the default stays sequential.
         this.opScheduler = opScheduler || null;
+        // Phase 7 / R4 (roadmap #8) — SHARED project-code retrieval seam. A NO-OP
+        // by default: unless an owner injects a real `retrieval` service AND
+        // CODING_RAG_REUSE_ENABLED is on, every decider ctx sees `retrievalEnabled:
+        // false` and `retrieval: null`, so the production singleton (constructed with
+        // no deps) behaves byte-for-byte as before.
+        this.retrieval = retrieval || null;
+    }
+
+    /** R4 gate: reuse only engages when a retrieval service was injected AND the flag is ON. */
+    _retrievalReuseEnabled() {
+        return this.retrieval != null && projectRagReuseEnabled();
     }
 
     /** R3 gate: batching only engages when a scheduler is present AND the flag is ON. */
@@ -406,6 +418,13 @@ export class CodeAgentService {
                 errorCode: s.errorCode || null,
                 note: s.note || s.summary || null,
             })),
+            // Phase 7 / R4 (roadmap #8) — shared project-code retrieval surfaced to
+            // the decider. Additive + default-NULL: with no injected retrieval (or
+            // flag OFF) ctx carries the exact same keys as before plus retrieval:null
+            // / retrievalEnabled:false, which no legacy decider reads.
+            projectId: session.scope?.projectId ?? session.project?.id ?? null,
+            retrieval: this.retrieval,
+            retrievalEnabled: this._retrievalReuseEnabled(),
         };
     }
 
