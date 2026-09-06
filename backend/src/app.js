@@ -84,6 +84,7 @@ import { registerConfigRoutes } from "./routes/configRoutes.js";
 import { registerMemoryRoutes } from "./routes/memoryRoutes.js";
 import { registerCodingRoutes } from "./routes/codingRoutes.js";
 import { registerRagRoutes } from "./routes/ragRoutes.js";
+import { registerBenchRoutes } from "./eval/bench/benchRoutes.js";
 import { registerSkillRoutes } from "./routes/skillRoutes.js";
 import { registerA2ARoutes } from "./routes/a2aRoutes.js";
 import { registerAnpRoutes } from "./routes/anpRoutes.js";
@@ -419,6 +420,10 @@ function registerAllRoutes(instance, { buildCompactionSummary = defaultBuildComp
     // + telemetry over the durable project RAG stack). All /rag capabilities are
     // default OFF (see rag/flags.js); routes self-gate to 403 while dark.
     registerRagRoutes(appRouter, { requireAuth });
+    // Phase 7 / R6 — offline coding benchmark surface (scenario catalog / run
+    // ledger / consented trajectory+dataset export). Admin + rate-limited; the
+    // tree self-gates to 403 while BENCH_ENABLED is dark, so mounting is inert.
+    registerBenchRoutes(appRouter, { requireAuth, requireAdmin, createRateLimit });
     // Phase 7 / R5 — Extensible Agent registrar surfaces (roadmap #1/#7/#9).
     // All R5 trees self-gate on the extensibility feature flags (see
     // extensibility/flags.js) and answer 403 EXT_*_DISABLED while a capability is

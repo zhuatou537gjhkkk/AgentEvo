@@ -496,6 +496,50 @@ function ensureScopedSchema(defaultUserId) {
     )`).run();
     db.prepare("CREATE INDEX IF NOT EXISTS idx_knowledge_query_log_scope_at ON knowledge_query_log(owner_user_id, tenant_id, created_at)").run();
 
+    // ── Phase 7 / R6 — offline coding benchmark runs (additive) ──
+    // One row per benchmark execution of a fixed-revision scenario. It records the
+    // scenario + repo HEAD (deterministic seed revision), the driver kind
+    // (scripted | real), the coding-run/project/config linkage, and server-derived
+    // metrics/reward summaries. Payload JSON is sanitized at the boundary; consent
+    // (owner opt-in) gates trajectory/dataset export. No data rewrite, no legacy
+    // table touched.
+    db.prepare(`CREATE TABLE IF NOT EXISTS bench_runs (
+        id TEXT PRIMARY KEY,
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL,
+        scenario_id TEXT NOT NULL,
+        category TEXT NOT NULL,
+        driver TEXT NOT NULL DEFAULT 'scripted',
+        mode TEXT NOT NULL DEFAULT 'observe',
+        status TEXT NOT NULL DEFAULT 'running',
+        repo_head_sha TEXT,
+        project_id TEXT,
+        coding_run_id TEXT,
+        config_version_id TEXT,
+        seed_revision TEXT NOT NULL DEFAULT '1',
+        consent INTEGER NOT NULL DEFAULT 0,
+        metrics_json TEXT NOT NULL DEFAULT '{}',
+        reward_json TEXT NOT NULL DEFAULT '{}',
+        result_json TEXT NOT NULL DEFAULT '{}',
+        error_code TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        completed_at DATETIME,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_bench_runs_scope_created ON bench_runs(owner_user_id, tenant_id, created_at)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_bench_runs_scope_scenario ON bench_runs(owner_user_id, tenant_id, scenario_id, status)").run();
+
+    // One raw (sanitized) canonical record per completed bench run — the owner-
+    // consented source for trajectory/dataset export. Kept separate from bench_runs
+    // so listing stays light; export is gated by bench_runs.consent.
+    db.prepare(`CREATE TABLE IF NOT EXISTS bench_run_raws (
+        run_id TEXT PRIMARY KEY,
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL,
+        raw_json TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+
     const seedPath = path.resolve(__dirname, "../mcp/servers.json");
     try {
         const seeds = JSON.parse(fs.readFileSync(seedPath, "utf8")).servers || [];
@@ -533,6 +577,10 @@ function ensureScopedSchema(defaultUserId) {
         .run("R2-CODING-1", JSON.stringify({ policy: "additive coding_runs preset + worktree identity columns; no data rewrite", columns: ["preset", "worktree_path", "worktree_branch", "base_branch", "base_commit", "worktree_status", "provisioned_at"] }));
     db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
         .run("R4-KNOWLEDGE-1", JSON.stringify({ policy: "additive owner/tenant/project-scoped knowledge_documents/knowledge_chunks/project_memory/knowledge_query_log; file-hash revisions supersede old chunks (stale); durable vectors persisted as chunk embedding JSON in the same DB for restart rebuild; no legacy rewrite", tables: 4 }));
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("R6-BENCH-1", JSON.stringify({ policy: "additive owner-scoped bench_runs (offline coding benchmark results: scenario/head/driver/linkage + sanitized metrics/reward/result); consent gates export; no legacy rewrite", table: "bench_runs" }));
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("R6-BENCH-2", JSON.stringify({ policy: "additive bench_run_raws (sanitized canonical raw per bench run, owner-consented source for trajectory/dataset export); no legacy rewrite", table: "bench_run_raws" }));
 
 }
 
