@@ -268,6 +268,124 @@ function ensureScopedSchema(defaultUserId) {
         FOREIGN KEY (owner_user_id) REFERENCES users(id)
     )`).run();
 
+    // ── Phase 7 / R0 — Coding Run 基座：owner-scoped durable records ──
+    // 只存服务端判定后的可序列化事实；secret/raw env/provider 原始错/用户全文
+    // 一律不入库（入库载荷在 coding/* 写入边界再经 sanitize 白名单剥离）。
+    db.prepare(`CREATE TABLE IF NOT EXISTS coding_projects (
+        id TEXT PRIMARY KEY,
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        root_path TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'registered',
+        trusted INTEGER NOT NULL DEFAULT 0,
+        trusted_at DATETIME,
+        meta TEXT NOT NULL DEFAULT '{}',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+    db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_coding_projects_scope_path ON coding_projects(owner_user_id, tenant_id, root_path)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_coding_projects_scope_status ON coding_projects(owner_user_id, tenant_id, status)").run();
+
+    db.prepare(`CREATE TABLE IF NOT EXISTS coding_runs (
+        id TEXT PRIMARY KEY,
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL,
+        session_id INTEGER,
+        project_id TEXT,
+        status TEXT NOT NULL DEFAULT 'created',
+        mode TEXT NOT NULL DEFAULT 'observe',
+        snapshot_json TEXT NOT NULL DEFAULT '{}',
+        event_seq INTEGER NOT NULL DEFAULT 0,
+        cancelled INTEGER NOT NULL DEFAULT 0,
+        error_code TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        started_at DATETIME,
+        completed_at DATETIME,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id),
+        FOREIGN KEY (project_id) REFERENCES coding_projects(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_coding_runs_scope_created ON coding_runs(owner_user_id, tenant_id, created_at)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_coding_runs_project ON coding_runs(owner_user_id, tenant_id, project_id)").run();
+
+    db.prepare(`CREATE TABLE IF NOT EXISTS coding_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL,
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        actor TEXT NOT NULL DEFAULT 'system',
+        action_id TEXT,
+        sub_task_id TEXT,
+        causation_id TEXT,
+        request_id TEXT,
+        payload TEXT NOT NULL DEFAULT '{}',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (run_id, seq),
+        FOREIGN KEY (owner_user_id) REFERENCES users(id),
+        FOREIGN KEY (run_id) REFERENCES coding_runs(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_coding_events_run ON coding_events(run_id, seq)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_coding_events_scope_at ON coding_events(owner_user_id, tenant_id, created_at)").run();
+
+    db.prepare(`CREATE TABLE IF NOT EXISTS coding_actions (
+        id TEXT PRIMARY KEY,
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        tool TEXT NOT NULL,
+        input_json TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL DEFAULT 'pending',
+        timeout_ms INTEGER,
+        approval_id TEXT,
+        output_json TEXT,
+        error_code TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (run_id, seq),
+        FOREIGN KEY (owner_user_id) REFERENCES users(id),
+        FOREIGN KEY (run_id) REFERENCES coding_runs(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_coding_actions_run ON coding_actions(run_id, seq)").run();
+
+    db.prepare(`CREATE TABLE IF NOT EXISTS coding_approvals (
+        id TEXT PRIMARY KEY,
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        action_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'requested',
+        policy TEXT NOT NULL DEFAULT '{}',
+        requested_by INTEGER,
+        decided_by INTEGER,
+        reason TEXT,
+        requested_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        decided_at DATETIME,
+        expires_at DATETIME,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id),
+        FOREIGN KEY (run_id) REFERENCES coding_runs(id),
+        FOREIGN KEY (action_id) REFERENCES coding_actions(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_coding_approvals_run ON coding_approvals(run_id, status)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_coding_approvals_scope_at ON coding_approvals(owner_user_id, tenant_id, requested_at)").run();
+
+    db.prepare(`CREATE TABLE IF NOT EXISTS coding_artifacts (
+        id TEXT PRIMARY KEY,
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL,
+        run_id TEXT,
+        action_id TEXT,
+        kind TEXT NOT NULL,
+        path TEXT,
+        digest TEXT,
+        size_bytes INTEGER,
+        storage_ref TEXT NOT NULL,
+        meta TEXT NOT NULL DEFAULT '{}',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id),
+        FOREIGN KEY (run_id) REFERENCES coding_runs(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_coding_artifacts_scope_run ON coding_artifacts(owner_user_id, tenant_id, run_id)").run();
+
     const seedPath = path.resolve(__dirname, "../mcp/servers.json");
     try {
         const seeds = JSON.parse(fs.readFileSync(seedPath, "utf8")).servers || [];
@@ -299,6 +417,8 @@ function ensureScopedSchema(defaultUserId) {
         .run("W3.1-S1", JSON.stringify({ defaultUserId, policy: "unattributed legacy rows are not exposed by scoped queries" }));
     db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
         .run("W4-R5-S1", JSON.stringify({ policy: "additive advisory-lock table upload_key_locks (durable same-key cross-process upload lock); no data rewrite" }));
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("R0-CODING-1", JSON.stringify({ policy: "additive owner-scoped coding_projects/runs/events/actions/approvals/artifacts; no legacy rewrite; secrets/provider errors never persisted", tables: 6 }));
 
 }
 

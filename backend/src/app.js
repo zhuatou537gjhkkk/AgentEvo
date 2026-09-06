@@ -81,6 +81,12 @@ import { registerFeedbackRoutes } from "./routes/feedbackRoutes.js";
 import { registerObservabilityRoutes } from "./routes/observabilityRoutes.js";
 import { registerConfigRoutes } from "./routes/configRoutes.js";
 import { registerMemoryRoutes } from "./routes/memoryRoutes.js";
+import { registerCodingRoutes } from "./routes/codingRoutes.js";
+import { defaultProjectService } from "./coding/projects.js";
+import { defaultRunService } from "./coding/runs.js";
+import { defaultEventStore } from "./coding/events.js";
+import { defaultApprovalService } from "./coding/approvals.js";
+import { defaultRuntimeRegistry } from "./coding/runtimeRegistry.js";
 
 // Default service bindings; createApp can override the request-visible bag.
 const initDB = defaultInitDB;
@@ -182,6 +188,12 @@ const defaultDependencies = {
         saveUploadedImage,
         getUploadedImageDataUrl,
         resolveUserQuestion,
+        // Phase 7 / R0 — coding run base (owner-scoped; flags default off).
+        codingProjectService: defaultProjectService,
+        codingRunService: defaultRunService,
+        codingEventStore: defaultEventStore,
+        approvalService: defaultApprovalService,
+        codingRuntimeRegistry: defaultRuntimeRegistry,
     },
 };
 
@@ -379,6 +391,10 @@ function registerAllRoutes(instance, { buildCompactionSummary = defaultBuildComp
     registerObservabilityRoutes(appRouter, { requireAuth });
     registerConfigRoutes(appRouter, { requireAuth, requireAdmin });
     registerMemoryRoutes(appRouter, { requireAuth });
+    // Phase 7 / R0 — coding registrar (owner-scoped control plane over durable
+    // project/run/event/approval records + instance-local runtime registry).
+    // Agent turns still enter the main Graph through /chat; flags default off.
+    registerCodingRoutes(appRouter, { requireAuth });
     // Phase 5: 评估系统 — admin + rate-limited。evalRoutes 内部 DB 访问仍走
     // 模块单例(残余项),待 eval 路由自身 bag 化后再注入。
     appRouter.use("/eval", requireAuth, createRateLimit({ scope: "eval", windowMs: 60_000, max: 30 }), requireAdmin, evalRoutes);
