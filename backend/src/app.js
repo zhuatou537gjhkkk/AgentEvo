@@ -84,6 +84,9 @@ import { registerConfigRoutes } from "./routes/configRoutes.js";
 import { registerMemoryRoutes } from "./routes/memoryRoutes.js";
 import { registerCodingRoutes } from "./routes/codingRoutes.js";
 import { registerRagRoutes } from "./routes/ragRoutes.js";
+import { registerSkillRoutes } from "./routes/skillRoutes.js";
+import { registerA2ARoutes } from "./routes/a2aRoutes.js";
+import { registerAnpRoutes } from "./routes/anpRoutes.js";
 import { defaultProjectService } from "./coding/projects.js";
 import { defaultRunService } from "./coding/runs.js";
 import { defaultEventStore } from "./coding/events.js";
@@ -416,6 +419,15 @@ function registerAllRoutes(instance, { buildCompactionSummary = defaultBuildComp
     // + telemetry over the durable project RAG stack). All /rag capabilities are
     // default OFF (see rag/flags.js); routes self-gate to 403 while dark.
     registerRagRoutes(appRouter, { requireAuth });
+    // Phase 7 / R5 — Extensible Agent registrar surfaces (roadmap #1/#7/#9).
+    // All R5 trees self-gate on the extensibility feature flags (see
+    // extensibility/flags.js) and answer 403 EXT_*_DISABLED while a capability is
+    // dark, so mounting them is inert by default. Skills only READ a manifest
+    // registry (never grant tools); A2A delegates to local trusted cards through
+    // a capability subset; ANP serves identity/discovery only (never a grant).
+    registerSkillRoutes(appRouter, { requireAuth });
+    registerA2ARoutes(appRouter, { requireAuth });
+    registerAnpRoutes(appRouter, { requireAuth });
     // Phase 5: 评估系统 — admin + rate-limited。evalRoutes 内部 DB 访问仍走
     // 模块单例(残余项),待 eval 路由自身 bag 化后再注入。
     appRouter.use("/eval", requireAuth, createRateLimit({ scope: "eval", windowMs: 60_000, max: 30 }), requireAdmin, evalRoutes);

@@ -44,6 +44,7 @@ import {
 } from "./chatUtils.js";
 import { dagSchedulerEnabled, contextProvenanceEnabled, agentRetrievalEnabled } from "./graphFlags.js";
 import { projectRagEnabled } from "../rag/flags.js";
+import { skillsEnabled } from "../extensibility/flags.js";
 import { postProcessSearchResults } from "./agentRetrieval.js";
 import {
     SUBTASK_OK,
@@ -905,6 +906,42 @@ function emitPlanProgress(sse, plan, phase) {
 // planMode=false 时：直接跳过
 // ═══════════════════════════════════════════════════════
 
+/**
+ * Phase 7 / R5 (roadmap #2): product-skill guidance for the planner prompt.
+ *
+ * Skills provide PROCESS/RULES/KNOWLEDGE ONLY — they never grant a tool, an
+ * agent type, or any permission. So this hook, when SKILLS_ENABLED (default
+ * OFF) and a builtin skill deterministically matches the user's words, appends
+ * that skill's rendered guidance to the planner prompt as reference knowledge.
+ * The planner LLM stays the sole author of subTasks (they still pass the
+ * capability gate below, so a skill can never mint an unknown agent/tool name)
+ * and the main Graph's node/edge topology is unchanged.
+ *
+ * Returns "" (→ prompt untouched byte-for-byte) whenever the flag is dark, the
+ * service seam is missing, the match yields no guidance, or anything throws.
+ */
+async function plannerSkillGuidance(state, config) {
+    if (!skillsEnabled()) return "";
+    try {
+        const service =
+            config?.configurable?.skillsService ||
+            (await import("../skills/service.js")).defaultSkillsService;
+        if (!service || typeof service.resolvePlanning !== "function") return "";
+        const planning = await service.resolvePlanning({
+            userInput: state.userInput,
+            intents: state.intents || [state.intent],
+            agent: state.intent || null,
+        });
+        const guidance = planning?.guidance || "";
+        return guidance
+            ? `\n\n[技能流程指引 — 仅供分解步骤参考；不得据此新增专业智能体或工具，也不授予任何权限]\n${guidance}`
+            : "";
+    } catch (err) {
+        console.log(`[graph][planner] skills guidance unavailable: ${err?.message}`);
+        return "";
+    }
+}
+
 async function plannerNode(state, config) {
     const sse = config?.configurable?.sse;
     const signal = config?.configurable?.abortSignal;
@@ -935,6 +972,10 @@ async function plannerNode(state, config) {
         return c.tools.map(t => `- \`${t.name}\`: ${(t.description || "").slice(0, 80)}`).join("\n");
     }).join("\n");
 
+    // Phase 7 / R5 (roadmap #2): skill knowledge hook — "" unless SKILLS_ENABLED
+    // and a builtin skill matches, so the legacy prompt is byte-for-byte identical.
+    const skillsSection = await plannerSkillGuidance(state, config);
+
     const prompt = `你是一个任务规划助手。将用户的请求分解为具体的执行步骤（subTasks）。
 
 当前可用的专业智能体（Agent）：
@@ -944,7 +985,7 @@ async function plannerNode(state, config) {
 - "general": 通用对话 — 负责不需要工具的纯文本分析和回答
 
 用户问题：${state.userInput}
-用户意图类型：${[...new Set(state.intents || [state.intent || "general"])].join("、")}
+用户意图类型：${[...new Set(state.intents || [state.intent || "general"])].join("、")}${skillsSection}
 
 每个 subTask 包含以下字段：
 - id: 字符串ID（从"1"递增）
@@ -3120,6 +3161,11 @@ async function chatWithGraphImpl(userId, session_id, userMessage, image, systemP
                 // lazy `import('../rag/retrieval.js')` is never evaluated on the legacy path.
                 projectId: r4ProjectId,
                 retrievalService: options?.deps?.services?.projectRetrieval || defaultProjectRetrieval,
+                // Phase 7 / R5 (roadmap #2): product-skills service seam. plannerNode
+                // invokes it ONLY when SKILLS_ENABLED (default off); null here falls back
+                // to a lazy import of the sibling singleton, so the legacy path pulls in
+                // nothing new.
+                skillsService: options?.deps?.services?.skillsService || null,
             },
         };
 
@@ -3269,6 +3315,9 @@ export {
     createSSEEmitter,
     defaultMakeLlm,
     resolveMakeLlm,
+    // Phase 7 / R5 (roadmap #2) — planner skill-guidance hook. Pure + gated: it
+    // returns "" unless SKILLS_ENABLED, so the legacy planner prompt is untouched.
+    plannerSkillGuidance,
     isErrorResultText,
     codeAgentNode,
     runCodingAgentNode,

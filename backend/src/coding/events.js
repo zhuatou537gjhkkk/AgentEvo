@@ -32,6 +32,10 @@ const EVENT_TYPES = new Set([
     "action.executed", "action.executing", "action.exec_failed", "action.auto_approved",
     "action.requested", "action.decided",
     "approval.requested", "approval.approved", "approval.denied", "approval.expired",
+    // R5 (roadmap #2) — product Skills Runtime audit hooks. Skills only add
+    // process/rules/knowledge; these two event types merely RECORD that a skill
+    // was activated or denied for a run, they never grant tools or agents.
+    "skill.activated", "skill.denied",
 ]);
 
 function toEventRow(row) {
