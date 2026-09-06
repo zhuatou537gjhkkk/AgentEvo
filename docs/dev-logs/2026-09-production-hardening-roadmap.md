@@ -3,7 +3,7 @@
 > 本文是下一次开发的恢复入口。继续开发前先阅读本文和 `2026-09-production-hardening.md`，不要跳过验收条件直接扩展功能。
 >
 > 记录日期：2026-09-01
-> 当前状态：P0 已完成首批加固，W3.1-S1 owner scope 已完成；P0 其余闭环和 P1/P2 尚未完成。
+> 当前状态：P0 加固 + W3.x 隔离/registrar 矩阵 + W4-R1…R5 重试/SSE 收口已全量落地；最新一波 W4-R5（三文档未完成项对账 + durable 同 key 跨进程锁 + W3.2 残余）见 §24，残余总账以 §24 为准。W5-W8、组织 RBAC、P2 岗位项仍未开始。
 
 ## 1. 当前基线
 
@@ -46,8 +46,8 @@
 
 - [ ] 增加单用户并发上传数、单文件总大小、每日/累计磁盘配额。
 - [x] 合并时禁止无限 `readFile`；采用流式大小校验，失败时清理临时目录（RAG 兼容入口仍可能保留文本内存态）。
-- [x] hash、user namespace、旧版本未完成上传兼容迁移策略已覆盖基础校验/用户目录和单测；迁移 runbook + 工具已交付（见 §15），ledger 复用 `security_migration_audit`；durable quota **restart 持久化 / 跨进程记账 / 生产写入 smoke** 已在 A1+A2 验收（见 §18）。唯一残余：**同 key 跨进程锁** 需分布式锁服务。
-- [~] 已增加进程内 RAG tenant store 数量上限与大文件 segment cache 的数量/TTL 淘汰；重启丢失告警、字节级磁盘治理和多实例共享仍未完成。
+- [x] hash、user namespace、旧版本未完成上传兼容迁移策略已覆盖基础校验/用户目录和单测；迁移 runbook + 工具已交付（见 §15），ledger 复用 `security_migration_audit`；durable quota **restart 持久化 / 跨进程记账 / 生产写入 smoke** 已在 A1+A2 验收（见 §18）。**同 key 跨进程锁已由 W4-R5-S1 SQLite 租约表闭合（`upload_key_locks`，见 §24），不再需要外部锁服务。**
+- [x] 已增加进程内 RAG tenant store 数量上限与大文件 segment cache 的数量/TTL 淘汰；重启丢失告警与字节级磁盘治理报告已在 W4-R5 T5 补齐（startServer 启动告警 + audit-db `quotaGovernance`/`diskStaging`）。多实例共享 RAG 仍未完成（W5/W6）。
 - [~] `/upload`、`/upload/chunk`、`/upload/merge` 已统一主要错误 code/status 并隐藏内部路径；全量 HTTP contract 矩阵仍待完成。
 
 #### W3.3 限流、统一错误和应用测试
@@ -323,3 +323,16 @@
 - [x] **T4（生产改动 + 护栏）** `eval/reflection.js` reflectionLlm.invoke、`services/memory.js` llmMemoryConsolidation 的 llm.invoke 各包 `withRetry(retries:2)`（DEAD CODE 注释标注 maxRetries:0 理由）。新建 `services/retryInvariant.test.js` 源级护栏 4 用例：allowlist 含 `new ChatOpenAI(` 必含 `withRetry(` 调用；reflection/memory 各自唯一裸 invoke 在 withRetry 包裹区间内；src 全量扫描（除 learning/）ChatOpenAI 构造模块皆在 allowlist。
 - [x] 全量 backend **43 files / 557 tests 全绿**（原 39/543，+4/+14）；frontend 9 files / 155 tests 保险复跑全绿；`git diff --check` OK；dev 库不被触碰。
 - [ ] **残余/延后**：durable 同 key 跨进程锁（需分布式锁）、软点→404、组织 RBAC、多实例 RAG、W5-W8/P2 继续延后。W4 全部明确残余已清零。
+
+## 24. W4-R5：收口全垒打 — 三文档未完成项全量对账（2026-09-06）
+
+用户决策（本次会话）：阅读 runbook / roadmap / 主日志后要求"今天把未完成部分全部弄完"，AskUserQuestion 选 **A+B 收口全垒打**。**runbook §6 DoD 已全勾、§7 已含真实 `--apply` 执行记录 → 本次 0 待办**。主日志为时间线记录、无独立任务；roadmap 残余分三类：**文档漂移勾选**（已完成未勾，刷新）、**本波可闭合的有界项**（W4 真残余 + durable 同 key 跨进程锁 + W3.2 小残余）、**外依赖/大程序**（如实延后）。完整实施记录见主日志 W4-R5 段；本节是恢复入口与残余总账。
+
+- [x] **T1 — RAG embedding/search withRetry 接线（roadmap §2 W4 首项 + §20 延后项）**：`rag/index.js` embeddings `maxRetries:0`（C1 预算统一）+ `fromTexts`/`addDocuments`/`similaritySearchWithScore` 三条网络裸点包 `withRetry({retries:2})`；新 `rag/retry.test.js` 4 用例（vi.mock faiss 可控缝，零网络）。
+- [x] **T2 — 工具结果统一 + Synthesizer 只收成功/blocked 守卫（roadmap §2 W4 "工具结果统一为 {ok,...}"项）**：`chatGraph.js` 内联文本前缀分类器提升为导出 `isErrorResultText` + 结构化失败标记；成功但空（no_match/空库）不误伤；新 `chatGraphErrorResult.test.js` 4 用例 + 源级不变量。按 W4-R1 注释口径**不把遗留字符串工具 objectify**（记录为明确非目标）。
+- [x] **T3 — /chat reconnect/replay 无副作用 + 429 终端（roadmap §2 W4 测试项）**：真实 HTTP + 注入计数 executor 断言同 key 二 POST 走 `writeReplaySSE` 回放不重执行（`chatIdempotentReplay.test.js` 2）；`chatGraphToolReliability.test.js` 增恒 429 真实节点耗尽降级（现 4 用例）。
+- [x] **T4 — durable 同 key 跨进程锁闭合（roadmap §18/§19/§22/§23 历波残留的"需分布式锁服务"项）**：**零外部依赖** —— SQLite `upload_key_locks` 租约表（additive DDL + ledger `W4-R5-S1`），durable adapter `withUploadLock` 由 in-process 内存锁升级为 DB 租约（INSERT OR IGNORE acquire / 过期原子回收 / 持有续约 / holder_token 释放 / busy 到期 429）。新 harness `scripts/quota-lock-worker.mjs` + 子进程验收 `uploadQuotaLockDurable.test.js` 4 用例：双 OS 进程互斥、SIGKILL 崩溃持有者租约回收、活租约不偷、过期原子回收。
+- [x] **T5 — W3.2 小残余（roadmap §2 W3.2 `[~]` 项）**：`startServer` 启动期 `warnVolatileRuntimeState()`（DURABLE_UPLOAD_QUOTA 内存模式 / RAG 向量无落盘 / 图片内存态三条重启丢失告警）；`audit-db.mjs` 只读扩展 `quotaGovernance`（per-owner committed/reserved 字节 + lockLeases）+ `diskStaging` 字节级磁盘治理报告；`startupVolatility.test.js` 4 源级护栏。
+- [x] **验证**：全量 backend **48 files / 576 tests 全绿**（原 43/557，+5/+19）；frontend 9 files / 155 tests 保险复跑全绿；`node --check` + `git diff --check` exit=0；dev 库不被触碰（audit 只读跑 scratch 副本）。
+- [x] **文档勾选对账（本次刷新）**：§2 W3.2 "同 key 跨进程锁需分布式锁服务" → 已闭合（见本段 T4）；§2 W3.2 "[~] 重启丢失告警、字节级磁盘治理…未完成" → 已完成（T5，多实例共享 RAG 仍延后）；主日志新增 W4-R5 段。§18/§19/§22/§23 历史残余行中 "durable 同 key 跨进程锁（需分布式锁）" **该项被本段取代关闭**，其余（软点→404、RBAC、多实例 RAG、W5-W8/P2）维持原状不变。
+- [ ] **残余总账（如实，非今日可闭合）**：软点→404（API 行为变更，FE 兼容评估，低优先）；eval 深矩阵补全待 D2（admin-only 树，低 ROI）；组织 tenant/RBAC（§2 W3.1）；多实例/持久化 RAG（W5/W6）；Redis/OTLP exporter/Prometheus/健康告警（W6）；queue/checkpoint/replay/resume（W7）；A/B 实验（W8）；P2 岗位项（Skills Runtime/沙箱/remote MCP/生产 Reflection）；trusted proxy 真实代理链部署验证。下一候选波：**W4-SSE 错误字段审计**（独立小波）或 W5 durable RAG 起步。
