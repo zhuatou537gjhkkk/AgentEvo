@@ -6,7 +6,9 @@ import Sidebar from './components/Sidebar';
 import EvalDashboard from './components/EvalDashboard';
 import ObservabilityPanel from './components/ObservabilityPanel';
 import WelcomePanel from './components/WelcomePanel';
+import WorkspacePanel from './components/workspace/WorkspacePanel';
 import { useChatStore } from './store/chatStore';
+import { useWorkspaceStore } from './store/workspaceStore';
 
 function AmbientBackground() {
     return (
@@ -46,6 +48,7 @@ export default function App() {
     const [showShortcuts, setShowShortcuts] = useState(false);
     const [activeView, setActiveView] = useState('chat');
     const [suggestedPrompt, setSuggestedPrompt] = useState('');
+    const [workspaceOpen, setWorkspaceOpen] = useState(false);
     const [authMode, setAuthMode] = useState('login');
     const [username, setUsername] = useState('');
     const [password, setPassword] = useState('');
@@ -57,6 +60,7 @@ export default function App() {
     useEffect(() => {
         if (isAuthenticated) {
             initSessions();
+            useWorkspaceStore.getState().init();
         }
     }, [initSessions, isAuthenticated]);
 
@@ -251,6 +255,17 @@ export default function App() {
                             <span className="truncate text-sm font-semibold text-[var(--text-main)]">{viewTitle}</span>
                         </div>
                         <div className="flex items-center gap-2 sm:gap-3">
+                            {activeView === 'chat' && (
+                                <button
+                                    type="button"
+                                    onClick={() => setWorkspaceOpen((open) => !open)}
+                                    aria-pressed={workspaceOpen}
+                                    className={`header-link hidden md:inline-flex ${workspaceOpen ? '!text-[var(--text-main)]' : ''}`}
+                                    title="浏览/引用项目文件，查看 Git 状态与观察 run"
+                                >
+                                    工作区
+                                </button>
+                            )}
                             <button
                                 type="button"
                                 onClick={() => setShowShortcuts(true)}
@@ -269,21 +284,24 @@ export default function App() {
                 </header>
 
                 {activeView === 'chat' ? (
-                    <>
-                        <main className="chat-main">
-                            {!hasConversation && !isSessionLoading && (
-                                <WelcomePanel
-                                    userName={user?.username}
-                                    onSuggestion={setSuggestedPrompt}
-                                />
-                            )}
-                            <ChatList hideInitialPlaceholder={showWelcome} />
-                        </main>
-                        <ChatInput
-                            suggestedPrompt={suggestedPrompt}
-                            onSuggestedPromptConsumed={() => setSuggestedPrompt('')}
-                        />
-                    </>
+                    <div className="workspace-body">
+                        <div className="workspace-chat-col">
+                            <main className="chat-main">
+                                {!hasConversation && !isSessionLoading && (
+                                    <WelcomePanel
+                                        userName={user?.username}
+                                        onSuggestion={setSuggestedPrompt}
+                                    />
+                                )}
+                                <ChatList hideInitialPlaceholder={showWelcome} />
+                            </main>
+                            <ChatInput
+                                suggestedPrompt={suggestedPrompt}
+                                onSuggestedPromptConsumed={() => setSuggestedPrompt('')}
+                            />
+                        </div>
+                        {workspaceOpen && <WorkspacePanel onClose={() => setWorkspaceOpen(false)} />}
+                    </div>
                 ) : activeView === 'eval' ? (
                     <main className="tool-workspace"><EvalDashboard embedded onBack={() => changeView('chat')} /></main>
                 ) : (

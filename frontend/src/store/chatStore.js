@@ -24,6 +24,20 @@ import { createToolExecutionStateMachine, ToolStatus } from '../utils/toolExecut
 const activeToolCleanupMap = new Map();
 let contextUsageRequestVersion = 0;
 
+// Phase 7 / R1 — workspace attach-to-chat: a repo reference the user picked in
+// the Workspace panel. Consumed once by the next sendMessage, never persisted.
+let pendingRepoContext = null;
+
+export function setPendingRepoContext(repoContext) {
+    pendingRepoContext = repoContext;
+}
+
+export function consumePendingRepoContext() {
+    const value = pendingRepoContext;
+    pendingRepoContext = null;
+    return value;
+}
+
 function invalidateContextUsage() {
     contextUsageRequestVersion += 1;
     return { contextUsage: null };
@@ -1731,6 +1745,7 @@ export const useChatStore = create(persist((set, get) => ({
         const selectedImage = state.selectedImage;
         const selectedImageId = options.imageId ?? selectedImage?.imageId ?? null;
         const idempotencyKey = options.idempotencyKey || createIdempotencyKey();
+        const repoContext = options.repoContext ?? consumePendingRepoContext();
 
         const sessionSpecificSettings = sessionId
             ? state.sessionAgentSettings[sessionId]
@@ -2431,6 +2446,7 @@ export const useChatStore = create(persist((set, get) => ({
                 temperature,
                 imageId: selectedImageId,
                 idempotencyKey,
+                repoContext,
             }
         );
     },

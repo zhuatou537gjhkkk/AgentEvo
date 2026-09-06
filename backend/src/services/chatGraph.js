@@ -2364,13 +2364,37 @@ async function chatWithGraphImpl(userId, session_id, userMessage, image, systemP
         const memory = enableMemory ? new MemoryService(userId) : null;
         const contextBuilder = createChatContextBuilder(memory);
         const rawHistory = history.map(m => ({ role: m.role, content: m.content, timestamp: m.created_at }));
+
+        // Phase 7 / R1 — attach owner-scoped repo references (if any) as
+        // untrusted, pre-budgeted packets. The repo-context service is the only
+        // path that maps a request `projectId` to file content, and it re-checks
+        // owner/trust/allowed-roots through the workspace runner; any refusal or
+        // absence resolves to empty so the chat itself never fails on it.
+        const repoContextService = options?.deps?.services?.repoContextService;
+        let repoPackets = [];
+        if (repoContextService && options.repoContext) {
+            try {
+                const resolved = await repoContextService.resolve(
+                    { userId: Number(userId), tenantId: `user:${userId}` },
+                    options.repoContext,
+                );
+                repoPackets = Array.isArray(resolved?.packets) ? resolved.packets : [];
+                if (repoPackets.length > 0) {
+                    console.log(`[graph][repo] injected ${repoPackets.length} untrusted repo packets for project ${String(options.repoContext?.projectId || "")}`);
+                }
+            } catch (error) {
+                console.log(`[graph][repo] repo context unavailable: ${error?.message}`);
+                repoPackets = [];
+            }
+        }
+
         const optimizedContext = process.env.CONTEXT_BUILDER_ENABLED === "false"
             ? ""
             : await contextBuilder.build(
                 inputForAgent,
                 rawHistory,
                 systemPrompt,
-                { modelName }
+                { modelName, repoPackets }
             );
 
         const initialState = {

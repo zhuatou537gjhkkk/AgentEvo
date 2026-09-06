@@ -258,6 +258,20 @@
     .sidebar-error p { margin: 0; }
     .sidebar-error button { margin-top: 0.35rem; border: 0; background: transparent; padding: 0; color: inherit; font-size: inherit; text-decoration: underline; }
     .tool-workspace { min-height: 0; flex: 1; overflow: auto; padding: clamp(0.75rem, 3vw, 2.5rem); }
+    .workspace-body { display: flex; min-height: 0; flex: 1; overflow: hidden; }
+    .workspace-chat-col { display: flex; min-width: 0; min-height: 0; flex: 1; flex-direction: column; }
+    .workspace-panel {
+        display: flex; flex: 0 0 auto; width: min(27rem, 42%); min-height: 0;
+        flex-direction: column; border-left: 1px solid var(--glass-border);
+        background: var(--surface-elevated);
+    }
+    .workspace-panel-scroll { min-height: 0; flex: 1; overflow: auto; }
+    .ws-row-clickable { cursor: pointer; }
+    .ws-row-clickable:hover { background: var(--panel-soft); }
+    .ws-code-block { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.72rem; line-height: 1.5; white-space: pre; }
+    @media (max-width: 860px) {
+        .workspace-panel { display: none; }
+    }
     .tool-page-surface { width: min(100%, 74rem); margin: 0 auto; border: 1px solid var(--glass-border); border-radius: 1.45rem; background: var(--surface-elevated); padding: clamp(1rem, 3vw, 2rem); box-shadow: var(--glass-shadow-lg); }
     .tool-page-back-link { margin-top: 1.5rem; border: 0; background: transparent; color: var(--brand-start); font-size: 0.76rem; font-weight: 800; }
     .welcome-panel { position: absolute; z-index: 2; top: 14%; left: 50%; width: min(46rem, calc(100% - 2rem)); transform: translateX(-50%); text-align: center; pointer-events: none; }

@@ -47,6 +47,7 @@ function services(req) {
         events: svcFn(req, "codingEventStore"),
         approvals: svcFn(req, "approvalService"),
         registry: svcFn(req, "codingRuntimeRegistry"),
+        workspace: svcFn(req, "workspaceRunner"),
     };
 }
 
@@ -122,6 +123,33 @@ export function registerCodingRoutes(router, { requireAuth }) {
             const project = services(req).projects.revoke(scopeFromRequest(req), req.params.projectId);
             if (!project) return notFoundResource(res, "project not found");
             return res.json({ ok: true, project });
+        } catch (error) {
+            return sendError(res, req.requestId, error);
+        }
+    });
+
+    // ── workspace (R1 read-only runner surface) ──
+    // Every op is owner-scoped first (project fetched from the registrar by the
+    // authenticated request), then re-validated inside the runner at access time.
+    // Only READ_OPS dispatch; write/exec ops arrive in R2 on the same transport.
+    coding.post("/projects/:projectId/open", async (req, res) => {
+        try {
+            const project = services(req).projects.get(scopeFromRequest(req), req.params.projectId);
+            if (!project) return notFoundResource(res, "project not found");
+            const workspace = await services(req).workspace.open(project);
+            return res.json({ ok: true, workspace });
+        } catch (error) {
+            return sendError(res, req.requestId, error);
+        }
+    });
+
+    coding.post("/projects/:projectId/ops", async (req, res) => {
+        try {
+            const project = services(req).projects.get(scopeFromRequest(req), req.params.projectId);
+            if (!project) return notFoundResource(res, "project not found");
+            const { op, args } = req.body || {};
+            const result = await services(req).workspace.invoke(project, op, args);
+            return res.json({ ok: true, op: result.op, data: result.data });
         } catch (error) {
             return sendError(res, req.requestId, error);
         }

@@ -332,6 +332,7 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
         temperature = 0.7,
         image = null,
         imageId = null,
+        repoContext = null,
     } = options;
 
     try {
@@ -353,6 +354,9 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
                     enable_memory: enableMemory,
                     systemPrompt,
                     temperature,
+                    // Phase 7 / R1 — optional attached repo references (only sent
+                    // when the user explicitly attached a file/range in the panel).
+                    repo_context: repoContext || undefined,
                 }),
             },
             {

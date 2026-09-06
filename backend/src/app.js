@@ -87,6 +87,8 @@ import { defaultRunService } from "./coding/runs.js";
 import { defaultEventStore } from "./coding/events.js";
 import { defaultApprovalService } from "./coding/approvals.js";
 import { defaultRuntimeRegistry } from "./coding/runtimeRegistry.js";
+import { defaultWorkspaceRunner } from "./coding/runner/readRunner.js";
+import { defaultRepoContextService } from "./coding/repoContext.js";
 
 // Default service bindings; createApp can override the request-visible bag.
 const initDB = defaultInitDB;
@@ -194,6 +196,9 @@ const defaultDependencies = {
         codingEventStore: defaultEventStore,
         approvalService: defaultApprovalService,
         codingRuntimeRegistry: defaultRuntimeRegistry,
+        // Phase 7 / R1 — read-only workspace runner (allowed-root + trust gated).
+        workspaceRunner: defaultWorkspaceRunner,
+        repoContextService: defaultRepoContextService,
     },
 };
 
@@ -2029,6 +2034,11 @@ app.post("/chat", requireAuth, createRateLimit({ scope: "chat", windowMs: 60_000
         skipUserMessageSave: true,
         planMode,
         enableMemory,
+        // Phase 7 / R1 — optional attached repo references for the Graph's
+        // ContextBuilder. Consumed only by the LangGraph path when the workspace
+        // capability is enabled AND the referenced project is owned+trusted;
+        // otherwise the repo-context service resolves empty (never a failure).
+        repoContext: req.body?.repo_context ?? undefined,
         onComplete: (metrics, result = {}) => {
             if (metrics?.messageId) {
                 saveMessageMetric(metrics.messageId, metrics);
