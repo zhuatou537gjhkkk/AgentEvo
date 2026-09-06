@@ -2354,10 +2354,27 @@ app.use((err, req, res, next) => {
 
 export { app };
 
+// W3.2 残余（T5）：把"重启即丢失"的易失运行态在真实启动路径上显式告警，防止
+// in-memory 存储被误当作持久层（用户在文档里问的"重启丢什么"要能在日志里自证）。
+// - 上传配额：DURABLE_UPLOAD_QUOTA!=="true" 时 reservation/usage 只在内存 → 分片上传
+//   预留与当日字节记账重启即清零；设 DURABLE_UPLOAD_QUOTA=true 走 SQLite 账本。
+// - 知识库向量：rag tenantStores 是进程内 Map（vectorStore/indexedFiles/activeLargeFile），
+//   无落盘重载 → 重启后检索索引清空，需重新上传文档（durable RAG 在 roadmap W6）。
+// - 图片上传：images/store.js 内存 Map（TTL 30min）→ 重启清空已上传图片字节。
+function warnVolatileRuntimeState() {
+    if (process.env.DURABLE_UPLOAD_QUOTA !== "true") {
+        console.warn("[startup] 上传配额为内存模式（DURABLE_UPLOAD_QUOTA 未设为 true）：分片上传预留与当日字节记账重启即清零。设为 DURABLE_UPLOAD_QUOTA=true 启用 SQLite 持久记账。");
+    }
+    // 当前无 durable RAG 开关，索引恒为进程内存态 —— 如实标注而非假装可持久。
+    console.warn("[startup] 知识库向量索引为进程内内存态（无落盘重载）：服务重启后各用户检索索引清空，需重新上传文档。持久化 RAG 见 roadmap W6。");
+    console.warn("[startup] 图片上传存储为进程内内存态（TTL 30min）：服务重启后尚未随消息持久化的已上传图片字节清空。");
+}
+
 export async function startServer({ port = PORT, autoConnectMCP = true } = {}) {
     assertAuthSecurityConfig();
     assertProductionSecurityConfig();
     initDB();
+    warnVolatileRuntimeState();
     const stopUploadQuotaCleanup = startUploadQuotaCleanup({
         onExpire: (released) => console.log(`[upload-quota] released ${released} expired reservation(s)`),
     });

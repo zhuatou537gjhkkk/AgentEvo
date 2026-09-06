@@ -250,6 +250,24 @@ function ensureScopedSchema(defaultUserId) {
     db.prepare("CREATE INDEX IF NOT EXISTS idx_upload_reservations_scope ON upload_reservations(owner_user_id, tenant_id, status)").run();
     db.prepare("CREATE INDEX IF NOT EXISTS idx_upload_quota_usage_scope ON upload_quota_usage(owner_user_id, tenant_id, usage_day)").run();
 
+    // W4-R5-S1 — durable same-key cross-process advisory lock (lease table).
+    // SQLite serializes short write transactions but the upload merge critical
+    // section (chunk assembly + FAISS embed/index + quota settle) is long-running
+    // file work, so a single transaction cannot hold mutual exclusion across
+    // processes/instances. This table materializes an explicit lease in the same
+    // DB the accounting lives in (no external lock service): acquire is an
+    // INSERT OR IGNORE on the (owner,tenant,key) PK plus an atomic reclaim of an
+    // expired lease; the holder renews while its critical section runs and
+    // releases by holder_token on exit. A crashed holder never wedges the key —
+    // its lease simply expires and the next acquire reclaims the row.
+    db.prepare(`CREATE TABLE IF NOT EXISTS upload_key_locks (
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL, upload_key TEXT NOT NULL,
+        holder_token TEXT NOT NULL, acquired_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        expires_at DATETIME,
+        PRIMARY KEY (owner_user_id, tenant_id, upload_key),
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+
     const seedPath = path.resolve(__dirname, "../mcp/servers.json");
     try {
         const seeds = JSON.parse(fs.readFileSync(seedPath, "utf8")).servers || [];
@@ -279,6 +297,8 @@ function ensureScopedSchema(defaultUserId) {
     migrationAudit.run();
     db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
         .run("W3.1-S1", JSON.stringify({ defaultUserId, policy: "unattributed legacy rows are not exposed by scoped queries" }));
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("W4-R5-S1", JSON.stringify({ policy: "additive advisory-lock table upload_key_locks (durable same-key cross-process upload lock); no data rewrite" }));
 
 }
 

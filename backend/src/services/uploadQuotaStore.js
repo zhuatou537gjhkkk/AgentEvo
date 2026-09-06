@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import db, { getUserScope, initDB } from "../db/index.js";
 import {
     reserveUploadChunk as reserveMemoryChunk,
@@ -74,6 +75,82 @@ function durableCleanupExpired(now = new Date()) {
         return expired.length;
     });
     return transaction();
+}
+
+const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Durable same-key advisory lock (W4-R5-S1) — upload_key_locks lease rows.
+ *
+ * The merge/chunk critical section (file assembly + FAISS embed/index + quota
+ * settle) is long-running file work, so SQLite's per-write serialization alone
+ * cannot keep two processes from racing on the same (owner, upload_key). Each
+ * actor instead holds an explicit lease row: INSERT OR IGNORE wins the key, or
+ * an atomic UPDATE reclaims it when the previous lease has expired. SQLite
+ * serializes those write transactions, so exactly one process holds a live
+ * lease at a time. The holder renews while its section runs and deletes only
+ * its own row (holder_token guard) on exit; a crashed holder's lease expires
+ * and the next acquire reclaims it — the key can never be wedged permanently.
+ */
+function acquireUploadKeyLock(scope, key, holderToken, ttlSeconds) {
+    const insert = db.prepare(`INSERT OR IGNORE INTO upload_key_locks
+        (owner_user_id, tenant_id, upload_key, holder_token, acquired_at, expires_at)
+        VALUES (?, ?, ?, ?, datetime('now'), datetime('now', ?))`)
+        .run(scope.userId, scope.tenantId, key, holderToken, `+${ttlSeconds} seconds`);
+    if (insert.changes === 1) return true;
+    // PK exists — win it only if the previous holder's lease has expired. The
+    // expiry predicate + SQLite write serialization make concurrent reclaims
+    // single-winner (the loser's UPDATE matches 0 rows once the winner renewed).
+    return db.prepare(`UPDATE upload_key_locks SET
+            holder_token = ?, acquired_at = datetime('now'), expires_at = datetime('now', ?)
+        WHERE owner_user_id = ? AND tenant_id = ? AND upload_key = ?
+          AND (expires_at IS NULL OR expires_at <= datetime('now'))`)
+        .run(holderToken, `+${ttlSeconds} seconds`, scope.userId, scope.tenantId, key).changes === 1;
+}
+
+function renewUploadKeyLock(scope, key, holderToken, ttlSeconds) {
+    return db.prepare(`UPDATE upload_key_locks SET expires_at = datetime('now', ?)
+        WHERE owner_user_id = ? AND tenant_id = ? AND upload_key = ? AND holder_token = ?`)
+        .run(`+${ttlSeconds} seconds`, scope.userId, scope.tenantId, key, holderToken).changes === 1;
+}
+
+function releaseUploadKeyLock(scope, key, holderToken) {
+    db.prepare(`DELETE FROM upload_key_locks
+        WHERE owner_user_id = ? AND tenant_id = ? AND upload_key = ? AND holder_token = ?`)
+        .run(scope.userId, scope.tenantId, key, holderToken);
+}
+
+async function withDurableUploadLock(scopeOrUserId, uploadKey, operation, options = {}) {
+    const scope = resolveDurableScope(scopeOrUserId);
+    const key = normalizedUploadKey(uploadKey);
+    ensureQuotaSchema();
+    const ttlMs = Math.max(2_000, Number(options.ttlMs) || 60_000);
+    const busyTimeoutMs = Math.max(200, Number(options.busyTimeoutMs) || 30_000);
+    const pollMs = Math.max(5, Math.min(200, Number(options.pollMs) || 25));
+    const ttlSeconds = Math.ceil(ttlMs / 1000);
+    const holderToken = randomUUID();
+    const deadline = Date.now() + busyTimeoutMs;
+
+    for (;;) {
+        if (acquireUploadKeyLock(scope, key, holderToken, ttlSeconds)) break;
+        if (Date.now() >= deadline) {
+            throw quotaError("UPLOAD_LOCK_TIMEOUT", "upload is busy, try again shortly", 429);
+        }
+        await sleepMs(pollMs);
+    }
+
+    // Renew the lease while the critical section runs so a slow merge doesn't
+    // lose its lock mid-flight to a waiter or a stale reclaim.
+    const renewTimer = setInterval(() => {
+        try { renewUploadKeyLock(scope, key, holderToken, ttlSeconds); } catch { /* release path still runs */ }
+    }, Math.max(250, Math.floor(ttlMs / 3)));
+    renewTimer.unref?.();
+    try {
+        return await operation();
+    } finally {
+        clearInterval(renewTimer);
+        try { releaseUploadKeyLock(scope, key, holderToken); } catch { /* best-effort */ }
+    }
 }
 
 function createDurableAdapter() {
@@ -242,12 +319,11 @@ function createDurableAdapter() {
         cleanupExpiredUploadReservations(now = new Date()) {
             return durableCleanupExpired(now);
         },
-        // SQLite serializes writes; this lock still protects same-process file
-        // assembly while allowing a later distributed lock implementation.
-        // Cross-process locking requires a shared lock service; SQLite only
-        // serializes the accounting transaction, so retain this explicit
-        // single-process lock until that adapter exists.
-        withUploadLock: withMemoryUploadLock,
+        // W4-R5-S1 — the same-key lock is now lease-backed in upload_key_locks
+        // (see withDurableUploadLock): mutual exclusion holds across processes
+        // on the same DB file, not just within this process. The in-process
+        // memory lock remains the non-durable adapter's rollback path.
+        withUploadLock: withDurableUploadLock,
         close() {},
         health() { return { ok: true, durable: true }; },
     };

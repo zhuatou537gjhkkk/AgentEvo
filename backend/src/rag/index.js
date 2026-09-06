@@ -4,6 +4,7 @@ import path from "path";
 import { OpenAIEmbeddings } from "@langchain/openai";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { FaissStore } from "@langchain/community/vectorstores/faiss";
+import { withRetry } from "../services/resilience.js";
 
 const tenantStores = new Map();
 
@@ -75,10 +76,13 @@ const upload = multer({
     }
 });
 
+// C1 预算统一（W4-R3/R5）：LangChain/OpenAI SDK 内建 maxRetries 置 0，
+// withRetry 是唯一的重试预算层 —— 否则 SDK 默认 2 次重试会与下方 withRetry 叠乘。
 const embeddings = new OpenAIEmbeddings({
     modelName: process.env.OPENAI_EMBEDDING_MODEL || "qwen3.7-text-embedding",
     model: process.env.OPENAI_EMBEDDING_MODEL || "qwen3.7-text-embedding",
     batchSize: EMBED_BATCH_SIZE,
+    maxRetries: 0,
     configuration: {
         apiKey: process.env.OPENAI_EMBEDDING_API_KEY || process.env.OPENAI_API_KEY || process.env.DASHSCOPE_API_KEY,
         baseURL: process.env.OPENAI_EMBEDDING_BASE_URL || process.env.OPENAI_BASE_URL || process.env.DASHSCOPE_BASE_URL
@@ -126,8 +130,20 @@ async function processAndStoreText(text, fileName, userId, sizeBytes) {
     store.knowledgeMetadatas.push(...metadata);
     store.indexedFiles.add(fileName);
     const documents = chunks.map((chunk, index) => ({ pageContent: chunk, metadata: metadata[index] }));
-    if (!store.vectorStore) store.vectorStore = await FaissStore.fromTexts(chunks, metadata, embeddings);
-    else await store.vectorStore.addDocuments(documents);
+    // W4-R5 (T1)：索引期 embedding 推理是网络调用，包 withRetry（预算层唯一，见上方
+    // embeddings maxRetries:0）。耗尽后异常上抛 → 上传路径按失败处理（清理临时文件并
+    // 释放 reservation），provider 细节不会离开本模块的调用方错误封装。
+    if (!store.vectorStore) {
+        store.vectorStore = await withRetry(
+            () => FaissStore.fromTexts(chunks, metadata, embeddings),
+            { retries: 2 }
+        );
+    } else {
+        await withRetry(
+            () => store.vectorStore.addDocuments(documents),
+            { retries: 2 }
+        );
+    }
     return { fileName, mode: "vector", chunkCount: chunks.length, totalChunks: store.knowledgeChunks.length, totalFiles: store.indexedFiles.size };
 }
 
@@ -192,7 +208,13 @@ export async function retrieveKnowledgeEvidence(
     const searchTopK = preferredSource
         ? Math.max(topK, DEFAULT_TOP_K * 4)
         : topK;
-    const docsWithScore = await store.vectorStore.similaritySearchWithScore(query, searchTopK);
+    // W4-R5 (T1)：similaritySearch 会触发 embedding 推理（网络调用），包 withRetry 使
+    // 请求路径上的瞬态上游故障自动重试；耗尽后异常上抛，由调用方（search_knowledge_base
+    // 工具 / knowledgeAgent 节点）按既有降级路径转成"知识库检索出错"类公开结果。
+    const docsWithScore = await withRetry(
+        () => store.vectorStore.similaritySearchWithScore(query, searchTopK),
+        { retries: 2 }
+    );
 
     const scorePreview = docsWithScore
         .map(([, score]) => Number(score))

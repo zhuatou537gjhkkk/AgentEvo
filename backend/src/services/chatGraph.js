@@ -1685,6 +1685,33 @@ function completePlan(plan, sse) {
 //   - 多源：合并所有来源后再输出
 // ═══════════════════════════════════════════════════════
 
+/**
+ * W4-R5 (T2) — Synthesizer/融合消费者"只接收成功文本或明确 blocked 结果"守卫。
+ *
+ * 判断一条工具/节点产出文本是否为"错误或不可用结果"。匹配两类标记：
+ *  1. 既有文本前缀：`(xxx工具不可用)`、`知识库检索出错:`、`联网搜索出错:`、
+ *     `工具调用失败:`、`Error:`、空/纯空白；
+ *  2. W4-R5 新增的结构化降级 JSON：web_search 的 `{"ok":false,...}`、
+ *     `{"errorCode":...}`、`{"status":"error"/"failed"}` —— 这类是"明确失败结果"，
+ *     不得被当作成功数据注入融合上下文。
+ *
+ * 注意：`未检索到相关知识片段`/`当前知识库为空` 等"成功但空"文本**不是**错误，
+ * 保持按成功来源处理（LLM 收到真实告知，而非被丢弃）。本分类器只挡真失败。
+ */
+function isErrorResultText(text) {
+    if (!text || !text.trim()) return true;
+    const s = text.trim();
+    if (/^\(.*工具不可用\)$/.test(s)) return true;
+    if (/^知识库检索出错:/i.test(s)) return true;
+    if (/^联网搜索出错:/i.test(s)) return true;
+    if (/^工具调用失败:/i.test(s)) return true;
+    if (/^Error:/i.test(s)) return true;
+    if (/"ok"\s*:\s*false/.test(s)) return true;
+    if (/"errorCode"\s*:/.test(s)) return true;
+    if (/"status"\s*:\s*"(?:error|failed)"/.test(s)) return true;
+    return false;
+}
+
 async function synthesizerNode(state, config) {
     const sse = config?.configurable?.sse;
     const signal = config?.configurable?.abortSignal;
@@ -1717,16 +1744,7 @@ async function synthesizerNode(state, config) {
     let contextBlock = "";
     const errorResults = []; // 收集错误/不可用的结果来源
 
-    // 辅助函数：检测错误/不可用结果
-    const isErrorResult = (text) => {
-        if (!text || !text.trim()) return true;
-        const s = text.trim();
-        return /^\(.*工具不可用\)$/.test(s) ||
-            /^知识库检索出错:/.test(s) ||
-            /^联网搜索出错:/.test(s) ||
-            /^工具调用失败:/.test(s) ||
-            /^Error:/i.test(s);
-    };
+    // 检测错误/不可用结果 → 提升到模块级导出的 isErrorResultText（W4-R5 T2，含结构化 JSON 标记）
 
     // Phase 4: 从 planResults 收集 subTask 执行结果
     const planResults = state.planResults || {};
@@ -1737,7 +1755,7 @@ async function synthesizerNode(state, config) {
         for (const st of completedSubTasks) {
             const result = planResults[st.id] || "";
             if (!result) continue;
-            if (isErrorResult(result)) {
+            if (isErrorResultText(result)) {
                 errorResults.push(`${st.content.slice(0, 30)}(${st.toolName || "未知工具"})`);
                 continue;
             }
@@ -1752,7 +1770,7 @@ async function synthesizerNode(state, config) {
     // 旧字段 fallback（无 subTask 的 Parallel 模式）
     if (completedSubTasks.length === 0) {
         if (state.searchResults) {
-            if (isErrorResult(state.searchResults)) {
+            if (isErrorResultText(state.searchResults)) {
                 errorResults.push("搜索");
             } else {
                 sources.push("搜索");
@@ -1760,7 +1778,7 @@ async function synthesizerNode(state, config) {
             }
         }
         if (state.knowledgeResults) {
-            if (isErrorResult(state.knowledgeResults)) {
+            if (isErrorResultText(state.knowledgeResults)) {
                 errorResults.push("知识库");
             } else {
                 sources.push("知识库");
@@ -1768,7 +1786,7 @@ async function synthesizerNode(state, config) {
             }
         }
         if (state.codeResults) {
-            if (isErrorResult(state.codeResults)) {
+            if (isErrorResultText(state.codeResults)) {
                 errorResults.push("代码");
             } else {
                 sources.push("代码");
@@ -2535,4 +2553,5 @@ export {
     createSSEEmitter,
     defaultMakeLlm,
     resolveMakeLlm,
+    isErrorResultText,
 };
