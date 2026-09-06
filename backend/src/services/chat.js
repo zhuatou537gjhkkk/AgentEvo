@@ -274,6 +274,19 @@ async function chatWithStreamImpl(userId, session_id, userMessage, image, system
                     console.log('[agent] agent event stream aborted by client disconnect');
                     break;
                 }
+                // W4-R4 (SSE #2)：模型/链路错误事件升级为终态，避免被下方 catch-all
+                // `continue` 吞成"正常结束"→ 假 [DONE]。收敛到外层 catch（error envelope +
+                // res.end()，无 [DONE]，不落 assistant）。不抛 provider 原文——raw 只进
+                // console + cause，对外固定中文 + retryable 语义。
+                if (event.event === "on_chain_error" || event.event === "on_chat_model_error" || event.event === "on_llm_error") {
+                    const rawError = event?.data?.error ?? event?.data ?? event;
+                    console.error(`[agent][fatal] ${event.event}:`, rawError?.message || rawError);
+                    throw Object.assign(new Error(`模型调用中途失败（${event.event}）`), {
+                        code: "UPSTREAM_UNAVAILABLE",
+                        retryable: true,
+                        cause: rawError instanceof Error ? rawError : new Error(String(rawError?.message ?? rawError)),
+                    });
+                }
                 if (event.event !== "on_chat_model_stream") {
                     console.log(`[agent][event] type=${event.event} name=${event.name || "-"}`);
                 }
@@ -442,6 +455,19 @@ async function chatWithStreamImpl(userId, session_id, userMessage, image, system
                     console.log('[agent] agent event stream aborted by client disconnect');
                     break;
                 }
+                // W4-R4 (SSE #2)：模型/链路错误事件升级为终态，避免被下方 catch-all
+                // `continue` 吞成"正常结束"→ 假 [DONE]。收敛到外层 catch（error envelope +
+                // res.end()，无 [DONE]，不落 assistant）。不抛 provider 原文——raw 只进
+                // console + cause，对外固定中文 + retryable 语义。
+                if (event.event === "on_chain_error" || event.event === "on_chat_model_error" || event.event === "on_llm_error") {
+                    const rawError = event?.data?.error ?? event?.data ?? event;
+                    console.error(`[agent][fatal] ${event.event}:`, rawError?.message || rawError);
+                    throw Object.assign(new Error(`模型调用中途失败（${event.event}）`), {
+                        code: "UPSTREAM_UNAVAILABLE",
+                        retryable: true,
+                        cause: rawError instanceof Error ? rawError : new Error(String(rawError?.message ?? rawError)),
+                    });
+                }
                 if (event.event !== "on_chat_model_stream") {
                     console.log(`[agent][event] type=${event.event} name=${event.name || "-"}`);
                 }
@@ -597,6 +623,23 @@ async function chatWithStreamImpl(userId, session_id, userMessage, image, system
             onFailure?.(Object.assign(new Error("Request aborted"), { code: "ABORTED", statusCode: 499 }), { text: fullText });
             res.end();
             cleanupDisconnect();
+            return;
+        }
+
+        // W4-R4 (SSE #2) 空输出守卫：Agent 流正常结束但未产出任何文本 → 按失败终态处理。
+        // 不落空 assistant、不发假 [DONE]（前端把 [DONE] 当成功）。direct-stream 分支已有
+        // fullText 守卫，agent 分支此前缺失。
+        if (!fullText) {
+            const emptyErr = Object.assign(new Error("模型未生成有效回答"), { code: "EMPTY_OUTPUT", retryable: false });
+            if (!clientDisconnected) {
+                emitThought(res, "未生成有效回答", "error");
+                const envelope = toPublicError(emptyErr, requestContext?.requestId);
+                envelope.message = "模型未生成有效回答"; // 覆盖 generic fallback，FE 可见明确文案
+                sseWriter.write(envelope);
+            }
+            res.end();
+            cleanupDisconnect();
+            onFailure?.(emptyErr, { text: "" });
             return;
         }
 

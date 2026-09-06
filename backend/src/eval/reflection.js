@@ -14,7 +14,12 @@
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { buildChatOpenAIConfig } from "../services/chatUtils.js";
+import { withRetry } from "../services/resilience.js";
 import { LLMJudge } from "./judge.js";
+
+// ⚠️ DEAD CODE：当前无任何生产/测试调用者（eval runner 的 options.reflect 从未被读取）。
+// 若将来启用，必须保留下方 withRetry —— buildChatOpenAIConfig 默认 maxRetries:0，
+// 直接 invoke 会静默零重试。启用前请先补 `reflect` 接线 + HTTP 集成测试。
 
 const REFLECTION_SYSTEM_PROMPT = `你是一个严格的质量审查员。审查AI助手的回答，判断是否存在以下问题：
 
@@ -188,10 +193,13 @@ ${(output.toolCallNames || []).join(", ") || "无"}
 请审查以上回答并输出JSON。`;
 
         try {
-            const response = await this.reflectionLlm.invoke([
-                new SystemMessage(REFLECTION_SYSTEM_PROMPT),
-                new HumanMessage(prompt),
-            ]);
+            const response = await withRetry(
+                (_, retrySignal) => this.reflectionLlm.invoke([
+                    new SystemMessage(REFLECTION_SYSTEM_PROMPT),
+                    new HumanMessage(prompt),
+                ], { signal: retrySignal }),
+                { retries: 2 }
+            );
 
             const content = typeof response.content === "string"
                 ? response.content

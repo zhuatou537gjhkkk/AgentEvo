@@ -27,6 +27,7 @@ import {
     removeMemory,
 } from "../db/index.js";
 import { agentConfig } from "./agentConfig.js";
+import { withRetry } from "./resilience.js";
 
 /**
  * MemoryService — 封装记忆系统的业务逻辑
@@ -168,6 +169,9 @@ export class MemoryService {
  * @param {number} sessionId
  * @returns {Promise<{ extractedCount: number, consolidatedCount: number }>}
  */
+// ⚠️ DEAD CODE：当前无任何生产/测试调用者（regex extractFromConversation 才是活跃记忆路径）。
+// 若将来接线，必须保留下方 withRetry —— buildChatOpenAIConfig 默认 maxRetries:0，直接
+// invoke 会静默零重试。llm 由调用方传入，来电方同样需遵循 withRetry 单一重试预算约定。
 export async function llmMemoryConsolidation(llm, memory, messages, sessionId) {
     // 只处理 > 3 轮对话的会话
     const substantiveMessages = messages.filter(m =>
@@ -198,7 +202,10 @@ ${conversationText}
 仅返回 JSON 数组，不要其他内容。`;
 
     try {
-        const response = await llm.invoke([{ role: "user", content: extractionPrompt }]);
+        const response = await withRetry(
+            (_, retrySignal) => llm.invoke([{ role: "user", content: extractionPrompt }], { signal: retrySignal }),
+            { retries: 2 }
+        );
         const text = typeof response === "string" ? response : (response?.content || "");
         // 提取 JSON 数组
         const jsonMatch = text.match(/\[[\s\S]*\]/);
