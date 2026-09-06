@@ -27,8 +27,9 @@ import { codingError, requireCodingScope } from "./util.js";
 import { defaultRunWorkspaceRunner } from "./runWorkspaceRunner.js";
 import { defaultRunService } from "./runs.js";
 import { defaultApprovalService } from "./approvals.js";
-import { codingWorkspaceEnabled, codingWriteToolsEnabled } from "./flags.js";
+import { codingWorkspaceEnabled, codingWriteToolsEnabled, codingBatchReadsEnabled } from "./flags.js";
 import { defaultProjectService } from "./projects.js";
+import { defaultOpScheduler } from "./opScheduler.js";
 
 const CODE_BUDGET_DEFAULTS = Object.freeze({
     maxTurns: 8,            // decider calls before the loop halts
@@ -65,10 +66,20 @@ export class CodeAgentService {
         runRunner = defaultRunWorkspaceRunner,
         runService = defaultRunService,
         approvals = defaultApprovalService,
+        opScheduler = defaultOpScheduler,
     } = {}) {
         this.runRunner = runRunner;
         this.runService = runService;
         this.approvals = approvals;
+        // R3 batch-reads scheduler (opScheduler.js). It is a NO-OP seam unless the
+        // decider emits a multi-op `ops` decision AND CODING_BATCH_READS is enabled —
+        // the single-op loop path never consults it, so the default stays sequential.
+        this.opScheduler = opScheduler || null;
+    }
+
+    /** R3 gate: batching only engages when a scheduler is present AND the flag is ON. */
+    _batchReadsEnabled() {
+        return this.opScheduler != null && codingBatchReadsEnabled();
     }
 
     /**
@@ -86,6 +97,13 @@ export class CodeAgentService {
      *                     run one workspace op (read immediate; write/exec may pause)
      *   `async (ctx) => ({type:"verify", op, args})`
      *                     run an op whose output is recorded under "verify"
+     *   `async (ctx) => ({type:"ops", ops:[{op, args?, note?}], note?})`
+     *                     run several ops in one turn. When the session has an
+     *                     opScheduler AND CODING_BATCH_READS is enabled AND every
+     *                     op in the set is a read, independent reads share a wave
+     *                     and run in parallel; a set containing any write/exec/verify
+     *                     (or batching off) executes each op sequentially through the
+     *                     same per-op machinery (a write may still pause for approval).
      *   `async (ctx) => ({type:"note", text})` append a step note
      *   `async (ctx) => ({type:"done", summary})` finish
      *   ctx = { goal, steps: [{type, op?, note?, ok?, summary?, at}], stepIndex }
@@ -194,19 +212,49 @@ export class CodeAgentService {
                 continue;
             }
             if (type === "op" || type === "verify") {
-                const op = decision.op;
-                const args = decision.args || {};
-                const outcome = await this._executeOp(session, op, args, type);
-                if (session.phase !== "running") break; // paused for decision / halted
-                const step = {
-                    type: outcome.effect === "read" || type === "op" ? "op" : "verify",
-                    op,
+                const advanced = await this._executeOpDecision(session, {
+                    type,
+                    op: decision.op,
+                    args: decision.args || {},
                     note: decision.note || null,
-                    ...(outcome.errorCode ? { errorCode: outcome.errorCode } : {}),
-                };
-                if (outcome.errorCode) step.ok = false;
-                this._appendStep(session, step);
-                this._checkBudgets(session, step);
+                });
+                if (!advanced) break; // paused for decision / halted
+                continue;
+            }
+            // R3 — multi-op decision (see decide() JSDoc). Sequential by default; the
+            // parallel read path only engages when CODING_BATCH_READS is enabled.
+            if (type === "ops") {
+                const batch = Array.isArray(decision.ops) ? decision.ops : [];
+                const entries = batch.filter((e) => e && typeof e === "object" && typeof e.op === "string");
+                if (entries.length !== batch.length) {
+                    session.phase = "failed";
+                    session.haltReason = "invalidDecision";
+                    break;
+                }
+                const canBatch = entries.length > 0
+                    && this._batchReadsEnabled()
+                    && entries.every((e) => this.opScheduler.classifyOp(e.op) === "read");
+                if (canBatch) {
+                    await this._executeReadBatch(session, entries, decision.note || null);
+                    if (session.phase !== "running") break;
+                    continue;
+                }
+                // Batching off, or a write/exec/verify in the set → sequential executor.
+                let proceeded = true;
+                for (const entry of entries) {
+                    const kind = entry.kind === "verify" || entry.type === "verify" ? "verify" : "op";
+                    const advanced = await this._executeOpDecision(session, {
+                        type: kind,
+                        op: entry.op,
+                        args: entry.args || {},
+                        note: entry.note || decision.note || null,
+                    });
+                    if (!advanced) {
+                        proceeded = false;
+                        break;
+                    }
+                }
+                if (!proceeded) break;
                 continue;
             }
             session.phase = "failed";
@@ -298,6 +346,52 @@ export class CodeAgentService {
         const errorCode = outcome?.errorCode || outcome?.action?.errorCode;
         this._emit(session, { type: "op.rejected", op, errorCode });
         return { effect: "write", op, ok: false, errorCode: errorCode || "EXECUTION_NOT_RUN" };
+    }
+
+    /**
+     * Record a single op outcome as a step (identical step shape for both the
+     * sequential loop and the parallel read batch) and run the budget check.
+     */
+    _recordOpStep(session, op, note, outcome, kind = "op") {
+        const step = {
+            type: outcome.effect === "read" || kind === "op" ? "op" : "verify",
+            op,
+            note: note || null,
+            ...(outcome.errorCode ? { errorCode: outcome.errorCode } : {}),
+        };
+        if (outcome.errorCode) step.ok = false;
+        this._appendStep(session, step);
+        this._checkBudgets(session, step);
+    }
+
+    /** Run ONE op decision through the sequential machinery. Returns false when the
+     * loop must stop (paused on approval, budget-halted, or failed). */
+    async _executeOpDecision(session, { type, op, args = {}, note = null }) {
+        const outcome = await this._executeOp(session, op, args, type);
+        if (session.phase !== "running") return false; // paused for decision / halted
+        this._recordOpStep(session, op, note, outcome, type);
+        return true;
+    }
+
+    /**
+     * R3 — execute an all-read batch. The scheduler partitions the reads into waves;
+     * reads that share a wave (disjoint targets, within readConcurrency) dispatch
+     * concurrently through the SAME `_executeOp` used by the sequential loop, so
+     * action accounting, events and budget checks stay identical. Steps are appended
+     * in original op order (wave order is a stable partition).
+     */
+    async _executeReadBatch(session, entries, note) {
+        const descriptors = entries.map((e) => ({ op: e.op, args: e.args || {}, note: e.note || note || null }));
+        const { waves } = this.opScheduler.plan(descriptors, { readBatch: true });
+        for (const wave of waves) {
+            const outcomes = await Promise.all(
+                wave.map(async (entry) => ({ entry, outcome: await this._executeOp(session, entry.op, entry.args, "op") })),
+            );
+            for (const { entry, outcome } of outcomes) {
+                this._recordOpStep(session, entry.op, entry.note, outcome, "op");
+                if (session.phase !== "running") return; // halted mid-batch; stop
+            }
+        }
     }
 
     _ctx(session) {

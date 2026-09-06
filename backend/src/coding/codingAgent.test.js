@@ -9,7 +9,8 @@ import { defaultProjectService } from "./projects.js";
 import { defaultRunService } from "./runs.js";
 import { defaultApprovalService } from "./approvals.js";
 import { setCommandAllowlistOverride, clearCommandAllowlistOverride } from "./runner/commandRunner.js";
-import { defaultCodingAgentService, resolveCodingRunTask } from "./codingAgent.js";
+import { CodeAgentService, defaultCodingAgentService, resolveCodingRunTask } from "./codingAgent.js";
+import { createOpScheduler } from "./opScheduler.js";
 import { codeAgentNode, runCodingAgentNode } from "../services/chatGraph.js";
 
 /**
@@ -238,6 +239,87 @@ describe("CodeAgentService — bounded, resumable coding loop over a disposable 
         const snap = await defaultCodingAgentService.run(session);
         expect(snap.phase).toBe("budget_halted");
         expect(snap.haltReason).toBe("maxTurns");
+    });
+
+    // R3 — batch op scheduler seam (opScheduler.js). The R2 loop above stays strictly
+    // sequential; a multi-op `ops` decision only parallelizes ALL-READ sets when the
+    // session carries an opScheduler AND CODING_BATCH_READS is enabled. These tests
+    // drive the seam through a fake read runner (deterministic concurrency counting)
+    // so no worktree/DB mutation is involved.
+    function countingReadRunner(maxActiveBox) {
+        return {
+            async runOp(_scope, { request }) {
+                const op = request.op;
+                maxActiveBox.active += 1;
+                maxActiveBox.max = Math.max(maxActiveBox.max, maxActiveBox.active);
+                maxActiveBox.order.push(`start:${op}`);
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                maxActiveBox.order.push(`end:${op}`);
+                maxActiveBox.active -= 1;
+                return { ok: true, effect: "read", op, data: { ok: 1 } };
+            },
+        };
+    }
+
+    function batchedDecider(entries) {
+        let calls = 0;
+        return async () => {
+            calls += 1;
+            if (calls === 1) return { type: "ops", ops: entries };
+            return { type: "done", summary: "batched reads observed" };
+        };
+    }
+
+    it("runs an all-read 'ops' decision as one parallel wave when CODING_BATCH_READS is on", async () => {
+        const box = { active: 0, max: 0, order: [] };
+        const service = new CodeAgentService({ runRunner: countingReadRunner(box), opScheduler: createOpScheduler() });
+        const session = service.begin({ userId: OWNER.id }, {
+            run: { id: "run_batch_on", projectId },
+            project: { id: projectId },
+            goal: "read three files",
+            decide: batchedDecider([
+                { op: "read_file", args: { path: "a.js" }, note: "r-a" },
+                { op: "read_file", args: { path: "b.js" }, note: "r-b" },
+                { op: "read_file", args: { path: "c.js" }, note: "r-c" },
+            ]),
+            budget: { maxTurns: 6, maxActions: 12 },
+        });
+        process.env.CODING_BATCH_READS = "true";
+        try {
+            const snap = await service.run(session);
+            expect(snap.phase).toBe("done");
+            expect(box.max).toBe(3); // all three reads overlapped → real parallel dispatch
+            const ops = session.steps.filter((s) => s.op).map((s) => s.op);
+            expect(ops).toEqual(["read_file", "read_file", "read_file"]); // original order kept
+            expect(session.steps.filter((s) => s.type === "op")).toHaveLength(3);
+        } finally {
+            delete process.env.CODING_BATCH_READS;
+        }
+    });
+
+    it("keeps an all-read 'ops' decision strictly sequential when the flag is off (default)", async () => {
+        const box = { active: 0, max: 0, order: [] };
+        const service = new CodeAgentService({ runRunner: countingReadRunner(box), opScheduler: createOpScheduler() });
+        const session = service.begin({ userId: OWNER.id }, {
+            run: { id: "run_batch_off", projectId },
+            project: { id: projectId },
+            goal: "read three files",
+            decide: batchedDecider([
+                { op: "read_file", args: { path: "a.js" } },
+                { op: "read_file", args: { path: "b.js" } },
+                { op: "read_file", args: { path: "c.js" } },
+            ]),
+            budget: { maxTurns: 6, maxActions: 12 },
+        });
+        delete process.env.CODING_BATCH_READS; // default-off
+        try {
+            const snap = await service.run(session);
+            expect(snap.phase).toBe("done");
+            expect(box.max).toBe(1); // sequential executor path
+            expect(session.steps.filter((s) => s.op)).toHaveLength(3);
+        } finally {
+            delete process.env.CODING_BATCH_READS;
+        }
     });
 });
 

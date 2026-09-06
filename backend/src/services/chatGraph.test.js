@@ -14,7 +14,7 @@
  * 运行: npx vitest run src/services/chatGraph.test.js
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 // ============================================================
 // Mock 外部依赖（避免数据库连接等副作用）
@@ -113,12 +113,24 @@ import {
     mapIntentToNode,
     resolveSubTaskNode,
     enforceSubTaskOrder,
+    orderSubTasksByType,
     subTasksToPlan,
     isSoloRun,
     fanoutBySubTasks,
     fanoutByIntents,
     fanoutToAgents,
     AGENT_NODE_MAP,
+    // Phase 7 / R3 — DAG scheduler + helpers
+    estimateTaskComplexity,
+    subTaskOutcomeFromText,
+    fanoutDag,
+    agentExitRoute,
+    dagSchedulerNode,
+    dagSchedulerExit,
+    depContextForSubTask,
+    subTaskSettledStatus,
+    // Phase 7 / R3 — Synthesizer 融合上下文（provenance/artifact/status）
+    buildFusionContext,
 } from './chatGraph.js';
 
 import { toolRegistry } from '../mcp/registry.js';
@@ -747,5 +759,328 @@ describe('State Reducers — 语义验证', () => {
 describe('chatGraph source integrity', () => {
     it('chatGraph module can be imported', () => {
         expect(true).toBe(true);
+    });
+});
+
+// ============================================================
+// Phase 7 / R3 — Router complexity + subTask outcome helpers
+// ============================================================
+
+describe('estimateTaskComplexity — 任务复杂度启发式 (R3 #5)', () => {
+    it('≥3 intents → complex', () => {
+        expect(estimateTaskComplexity('x', ['a', 'b', 'c'])).toBe('complex');
+    });
+    it('2 intents + 排序词 → complex; 2 intents 无提示 → compound', () => {
+        expect(estimateTaskComplexity('先查资料再写代码', ['search', 'code'])).toBe('complex');
+        expect(estimateTaskComplexity('x', ['search', 'knowledge'])).toBe('compound');
+    });
+    it('单意图 + 长 pipeline 提示词 → complex; 其余 → simple', () => {
+        expect(estimateTaskComplexity('请先设计一个完整的架构方案，然后再逐步实现各个模块的代码，最后编写测试并逐步验证每一步的结果是否与预期完全一致', ['code'])).toBe('complex');
+        expect(estimateTaskComplexity('你好', ['general'])).toBe('simple');
+    });
+});
+
+describe('subTaskOutcomeFromText — 结果文本 → completed|failed', () => {
+    it('正常文本 → completed; 空 → failed; 错误/不可用标记 → failed', () => {
+        expect(subTaskOutcomeFromText('搜索到三篇文章……')).toBe('completed');
+        expect(subTaskOutcomeFromText('')).toBe('failed');
+        expect(subTaskOutcomeFromText('{"ok":false,"data":null}')).toBe('failed');
+        expect(subTaskOutcomeFromText('(web_search 工具不可用)')).toBe('failed');
+    });
+});
+
+// ============================================================
+// Phase 7 / R3 — 稳定排序（不重编号）
+// ============================================================
+
+describe('orderSubTasksByType — R3 稳定排序', () => {
+    it('executable 在前 reasoning 在后，且 id/dependsOn 引用原样保留', () => {
+        const out = orderSubTasksByType([
+            { id: '1', type: 'reasoning', dependsOn: ['2', '3'], status: 'pending' },
+            { id: '2', type: 'agent', agent: 'search', dependsOn: [], status: 'pending' },
+            { id: '3', type: 'agent', agent: 'code', dependsOn: ['2'], status: 'pending' },
+        ]);
+        expect(out.map((s) => s.id)).toEqual(['2', '3', '1']); // 无重编号
+        expect(out[0].id).toBe('2');
+        expect(out[2].dependsOn).toEqual(['2', '3']); // 引用保持
+    });
+});
+
+// ============================================================
+// Phase 7 / R3 — DAG 入口/出口路由（flag 门控）
+// ============================================================
+
+describe('fanoutDag / agentExitRoute — DAG 路由 (R3 #4/#5)', () => {
+    afterEach(() => {
+        delete process.env.GRAPH_DAG_SCHEDULER_ENABLED;
+    });
+
+    it('fanoutDag: pending executable → dag_scheduler；全 blocked/仅 reasoning → synthesizer', () => {
+        expect(fanoutDag({ subTasks: [{ id: '1', type: 'agent', agent: 'search', status: 'pending' }] })).toBe('dag_scheduler');
+        expect(fanoutDag({ subTasks: [
+            { id: '1', type: 'agent', status: 'blocked' },
+            { id: '2', type: 'reasoning', status: 'pending' },
+        ] })).toBe('synthesizer');
+        expect(fanoutDag({ subTasks: [{ id: '1', type: 'reasoning', status: 'pending' }] })).toBe('synthesizer');
+    });
+
+    it('agentExitRoute: flag ON + subTasks → dag_scheduler；否则 synthesizer（零拓扑变化）', () => {
+        const withSub = { subTasks: [{ id: '1', type: 'agent', agent: 'search', status: 'pending' }] };
+        // flag off → synthesizer
+        expect(agentExitRoute(withSub)).toBe('synthesizer');
+        // flag on + subTasks → dag_scheduler
+        process.env.GRAPH_DAG_SCHEDULER_ENABLED = 'true';
+        expect(agentExitRoute(withSub)).toBe('dag_scheduler');
+        // flag on + 无 subTasks（solo/非 plan 路径）→ synthesizer
+        expect(agentExitRoute({ subTasks: [] })).toBe('synthesizer');
+        expect(agentExitRoute({})).toBe('synthesizer');
+    });
+});
+
+// ============================================================
+// Phase 7 / R3 — 结果状态推导 + 依赖上下文注入
+// ============================================================
+
+describe('subTaskSettledStatus / depContextForSubTask — R3 结果门控', () => {
+    afterEach(() => {
+        delete process.env.GRAPH_DAG_SCHEDULER_ENABLED;
+    });
+
+    it('flag OFF: 一律 completed（与 R2 一致）', () => {
+        expect(subTaskSettledStatus('{"ok":false,"data":null}')).toBe('completed');
+        expect(subTaskSettledStatus('好结果')).toBe('completed');
+    });
+
+    it('flag ON: 按结果文本推导 completed|failed', () => {
+        process.env.GRAPH_DAG_SCHEDULER_ENABLED = 'true';
+        expect(subTaskSettledStatus('正常结果')).toBe('completed');
+        expect(subTaskSettledStatus('{"errorCode":"MCP_TOOL_FAILED"}')).toBe('failed');
+    });
+
+    it('depContextForSubTask: flag OFF → ""；flag ON 无依赖 → ""', () => {
+        const st = { id: '2', dependsOn: ['1'] };
+        expect(depContextForSubTask({ currentSubTask: st, agentResults: { '1': { agent: 'search', text: '资料' } } })).toBe('');
+        process.env.GRAPH_DAG_SCHEDULER_ENABLED = 'true';
+        expect(depContextForSubTask({ currentSubTask: { id: '9', dependsOn: [] }, agentResults: {} })).toBe('');
+    });
+
+    it('flag ON 有已完成依赖 → 注入有界参考上下文', () => {
+        process.env.GRAPH_DAG_SCHEDULER_ENABLED = 'true';
+        const ctx = depContextForSubTask({
+            currentSubTask: { id: '2', dependsOn: ['1'] },
+            agentResults: { '1': { agent: 'search', text: '检索到的资料 A' } },
+        });
+        expect(ctx).toContain('依赖步骤 1');
+        expect(ctx).toContain('检索到的资料 A');
+        expect(ctx).toContain('参考用');
+    });
+});
+
+// ============================================================
+// Phase 7 / R3 — dag_schedulerNode：多波就绪 + 失败传播 + 残留 settle
+// ============================================================
+
+describe('dagSchedulerNode — 依赖感知多波调度 (R3 #2/#3)', () => {
+    const agent = (id, agent, dependsOn, extra = {}) => ({ id, type: 'agent', agent, dependsOn: dependsOn || [], status: 'pending', ...extra });
+
+    it('wave-1 只分发依赖满足的步骤（Search→Code 两波）', async () => {
+        const subTasks = [
+            agent('1', 'search', []),
+            agent('2', 'code', ['1']),
+            { id: '3', type: 'reasoning', dependsOn: ['1', '2'], status: 'pending' },
+        ];
+        const first = await dagSchedulerNode({ subTasks, schedulerWaves: 0 }, {});
+        expect(first._sends.map((s) => s.id)).toEqual(['1']); // code 留待下一波
+        expect(first.schedulerWaves).toBe(1);
+
+        // 波1 完成 → 再次调度 → code 就绪
+        const afterWave1 = subTasks.map((s) => (s.id === '1' ? { ...s, status: 'completed' } : s));
+        const second = await dagSchedulerNode({ subTasks: afterWave1, schedulerWaves: 1 }, {});
+        expect(second._sends.map((s) => s.id)).toEqual(['2']);
+
+        // 波2 完成 → 无就绪 executable → 终止（reasoning 由 synthesizer 融合）
+        const afterWave2 = afterWave1.map((s) => (s.id === '2' ? { ...s, status: 'completed' } : s));
+        const third = await dagSchedulerNode({ subTasks: afterWave2, schedulerWaves: 2 }, {});
+        expect(third._sends).toEqual([]);
+    });
+
+    it('失败依赖不触发后继：上游 failed → 下游 blocked 且不入波', async () => {
+        const subTasks = [
+            agent('1', 'search', []),
+            agent('2', 'code', ['1']),
+        ];
+        // 上游以失败收场
+        const failed = subTasks.map((s) => (s.id === '1' ? { ...s, status: 'failed' } : s));
+        const pass = await dagSchedulerNode({ subTasks: failed, schedulerWaves: 1 }, {});
+        const blockedTask = pass.subTasks.find((s) => s.id === '2');
+        expect(blockedTask.status).toBe('blocked');
+        expect(blockedTask.statusReason).toContain('前置步骤');
+        expect(pass._sends.map((s) => s.id)).not.toContain('2');
+        expect(pass._sends).toEqual([]);
+    });
+
+    it('并行：互不依赖的多步骤同一波就绪', async () => {
+        const subTasks = [agent('1', 'search', []), agent('2', 'knowledge', []), agent('3', 'code', ['1', '2'])];
+        const pass = await dagSchedulerNode({ subTasks, schedulerWaves: 0 }, {});
+        expect(pass._sends.map((s) => s.id).sort()).toEqual(['1', '2']);
+    });
+
+    it('残留 in_progress（节点返回未落定）→ blocked，避免永不收敛', async () => {
+        const subTasks = [{ id: '1', type: 'agent', agent: 'search', status: 'in_progress', dependsOn: [] }];
+        const pass = await dagSchedulerNode({ subTasks, schedulerWaves: 1 }, {});
+        const settled = pass.subTasks.find((s) => s.id === '1');
+        expect(settled.status).toBe('blocked');
+        expect(settled.statusReason).toContain('未落定');
+        expect(pass._sends).toEqual([]);
+    });
+
+    it('死锁防御：无 ready 无 running 但仍有 stuck → blocked', async () => {
+        // 两个互相 stuck（本不应出现——planner 已拒绝成环，防御兜底）
+        const subTasks = [
+            { id: 'a', type: 'agent', agent: 'code', status: 'pending', dependsOn: ['b'] },
+            { id: 'b', type: 'agent', agent: 'code', status: 'pending', dependsOn: ['a'] },
+        ];
+        const pass = await dagSchedulerNode({ subTasks, schedulerWaves: 0 }, {});
+        expect(pass._sends).toEqual([]);
+        const statuses = pass.subTasks.map((s) => s.status);
+        expect(statuses.every((st) => st === 'blocked')).toBe(true);
+    });
+});
+
+// ============================================================
+// Phase 7 / R3 — dagSchedulerExit：就绪波 → Send[] / synthesizer
+// ============================================================
+
+describe('dagSchedulerExit — 波分发条件边 (R3 #2)', () => {
+    it('无就绪步骤 → synthesizer', () => {
+        expect(dagSchedulerExit({ _sends: [] })).toBe('synthesizer');
+    });
+
+    it('有就绪步骤 → Send[]，各自带 in_progress 的 currentSubTask 与目标节点', () => {
+        const state = {
+            _sends: [
+                { id: '1', type: 'agent', agent: 'search', status: 'pending', dependsOn: [] },
+                { id: '2', type: 'agent', agent: 'code', status: 'pending', dependsOn: ['1'] },
+            ],
+            subTasks: [],
+        };
+        const sends = dagSchedulerExit(state);
+        expect(Array.isArray(sends)).toBe(true);
+        expect(sends.length).toBe(2);
+        const nodes = sends.map((s) => s.node).sort();
+        expect(nodes).toEqual(['code_agent', 'search_agent']);
+        for (const s of sends) {
+            expect(s.state.currentSubTask.status).toBe('in_progress');
+        }
+    });
+
+    it('tool 类型 → tool_executor 目标', () => {
+        const sends = dagSchedulerExit({
+            _sends: [{ id: '5', type: 'tool', toolName: 'read_file', status: 'pending', dependsOn: [] }],
+            subTasks: [],
+        });
+        expect(sends[0].node).toBe('tool_executor');
+    });
+});
+
+// ============================================================
+// Phase 7 / R3 — Synthesizer 融合上下文（provenance/artifact/status）
+// ============================================================
+
+describe('buildFusionContext — Synthesizer 融合上下文 (R3 #5)', () => {
+    // 与旧实现完全一致的 subTask/result 输入
+    const baseState = () => ({
+        subTasks: [
+            { id: '1', type: 'agent', agent: 'knowledge', content: '检索学习率资料', status: 'completed', dependsOn: [] },
+            { id: '2', type: 'agent', agent: 'code', content: '编写学习率配置代码', status: 'completed', dependsOn: ['1'] },
+            { id: '3', type: 'reasoning', content: '综合检索与代码并给出最终说明', status: 'pending', dependsOn: ['1', '2'] },
+        ],
+        planResults: {
+            '1': '检索结果：学习率建议 0.001（KBHIT）',
+            '2': '代码：学习率配置完成（CODE_DONE）',
+        },
+    });
+
+    it('legacy（enableProvenance=false）: 逐字节复刻旧标签 — 无 agent 追加、错误结果进 blocked 提示', () => {
+        const state = {
+            ...baseState(),
+            planResults: { ...baseState().planResults, '1': '{"ok":false,"errorCode":"KB_FAILED"}' },
+        };
+        const out = buildFusionContext(state, { enableProvenance: false });
+        // code 步骤标签不带 · code / · completed 之类 provenance 后缀
+        expect(out.contextBlock).toContain('[步骤2: 编写学习率配置代码]');
+        expect(out.contextBlock).not.toContain('· code');
+        // 错误结果（步骤1）不算 source，进入 errorResults → blockedNote
+        expect(out.sources).toEqual(['编写学习率配置代码']);
+        expect(out.contextBlock).not.toContain('KBHIT');
+        expect(out.blockedNote).toContain('检索学习率资料(未知工具)');
+        expect(out.reasoningGuide).toContain('综合检索与代码');
+    });
+
+    it('provenance（enableProvenance=true）: 标签叠加 agent · status · 有产物，source 优先 agent 名', () => {
+        const state = {
+            ...baseState(),
+            agentResults: {
+                '1': { subTaskId: '1', agent: 'knowledge', source: 'knowledge', status: 'completed', text: '检索结果：学习率建议 0.001（KBHIT）', artifact: null },
+                '2': { subTaskId: '2', agent: 'code', source: 'code', status: 'completed', text: '代码：学习率配置完成（CODE_DONE）', artifact: { digest: 'a1' }, errorCode: null },
+            },
+        };
+        const out = buildFusionContext(state, { enableProvenance: true });
+        // 用 AgentResult.text 注入（与 planResults 同文本），标签含 agent
+        expect(out.contextBlock).toContain('KBHIT');
+        expect(out.contextBlock).toContain('· code');
+        expect(out.contextBlock).toContain('· knowledge');
+        // completed 不带 status，但 artifact 存在 → “有产物”
+        expect(out.contextBlock).toContain('有产物');
+        // code 步骤不含多余 status 标签（completed 不显示）
+        expect(out.contextBlock).not.toMatch(/· completed/);
+        expect(out.sources).toEqual(['knowledge', 'code']);
+    });
+
+    it('provenance: failed/error 状态的 packet 进 errorResults（不进 contextBlock）', () => {
+        const state = {
+            ...baseState(),
+            planResults: {},
+            agentResults: {
+                '1': { subTaskId: '1', agent: 'knowledge', status: 'failed', text: '{"ok":false,"errorCode":"KB_SEARCH_FAILED","message":"检索不可用"}', artifact: null },
+            },
+        };
+        const out = buildFusionContext(state, { enableProvenance: true });
+        expect(out.sources).toEqual([]);
+        // 来源标签优先 agent 名（不是“未知工具”）
+        expect(out.blockedNote).toContain('knowledge');
+        expect(out.contextBlock).not.toContain('KB_SEARCH_FAILED');
+    });
+
+    it('provenance 降级: 有 agentResults 但 enableProvenance=false 时完全忽略（旧路径不读新包）', () => {
+        const state = {
+            ...baseState(),
+            agentResults: {
+                '1': { subTaskId: '1', agent: 'knowledge', status: 'completed', text: 'PACKET_ONLY_TEXT', artifact: { digest: 'x' } },
+            },
+            planResults: {}, // legacy 无文本 → 不注入 PACKET_ONLY_TEXT
+        };
+        const out = buildFusionContext(state, { enableProvenance: false });
+        expect(out.contextBlock).toBe('');
+        expect(out.contextBlock).not.toContain('PACKET_ONLY_TEXT');
+        // reasoning 仍在 → 不会触发 pass-through（node 侧由 caller 决定）
+        expect(out.reasoningGuide).not.toBe('');
+    });
+
+    it('无 subTask 的 legacy 平行模式 fallback（searchResults/knowledgeResults/codeResults）', () => {
+        const state = {
+            subTasks: [],
+            planResults: {},
+            searchResults: '实时搜索命中（SRCH）',
+            knowledgeResults: '{"ok":false,"errorCode":"KB_FAILED"}',
+            codeResults: '',
+        };
+        const out = buildFusionContext(state, { enableProvenance: false });
+        expect(out.sources).toEqual(['搜索']);
+        expect(out.contextBlock).toContain('[搜索结果]');
+        expect(out.contextBlock).toContain('SRCH');
+        expect(out.contextBlock).not.toContain('[知识库结果]');
+        // 错误来源进入 blockedNote（“知识库”）
+        expect(out.blockedNote).toContain('知识库');
     });
 });

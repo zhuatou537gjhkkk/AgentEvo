@@ -65,6 +65,7 @@ class ContextConfig {
  * 中文 1 字 ≈ 1 token，英文 1 词 ≈ 1.3 token
  */
 import { estimateTokens } from "./chatUtils.js";
+import { createHash } from "node:crypto";
 
 export { estimateTokens };
 
@@ -167,6 +168,236 @@ export class ContextBuilder {
         console.log(`[contextBuilder] built context: ${packets.length} gathered → ${selected.length} selected → ${finalTokens} tokens`);
 
         return context;
+    }
+
+    // ── Provenance pipeline (Phase 7 / R3 — GSSC 演化为 provenance packets) ──
+    // 与 legacy `build` 分离：build 保持逐字节不变；buildProvenance 额外做
+    //   hash/range 去重 → loop observation 压缩 → per-source budget → 选择 → 结构 → digest。
+    // 返回 { context, digest, sources[], deduped, loopCompressed, gathered, selectedCount }。
+
+    _sha256(text) {
+        return createHash("sha256").update(String(text ?? "")).digest("hex");
+    }
+
+    _contentHash(text) {
+        return this._sha256(text).slice(0, 16);
+    }
+
+    /**
+     * hash/range 去重：同一内容（content hash 相同）只保留首个；后到且被某个已保留
+     * 内容完整包含（range 关系）的候选包丢弃（避免同一来源的分段被反复携带）。
+     * @returns {{ packets: ContextPacket[], deduped: number }}
+     */
+    dedupePackets(packets) {
+        const kept = [];
+        const seenHash = new Set();
+        let deduped = 0;
+        for (const p of packets || []) {
+            const content = String(p.content ?? "").trim();
+            if (!content) continue;
+            const h = this._contentHash(content);
+            if (seenHash.has(h)) { deduped += 1; continue; }
+            // range dup：短内容整体被已保留的较长内容包含 → 丢弃
+            if (content.length >= 24 && kept.some((k) => String(k.content).includes(content))) {
+                deduped += 1;
+                continue;
+            }
+            seenHash.add(h);
+            kept.push(p);
+        }
+        return { packets: kept, deduped };
+    }
+
+    /**
+     * loop observation 压缩：同类重复观测（metadata.type === "loop_observation"）
+     * 压缩成一条“×N 压缩”摘要，避免 agent 循环观测刷爆上下文。
+     * @returns {{ packets: ContextPacket[], compressed: number }} compressed = 被替换的条数
+     */
+    _compressLoopObservations(packets, { minRepeat = 3 } = {}) {
+        const groups = new Map();
+        const others = [];
+        for (const p of packets || []) {
+            // loop 观测包：type === "loop_observation"，或显式打了 loop 标记的来源包
+            if (p.metadata?.type === "loop_observation" || p.metadata?.loop === true) {
+                const key = String(p.content).slice(0, 48);
+                if (!groups.has(key)) groups.set(key, []);
+                groups.get(key).push(p);
+            } else {
+                others.push(p);
+            }
+        }
+        let compressed = 0;
+        for (const [key, list] of groups) {
+            if (list.length >= minRepeat) {
+                const last = list[list.length - 1];
+                const content = `[loop 观测 ×${list.length} 压缩] 最近一次：${last.content}`;
+                others.push(new ContextPacket({
+                    content,
+                    timestamp: last.timestamp,
+                    tokenCount: estimateTokens(content),
+                    relevanceScore: last.relevanceScore,
+                    metadata: { ...last.metadata, loopCompressed: true, loopCount: list.length },
+                }));
+                compressed += list.length;
+            } else {
+                others.push(...list);
+            }
+        }
+        return { packets: others, compressed };
+    }
+
+    /**
+     * per-source budget：非特权来源（system_instruction / repo 除外）对可用 token
+     * 均分得到每源上限；可被 options.sourceBudgets 逐源覆盖。caps: Map<source, tokens>。
+     */
+    _sourceCaps(packets, availableTokens, sourceBudgets = null) {
+        const sources = new Set();
+        for (const p of packets || []) {
+            const t = p.metadata?.type;
+            if (t === "system_instruction" || t === "repo") continue;
+            sources.add(p.metadata?.source || p.metadata?.type || "default");
+        }
+        const caps = new Map();
+        if (sources.size === 0) return { caps, capPerSource: availableTokens };
+        const capPerSource = Math.max(1, Math.floor(availableTokens / sources.size));
+        for (const s of sources) caps.set(s, capPerSource);
+        if (sourceBudgets && typeof sourceBudgets === "object") {
+            for (const [s, b] of Object.entries(sourceBudgets)) {
+                if (sources.has(s)) caps.set(s, Math.max(1, Number(b) || capPerSource));
+            }
+        }
+        return { caps, capPerSource };
+    }
+
+    /**
+     * Select 的 provenance 变体：贪心填充时同时检查全局预算与来源级预算（cap），
+     * 单源（如某次 RAG 大命中）无法挤占其他来源。
+     */
+    _selectProvenance(packets, userQuery, availableTokens, caps) {
+        const systemPackets = packets.filter((p) => p.metadata.type === "system_instruction");
+        const repoPackets = packets.filter((p) => p.metadata.type === "repo");
+        const otherPackets = packets.filter((p) => p.metadata.type !== "system_instruction" && p.metadata.type !== "repo");
+
+        const selected = [...systemPackets, ...repoPackets];
+        let currentTokens = selected.reduce((s, p) => s + p.tokenCount, 0);
+        const sourceUsed = new Map();
+
+        const remaining = availableTokens - currentTokens;
+        if (remaining <= 0) return { selected, sourceUsed };
+
+        const scored = [];
+        for (const packet of otherPackets) {
+            if (packet.relevanceScore === 0.5) packet.relevanceScore = calculateRelevance(packet.content, userQuery);
+            const recency = calculateRecency(packet.timestamp);
+            const combinedScore = this.config.relevanceWeight * packet.relevanceScore + this.config.recencyWeight * recency;
+            if (packet.relevanceScore >= this.config.minRelevance) scored.push({ score: combinedScore, packet });
+        }
+        scored.sort((a, b) => b.score - a.score);
+
+        for (const { packet } of scored) {
+            const source = packet.metadata?.source || packet.metadata?.type || "default";
+            const cap = caps instanceof Map ? caps.get(source) : null;
+            const used = sourceUsed.get(source) || 0;
+            // 来源级预算优先于全局：来源配额已满即跳过（即使全局仍有空位）
+            if (cap != null && used + packet.tokenCount > cap) continue;
+            if (currentTokens + packet.tokenCount <= availableTokens) {
+                selected.push(packet);
+                currentTokens += packet.tokenCount;
+                sourceUsed.set(source, used + packet.tokenCount);
+            } else {
+                const slot = Math.min(
+                    availableTokens - currentTokens,
+                    cap == null ? Infinity : Math.max(0, cap - used),
+                );
+                if (packet.relevanceScore >= 0.8 && packet.metadata.type !== "conversation_history" && slot > 30) {
+                    const truncated = packet.content.slice(0, Math.floor(slot * 1.5));
+                    const p = new ContextPacket({
+                        content: truncated,
+                        timestamp: packet.timestamp,
+                        relevanceScore: packet.relevanceScore,
+                        metadata: { ...packet.metadata, truncated: true },
+                    });
+                    selected.push(p);
+                    const t = p.tokenCount;
+                    currentTokens += t;
+                    sourceUsed.set(source, used + t);
+                }
+                break;
+            }
+        }
+        return { selected, sourceUsed };
+    }
+
+    /**
+     * GSSC provenance 版构建：结构与 legacy build 相同的管道，但穿插
+     *   hash/range 去重 → loop 观测压缩 → per-source budget select → digest。
+     * 建议经 CONTEXT_PROVENANCE_ENABLED 开关调用；默认不改变 `build` 返回值。
+     * @returns {Promise<{context: string, digest: string, sources: Array<{source,tokens,count}>,
+     *                   deduped: number, loopCompressed: number, gathered: number, selectedCount: number}>}
+     */
+    async buildProvenance(userQuery, conversationHistory = [], systemInstructions = "", options = {}) {
+        const extraPackets = [...(options.customPackets || []), ...(options.repoPackets || [])];
+        let packets = this._gather(userQuery, conversationHistory, systemInstructions, extraPackets);
+
+        if (this.memoryService) {
+            try {
+                const memories = this.memoryService.search(userQuery, ["episodic", "semantic"], 5, 0.3);
+                for (const mem of memories) {
+                    packets.push(new ContextPacket({
+                        content: `[记忆] ${mem.content}`,
+                        timestamp: new Date(mem.created_at),
+                        tokenCount: estimateTokens(mem.content),
+                        relevanceScore: Math.min(1, mem.relevanceScore || 0.5),
+                        metadata: { type: "memory", source: "memory", memory_type: mem.memory_type },
+                    }));
+                }
+            } catch (e) {
+                // 记忆检索失败不影响整体
+            }
+        }
+
+        // 1) hash/range 去重
+        const dedupe = this.dedupePackets(packets);
+        // 2) loop observation 压缩
+        const loop = this._compressLoopObservations(dedupe.packets);
+        const pool = loop.packets;
+
+        const availableTokens = Math.floor(this.config.maxTokens * (1 - this.config.reserveRatio));
+        // 3) per-source budget caps
+        const { caps } = this._sourceCaps(pool, availableTokens, options.sourceBudgets || null);
+        // 4) select（全局 + 来源预算）
+        const sel = this._selectProvenance(pool, userQuery, availableTokens, caps);
+
+        // 5) structure + compress（与 legacy build 同一套）
+        let context = this._structure(sel.selected, userQuery);
+        if (this.config.enableCompression) context = this._compress(context, this.config.maxTokens);
+
+        const digest = this._sha256(context).slice(0, 16);
+
+        const bySrc = new Map();
+        for (const p of sel.selected) {
+            const s = p.metadata?.source || p.metadata?.type || "default";
+            if (!bySrc.has(s)) bySrc.set(s, { tokens: 0, count: 0 });
+            const v = bySrc.get(s);
+            v.tokens += p.tokenCount;
+            v.count += 1;
+        }
+        const sources = [...bySrc.entries()]
+            .map(([source, v]) => ({ source, tokens: v.tokens, count: v.count }))
+            .sort((a, b) => b.tokens - a.tokens);
+
+        console.log(`[contextBuilder][provenance] gathered=${packets.length} deduped=${dedupe.deduped} ` +
+            `loopCompressed=${loop.compressed} selected=${sel.selected.length} digest=${digest}`);
+
+        return {
+            context,
+            digest,
+            sources,
+            deduped: dedupe.deduped,
+            loopCompressed: loop.compressed,
+            gathered: packets.length,
+            selectedCount: sel.selected.length,
+        };
     }
 
     // ── Stage 1: Gather ──

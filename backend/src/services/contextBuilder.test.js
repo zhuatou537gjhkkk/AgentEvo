@@ -530,3 +530,107 @@ describe('createChatContextBuilder()', () => {
         expect(result).toContain('hello world');
     });
 });
+
+// ═══════════════════════════════════════════════════════
+// Phase 7 / R3 — GSSC provenance 管道（hash/range 去重、per-source budget、
+// loop observation 压缩、context digest）
+// ═══════════════════════════════════════════════════════
+
+describe('ContextBuilder.dedupePackets — hash/range 去重 (R3 #10)', () => {
+    const cfg = new ContextConfig({ maxTokens: 500 });
+    const b = new ContextBuilder(cfg);
+    const mk = (content, meta = {}) => new ContextPacket({ content, metadata: meta });
+
+    it('同一内容 hash 去重：只保留首个', () => {
+        const { packets, deduped } = b.dedupePackets([
+            mk('完全相同的检索片段 AAAA'),
+            mk('完全相同的检索片段 AAAA'),
+            mk('完全相同的检索片段 AAAA'),
+        ]);
+        expect(deduped).toBe(2);
+        expect(packets).toHaveLength(1);
+    });
+
+    it('range 去重：被已保留长内容完整包含的短包被丢弃', () => {
+        const long = mk('AAAA' + 'x'.repeat(60));
+        const short = mk('AAAA' + 'x'.repeat(30)); // 整体是 long 的子串
+        const { packets, deduped } = b.dedupePackets([long, short]);
+        expect(deduped).toBe(1);
+        expect(packets).toHaveLength(1);
+        expect(packets[0].content).toBe(long.content);
+    });
+
+    it('空内容包不参与选择', () => {
+        const { packets } = b.dedupePackets([mk('   '), mk('真实内容')]);
+        expect(packets).toHaveLength(1);
+    });
+});
+
+describe('ContextBuilder.buildProvenance — 完整 provenance 管道 (R3 #10)', () => {
+    it('loop observation 压缩：同签名重复观测折叠为一条 ×N 摘要并给出 digest', async () => {
+        const b = new ContextBuilder(new ContextConfig({ maxTokens: 800 }));
+        const base = ('loop step model observation identical repeated tool result same '.repeat(3));
+        const obs = (i) => new ContextPacket({
+            content: `${base} trial=${i}`,   // 前 48 字符一致，差异在尾部
+            metadata: { type: 'rag', source: 'loop', loop: true },
+        });
+        const prov = await b.buildProvenance('测试查询', [], '', {
+            customPackets: [obs(1), obs(2), obs(3), obs(4), obs(5)],
+        });
+        expect(prov.loopCompressed).toBe(5);
+        expect(prov.context).toContain('×5 压缩');
+        expect(prov.digest).toMatch(/^[0-9a-f]{16}$/);
+        expect(prov.gathered).toBe(5);
+        expect(prov.sources.some((s) => s.source === 'loop')).toBe(true);
+    });
+
+    it('per-source budget：来源配额耗尽即跳过，另一来源不受影响', async () => {
+        const b = new ContextBuilder(new ContextConfig({ maxTokens: 800 }));
+        const contentA = 'A_source ' + 'y'.repeat(400);
+        const contentB = 'B_source ' + 'z'.repeat(400);
+        const pa = new ContextPacket({ content: contentA, metadata: { type: 'rag', source: 'srca' } });
+        const pb = new ContextPacket({ content: contentB, metadata: { type: 'rag', source: 'srcb' } });
+        const prov = await b.buildProvenance('查询', [], '', {
+            customPackets: [pa, pb],
+            sourceBudgets: { srca: 1 },   // A 来源几乎无配额 → 跳过；B 正常
+        });
+        expect(prov.context).not.toContain(contentA);
+        expect(prov.context).toContain(contentB);
+    });
+
+    it('无去重/无 loop/预算宽松时 context 与 legacy build 一致（向后兼容）', async () => {
+        const cfg = new ContextConfig({ maxTokens: 800 });
+        const b = new ContextBuilder(cfg);
+        const system = '你是 AgentEvo 助手。';
+        const history = [{ role: 'user', content: '上一轮问题', timestamp: new Date() }];
+        const custom = new ContextPacket({
+            content: '证据片段：学习率建议 0.001',
+            metadata: { type: 'rag', source: 'kb', relevanceScore: 0.9 },
+        });
+        const opts = { customPackets: [custom] };
+        const legacy = await b.build('当前查询', history, system, opts);
+        const prov = await b.buildProvenance('当前查询', history, system, opts);
+        expect(prov.context).toBe(legacy);
+        expect(typeof prov.digest).toBe('string');
+        expect(prov.deduped).toBe(0);
+        expect(prov.loopCompressed).toBe(0);
+    });
+
+    it('去重降低 gathered：重复检索片段只进一次', async () => {
+        const b = new ContextBuilder(new ContextConfig({ maxTokens: 800 }));
+        const dup = new ContextPacket({
+            content: '重复检索结果片段重复检索结果片段',
+            metadata: { type: 'rag', source: 'kb', relevanceScore: 0.8 },
+        });
+        const other = new ContextPacket({
+            content: '另一独立检索结果片段内容较长以确保唯一',
+            metadata: { type: 'rag', source: 'kb', relevanceScore: 0.7 },
+        });
+        const prov = await b.buildProvenance('查询', [], '你是助手。', {
+            customPackets: [dup, dup, other],
+        });
+        expect(prov.gathered).toBe(4); // system 指令 + 3 个自定义包
+        expect(prov.deduped).toBe(1);
+        expect(prov.context).toContain('另一独立检索结果片段');
+    });
+});

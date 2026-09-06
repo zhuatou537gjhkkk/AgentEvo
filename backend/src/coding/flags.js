@@ -20,12 +20,18 @@ export const codingRunnerEnabled = () => flagEnabled("CODING_RUNNER_ENABLED");
 export const codingWriteToolsEnabled = () => flagEnabled("CODING_WRITE_TOOLS_ENABLED");
 export const codingCommandToolsEnabled = () => flagEnabled("CODING_COMMAND_TOOLS_ENABLED");
 
+// R3 — batch reads scheduler (opScheduler.js). Default OFF: reads execute strictly
+// sequentially until an explicit opt-in. Turning it on only affects multi-op `ops`
+// decisions from the decider — the single-op loop path is untouched.
+export const codingBatchReadsEnabled = () => flagEnabled("CODING_BATCH_READS");
+
 export const CODING_FLAG_NAMES = [
     "CODING_WORKSPACE_ENABLED",
     "CODING_EVENT_LOG_ENABLED",
     "CODING_RUNNER_ENABLED",
     "CODING_WRITE_TOOLS_ENABLED",
     "CODING_COMMAND_TOOLS_ENABLED",
+    "CODING_BATCH_READS",
 ];
 
 /** Server-decided capability snapshot — never computed from client/model input. */
