@@ -1,0 +1,13 @@
+{
+  "datasetVersion": "rag-real-example-v1",
+  "documents": [
+    { "id": "manual", "path": "manual.md" },
+    { "id": "faq", "path": "faq.md" }
+  ],
+  "cases": [
+    { "id": "restart-service", "category": "semantic", "query": "如何重启服务？", "relevantDocumentIds": ["manual"], "relevantChunkIds": ["manual#1"], "expectedPages": [2], "expectedFacts": ["先停止当前进程，再启动服务"], "noAnswer": false },
+    { "id": "health-ready", "category": "exact_term", "query": "重启后如何确认 ready？", "relevantDocumentIds": ["manual"], "relevantChunkIds": ["manual#2"], "expectedPages": [3], "expectedFacts": ["访问健康检查接口"], "noAnswer": false },
+    { "id": "retention-days", "category": "number", "query": "日志默认保留多久？", "relevantDocumentIds": ["faq"], "relevantChunkIds": ["faq#1"], "expectedPages": [1], "expectedFacts": ["保存 30 天"], "noAnswer": false },
+    { "id": "no-quantum-transport", "category": "no_answer", "query": "系统支持量子传输吗？", "relevantDocumentIds": [], "relevantChunkIds": [], "expectedFacts": [], "noAnswer": true }
+  ]
+}

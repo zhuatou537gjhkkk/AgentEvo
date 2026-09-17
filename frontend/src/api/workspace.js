@@ -109,6 +109,18 @@ export function provisionRun(runId) {
     }));
 }
 
+/**
+ * POST /coding/runs/:id/land — apply a COMPLETED run's disposable-worktree
+ * changes onto the REAL project checkout's working tree. No commit, no staging:
+ * the real files change and the owner reviews/commits themselves. Server re-checks
+ * trust + allowed roots + conflicts before touching anything.
+ */
+export function landRunToMain(runId) {
+    return unwrap(request(`${CODING_BASE}/runs/${encodeURIComponent(runId)}/land`, {
+        method: 'POST',
+    }));
+}
+
 /** POST /coding/runs/:id/teardown — remove the run's disposable worktree. */
 export function teardownRun(runId) {
     return unwrap(request(`${CODING_BASE}/runs/${encodeURIComponent(runId)}/teardown`, {

@@ -28,6 +28,7 @@ import {
  */
 export function saveEvalRunScores({
     scores,
+    extraScores = null,
     runId,
     testCaseId,
     traceId = null,
@@ -43,6 +44,11 @@ export function saveEvalRunScores({
         { key: "conciseness", score: scores.conciseness },
         { key: "safety", score: scores.safety },
     ];
+    if (extraScores && typeof extraScores === "object") {
+        for (const [key, score] of Object.entries(extraScores)) {
+            if (Number.isFinite(Number(score))) dimensions.push({ key, score: Number(score) });
+        }
+    }
 
     for (const dim of dimensions) {
         saveEvalScore({
@@ -82,7 +88,11 @@ export function getRunSummary(runId, scope = null) {
     }
 
     const testCaseIds = Object.keys(byTestCase);
-    const avgScores = { correctness: 0, tool_usage: 0, tool_quality: 0, conciseness: 0, safety: 0 };
+    const coreDimensions = ["correctness", "tool_usage", "tool_quality", "conciseness", "safety"];
+    const extraDimensions = [...new Set(rows.map((row) => row.dimension))]
+        .filter((dimension) => !coreDimensions.includes(dimension));
+    const avgScores = Object.fromEntries([...coreDimensions, ...extraDimensions].map((dimension) => [dimension, 0]));
+    const extraCounts = Object.fromEntries(extraDimensions.map((dimension) => [dimension, 0]));
     let passed = 0;
     let failed = 0;
 
@@ -101,6 +111,12 @@ export function getRunSummary(runId, scope = null) {
         avgScores.tool_quality += dims.tool_quality || 0;
         avgScores.conciseness += dims.conciseness || 0;
         avgScores.safety += dims.safety || 0;
+        for (const dimension of extraDimensions) {
+            if (dims[dimension] != null) {
+                avgScores[dimension] += dims[dimension];
+                extraCounts[dimension] += 1;
+            }
+        }
 
         if (avg >= 3.0) passed++;
         else failed++;
@@ -108,7 +124,8 @@ export function getRunSummary(runId, scope = null) {
 
     const n = testCaseIds.length;
     for (const key of Object.keys(avgScores)) {
-        avgScores[key] = n > 0 ? Math.round(avgScores[key] / n * 100) / 100 : 0;
+        const denominator = extraDimensions.includes(key) ? extraCounts[key] : n;
+        avgScores[key] = denominator > 0 ? Math.round(avgScores[key] / denominator * 100) / 100 : 0;
     }
 
     return {

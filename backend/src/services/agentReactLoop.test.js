@@ -88,6 +88,39 @@ describe("agentReactLoop (a) 单轮最终答案", () => {
     });
 });
 
+describe("agentReactLoop streamed tool-call chunks", () => {
+    it("parses complete JSON args from tool_call_chunks instead of invoking an empty delta", async () => {
+        const calls = [];
+        const lookup = fakeTool("lookup", "found", calls);
+        const llm = makeFakeLlm([
+            [{ content: "", tool_call_chunks: [{ name: "lookup", args: '{"input":"late"}', id: "c1" }] }],
+            [{ content: "读取完成。" }],
+        ]);
+        const result = await runBoundedReactLoop({
+            messages: [new HumanMessage("read")],
+            systemTools: [lookup],
+            resolveLlm: () => llm,
+        });
+        expect(calls).toEqual(["late"]);
+        expect(result.fullText).toBe("读取完成。");
+    });
+
+    it("uses function.arguments when an OpenAI-compatible chunk also has empty args", async () => {
+        const calls = [];
+        const lookup = fakeTool("lookup", "found", calls);
+        const llm = makeFakeLlm([
+            [{ content: "", tool_calls: [{ name: "lookup", args: {}, function: { arguments: '{"input":"from-function"}' }, id: "c1" }] }],
+            [{ content: "读取完成。" }],
+        ]);
+        await runBoundedReactLoop({
+            messages: [new HumanMessage("read")],
+            systemTools: [lookup],
+            resolveLlm: () => llm,
+        });
+        expect(calls).toEqual(["from-function"]);
+    });
+});
+
 describe("agentReactLoop (b) 工具调用后给最终正文", () => {
     it("执行注入的工具，ToolMessage 回填后模型产出最终正文", async () => {
         const toolCalls = [];
@@ -215,6 +248,34 @@ describe("agentReactLoop (e) capabilityGate 按名过滤", () => {
         expect(pub.invoke).toHaveBeenCalledTimes(1);
         expect(res.fullText).toContain("public 被放行");
         expect(res.toolCalls).toBe(2); // secret 记一次"不可用"，public 记一次成功
+    });
+});
+
+describe("agentReactLoop execution hooks", () => {
+    it("uses injected stream and tool hooks for tool rounds and budget finalization", async () => {
+        const tool = fakeTool("lookup", "ok");
+        const llm = makeFakeLlm([
+            [{ content: "", tool_calls: [{ name: "lookup", args: { input: "x" }, id: "c1" }] }],
+            [{ content: "", tool_calls: [{ name: "lookup", args: { input: "y" }, id: "c2" }] }],
+            [{ content: "预算收尾正文" }],
+        ]);
+        const streamLlm = vi.fn((target, msgs, signal) => target.stream(msgs, { signal }));
+        const invokeTool = vi.fn((target, input, signal) => target.invoke(input, { signal }));
+
+        const res = await runBoundedReactLoop({
+            messages: [new HumanMessage("x")],
+            systemTools: [tool],
+            resolveLlm: () => llm,
+            budget: { maxRounds: 2 },
+            streamLlm,
+            invokeTool,
+        });
+
+        expect(res.fullText).toContain("预算收尾正文");
+        expect(res.exceededBudget).toBe(true);
+        expect(streamLlm).toHaveBeenCalledTimes(3);
+        expect(invokeTool).toHaveBeenCalledTimes(2);
+        expect(tool.invoke).toHaveBeenCalledTimes(2);
     });
 });
 

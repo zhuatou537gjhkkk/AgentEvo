@@ -8,7 +8,12 @@
         "start": "node src/server.js",
         "test": "vitest run",
         "test:watch": "vitest",
-        "check:syntax": "node --check src/app.js && node --check src/auth.js && node --check src/db/index.js && node --check src/services/chat.js && node --check src/services/chatGraph.js && node --check src/services/chatUtils.js && node --check src/services/sse.js && node --check src/services/uploadQuota.js && node --check src/services/uploadQuotaStore.js && node --check scripts/quota-worker.mjs && node --check scripts/durable-upload-smoke.mjs && node --check vitest.setup.js",
+        "smoke:mineru": "node scripts/mineru-smoke.mjs",
+        "worker:knowledge": "node scripts/knowledge-ingest-worker.mjs",
+        "smoke:knowledge-worker": "node scripts/knowledge-ingest-worker-smoke.mjs",
+        "eval:rag": "node scripts/rag-eval.mjs",
+        "eval:mcp-fixture": "node scripts/mcp-eval-fixture.mjs",
+        "check:syntax": "node --check src/app.js && node --check src/auth.js && node --check src/db/index.js && node --check src/services/chat.js && node --check src/services/chatGraph.js && node --check src/services/chatUtils.js && node --check src/services/sse.js && node --check src/services/uploadQuota.js && node --check src/services/uploadQuotaStore.js && node --check src/rag/mineruClient.js && node --check src/rag/mineruOutput.js && node --check src/rag/ingestStore.js && node --check src/rag/ingestService.js && node --check src/rag/nativeTextParser.js && node --check src/rag/documentChunk.js && node --check src/rag/knowledgeStore.js && node --check src/rag/faissVectorStore.js && node --check src/rag/ingestWorker.js && node --check src/rag/projectIds.js && node --check src/rag/uploadRetrieval.js && node --check src/rag/retrieval.js && node --check src/rag/retrievalCoordinator.js && node --check src/rag/durableSync.js && node --check src/rag/reranker.js && node --check src/rag/chatModelRetrievalProvider.js && node --check src/rag/queryRewrite.js && node --check src/rag/contextCompression.js && node --check src/eval/ragEvaluation.js && node --check src/eval/ragDataset.js && node --check src/eval/ragAnswerEvaluation.js && node --check src/eval/ragProfileEvaluation.js && node --check scripts/rag-eval.mjs && node --check scripts/rag-vector-benchmark.mjs && node --check scripts/mineru-smoke.mjs && node --check scripts/knowledge-ingest-worker.mjs && node --check scripts/knowledge-ingest-worker-smoke.mjs && node --check scripts/quota-worker.mjs && node --check scripts/durable-upload-smoke.mjs && node --check vitest.setup.js",
         "test:coverage": "vitest run --coverage"
     },
     "dependencies": {
@@ -25,7 +30,9 @@
         "faiss-node": "^0.5.1",
         "fs-extra": "^11.3.0",
         "langchain": "^1.2.37",
-        "multer": "^1.4.5-lts.1"
+        "multer": "^1.4.5-lts.1",
+        "unzipper": "^0.12.5",
+        "zod": "^3.25.76"
     },
     "devDependencies": {
         "nodemon": "^3.1.7",

@@ -169,11 +169,11 @@ describe("R4 durable knowledge schema + migration ledger", () => {
             "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('knowledge_documents','knowledge_chunks','knowledge_query_log','project_memory') ORDER BY name",
         ).all().map((row) => row.name);
         expect(names).toEqual([...R4_TABLES].sort());
-        // exactly the three knowledge_* tables (no stray/duplicated DDL)
+        // Knowledge document tables plus the K2 asynchronous ingest table.
         const knowledgeTables = db.prepare(
             "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'knowledge_%' ORDER BY name",
         ).all().map((row) => row.name);
-        expect(knowledgeTables).toHaveLength(3);
+        expect(knowledgeTables).toHaveLength(4);
         const again = db.prepare(
             "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('knowledge_documents','knowledge_chunks','knowledge_query_log','project_memory') ORDER BY name",
         ).all().map((row) => row.name);

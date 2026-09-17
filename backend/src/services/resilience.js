@@ -11,6 +11,7 @@ export class AppError extends Error {
         this.code = code;
         this.statusCode = statusCode;
         this.retryable = retryable;
+        this.protocolError = Boolean(cause?.protocolError);
     }
 }
 
@@ -29,6 +30,17 @@ function findRetryableCauseCode(error) {
 
 export function classifyError(error) {
     if (error instanceof AppError) return error;
+    // MCP `isError` is a completed protocol response. Its transport status
+    // must not turn it into a retryable 5xx, otherwise one logical call can
+    // replay a non-idempotent tool and hide the protocol failure.
+    if (error?.protocolError) {
+        return new AppError(error?.message || "MCP protocol error", {
+            code: error?.code || "MCP_PROTOCOL_ERROR",
+            statusCode: 502,
+            retryable: false,
+            cause: error,
+        });
+    }
     const status = Number(error?.status || error?.statusCode || error?.response?.status || 0);
     const code = String(error?.code || "").toUpperCase();
     const hasHttpStatus = status > 0;

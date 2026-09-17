@@ -149,6 +149,12 @@ describe('chatStore — Memory State', () => {
             expect(typeof getState().fetchMemoryStats).toBe('function');
         });
 
+        it('should expose review control-plane actions', () => {
+            expect(typeof getState().fetchMemoryLineage).toBe('function');
+            expect(typeof getState().batchUpdateMemories).toBe('function');
+            expect(typeof getState().switchSession).toBe('function');
+        });
+
         it('should have deleteMemory as a function', () => {
             expect(typeof getState().deleteMemory).toBe('function');
         });

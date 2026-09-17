@@ -5,6 +5,9 @@ import SettingsModal from './components/SettingsModal';
 import Sidebar from './components/Sidebar';
 import EvalDashboard from './components/EvalDashboard';
 import ObservabilityPanel from './components/ObservabilityPanel';
+import SkillsPanel from './components/SkillsPanel';
+import SettingsWorkspace from './components/settings/SettingsWorkspace';
+import { SESSION_SETTINGS_LABEL, SETTINGS_VIEW } from './components/settings/navigation';
 import WelcomePanel from './components/WelcomePanel';
 import WorkspacePanel from './components/workspace/WorkspacePanel';
 import { useChatStore } from './store/chatStore';
@@ -131,7 +134,11 @@ export default function App() {
         ? '评估与优化'
         : activeView === 'observability'
             ? '运行观测'
-            : currentSession?.title || '新对话';
+            : activeView === 'skills'
+                ? '技能库'
+                : activeView === SETTINGS_VIEW
+                    ? '设置'
+                    : currentSession?.title || '新对话';
 
     if (isAuthLoading) {
         return (
@@ -266,6 +273,15 @@ export default function App() {
                                     工作区
                                 </button>
                             )}
+                            {activeView === 'chat' && (
+                                <button
+                                    type="button"
+                                    onClick={() => useChatStore.getState().toggleSettings()}
+                                    className="header-link"
+                                >
+                                    {SESSION_SETTINGS_LABEL}
+                                </button>
+                            )}
                             <button
                                 type="button"
                                 onClick={() => setShowShortcuts(true)}
@@ -304,8 +320,14 @@ export default function App() {
                     </div>
                 ) : activeView === 'eval' ? (
                     <main className="tool-workspace"><EvalDashboard embedded onBack={() => changeView('chat')} /></main>
-                ) : (
+                ) : activeView === 'observability' ? (
                     <main className="tool-workspace"><ObservabilityPanel embedded onBack={() => changeView('chat')} /></main>
+                ) : activeView === 'skills' ? (
+                    <SkillsPanel />
+                ) : activeView === SETTINGS_VIEW ? (
+                    <SettingsWorkspace onBack={() => changeView('chat')} />
+                ) : (
+                    <main className="tool-workspace" />
                 )}
             </section>
 

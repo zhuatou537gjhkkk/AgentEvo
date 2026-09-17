@@ -7,10 +7,28 @@
  * 对应 Hello-Agents: Ch10 MCP 工具发现 + 注册机制
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { DynamicStructuredTool, DynamicTool } from "@langchain/core/tools";
 import { connectToMCPServer } from "./client.js";
 import { getRequestContext } from "../services/requestContext.js";
 import { withRetry } from "../services/resilience.js";
+import * as db from "../db/index.js";
+import {
+    McpObservationRecorder,
+    McpProtocolError,
+    safeMcpError,
+    statusForMcpError,
+} from "./observations.js";
+
+const mcpOperationStorage = new AsyncLocalStorage();
+
+function defaultMcpObservationPersist() {
+    // Some legacy Vitest modules provide a narrow db mock without the newer
+    // telemetry export. Inspect the namespace descriptor instead of reading a
+    // missing named export, so those tests keep their existing contract.
+    const descriptor = Object.getOwnPropertyDescriptor(db, "saveMcpOperationObservation");
+    return typeof descriptor?.value === "function" ? descriptor.value : null;
+}
 
 /**
  * MCP Server 的 schema 以 JSON Schema 形式返回，直接交给
@@ -80,8 +98,70 @@ function normalizeLegacyStructuredInput(tool, input) {
     return { [required[0] || propKeys[0] || "input"]: input };
 }
 
+class McpStructuredTool extends DynamicStructuredTool {
+    constructor({ recorder, serverName, toolName, schema, schemaStatus, description, invokeRemote, scope, requestId, traceId, spanId, subtaskId }) {
+        const remoteInvoke = invokeRemote;
+        super({
+            name: `${serverName}/${toolName}`,
+            description,
+            schema,
+            func: async (input) => {
+                const operation = mcpOperationStorage.getStore();
+                if (!operation) throw new Error("MCP operation context missing");
+                recorder.attempt(operation);
+                return remoteInvoke(input, operation);
+            },
+        });
+        this._mcp = { serverName, toolName };
+        this._recorder = recorder;
+        this._mcpInvokeRemote = remoteInvoke;
+        this._mcpScope = scope || null;
+        this._mcpRequestId = requestId || null;
+        this._mcpTraceId = traceId || null;
+        this._mcpSpanId = spanId || null;
+        this._mcpSubtaskId = subtaskId || null;
+        this._mcpSchemaStatus = schemaStatus || (this.schema ? "declared" : "missing");
+    }
+
+    async invoke(input, config = {}) {
+        const operation = config.mcpOperationContext || this._recorder.start({
+            serverName: this._mcp.serverName,
+            toolName: this._mcp.toolName,
+            operation: "call_tool",
+            scope: config.scope || this._mcpScope,
+            requestId: config.requestId || this._mcpRequestId,
+            traceId: config.traceId || this._mcpTraceId,
+            spanId: config.spanId || this._mcpSpanId,
+            subtaskId: config.subtaskId || this._mcpSubtaskId,
+            schemaStatus: this._mcpSchemaStatus,
+        });
+        const signal = config.signal || config?.configurable?.abortSignal;
+        try {
+            const result = await withRetry(
+                (_, retrySignal) => {
+                    operation.signal = retrySignal;
+                    return mcpOperationStorage.run(operation, () => super.invoke(input, { ...config, signal: retrySignal }));
+                },
+                {
+                    retries: Number.isInteger(config.mcpRetries) ? config.mcpRetries : 1,
+                    signal,
+                    // A protocol isError is a completed MCP response, not a
+                    // transient transport failure. Never replay it.
+                    shouldRetry: (error) => !error?.protocolError && Boolean(error?.retryable),
+                },
+            );
+            this._recorder.finish(operation, { status: "success" });
+            return result;
+        } catch (error) {
+            const safe = safeMcpError(error);
+            this._recorder.finish(operation, { status: safe.status, error });
+            throw error;
+        }
+    }
+}
+
 class ToolRegistry {
-    constructor() {
+    constructor({ connect = connectToMCPServer, observations = null } = {}) {
         /** @type {import("@langchain/core/tools").DynamicTool[]} */
         this._localTools = [];
 
@@ -90,6 +170,8 @@ class ToolRegistry {
 
         /** @type {Map<string, Promise>} 连接进行中，防止并发重复连接 */
         this._pendingConnections = new Map();
+        this._connect = connect;
+        this.observations = observations || new McpObservationRecorder({ persist: defaultMcpObservationPersist() });
     }
 
     /**
@@ -147,13 +229,40 @@ class ToolRegistry {
 
     async _doConnect(config) {
         console.log(`[registry] connecting to MCP server "${config.name}"...`);
-        const client = await connectToMCPServer(config);
+        const connectObservation = this.observations.start({
+            serverName: config.name,
+            operation: "connect",
+            scope: config.scope,
+            requestId: config.requestId,
+            traceId: config.traceId,
+            spanId: config.spanId,
+        });
+        this.observations.attempt(connectObservation);
+        let client;
+        try {
+            client = await this._connect(config);
+            this.observations.finish(connectObservation, { status: "success" });
+        } catch (error) {
+            this.observations.finish(connectObservation, { status: statusForMcpError(error), error });
+            throw error;
+        }
 
         let remoteTools;
+        const discoveryObservation = this.observations.start({
+            serverName: config.name,
+            operation: "list_tools",
+            scope: config.scope,
+            requestId: config.requestId,
+            traceId: config.traceId,
+            spanId: config.spanId,
+        });
+        this.observations.attempt(discoveryObservation);
         try {
             const result = await client.listTools();
             remoteTools = result?.tools || [];
+            this.observations.finish(discoveryObservation, { status: "success" });
         } catch (err) {
+            this.observations.finish(discoveryObservation, { status: statusForMcpError(err), error: err });
             console.error(`[registry] failed to list tools from "${config.name}": ${err.message}`);
             await client.close();
             return;
@@ -170,36 +279,48 @@ class ToolRegistry {
             const toolDesc = rt.description || `MCP tool from ${config.name}: ${toolName}`;
             const prefixedName = `${config.name}/${toolName}`;
             const schema = normalizeMCPInputSchema(rt.inputSchema, config.name, toolName);
+            const schemaStatus = rt.inputSchema ? "declared" : "missing";
 
-            const makeTool = (name) => new DynamicStructuredTool({
-                name,
-                description: `[${config.name}] ${toolDesc}`,
-                schema,
-                func: async (input) => {
-                    try {
-                        const result = await withRetry(
-                            (_, signal) => client.callTool({
-                                name: toolName,
-                                arguments: input && typeof input === "object" ? input : {},
-                                signal,
-                            }),
-                            { retries: 1 }
-                        );
+            const makeTool = (name) => {
+                const tool = new McpStructuredTool({
+                    recorder: this.observations,
+                    serverName: config.name,
+                    toolName,
+                    description: `[${config.name}] ${toolDesc}`,
+                    schema,
+                    schemaStatus,
+                    scope: config.scope,
+                    requestId: config.requestId,
+                    traceId: config.traceId,
+                    spanId: config.spanId,
+                    subtaskId: config.subtaskId,
+                    invokeRemote: async (input, operation) => {
+                        const result = await client.callTool({
+                            name: toolName,
+                            arguments: input && typeof input === "object" ? input : {},
+                            ...(operation?.signal ? { signal: operation.signal } : {}),
+                        });
+                        if (result?.isError === true) {
+                            const content = result?.content || [];
+                            const message = content.filter((item) => item?.type === "text").map((item) => item.text).join("\n") || "MCP tool returned isError";
+                            throw new McpProtocolError(message, {
+                                errorCode: "MCP_PROTOCOL_ERROR",
+                                retryable: false,
+                            });
+                        }
                         const content = result?.content || [];
                         const textParts = content
                             .filter(c => c.type === "text")
                             .map(c => c.text);
                         return textParts.length > 0 ? textParts.join("\n") : JSON.stringify(result);
-                    } catch (err) {
-                        return JSON.stringify({
-                            ok: false,
-                            errorCode: "MCP_TOOL_FAILED",
-                            message: `MCP tool "${toolName}" failed`,
-                            retryable: Boolean(err?.code === "ECONNRESET" || err?.code === "ETIMEDOUT"),
-                        });
-                    }
-                },
-            });
+                    },
+                });
+                // The registry uses this marker to avoid adding a second retry
+                // layer at graph call sites. Keep the namespace name as the
+                // canonical identity; bare aliases point to the same metadata.
+                tool.name = name;
+                return tool;
+            };
 
             // 注册带命名空间前缀的版本（Planner/ToolExecutor 优先使用）
             wrappers.push(makeTool(prefixedName));
@@ -304,6 +425,9 @@ class ToolRegistry {
         const normalizedInput = tool instanceof DynamicStructuredTool
             ? normalizeLegacyStructuredInput(tool, input)
             : input;
+        if (isMcpTool(tool)) {
+            return tool.invoke(normalizedInput, config || {});
+        }
         return withRetry(
             (_, signal) => tool.invoke(normalizedInput, { ...config, signal }),
             { retries: 1, signal: config?.signal }
@@ -485,6 +609,18 @@ class ToolRegistry {
         }
         return wrapper.tools.map(t => ({ name: t.name, description: t.description }));
     }
+}
+
+export function isMcpTool(tool) {
+    return Boolean(tool?._mcp?.serverName && tool?._mcp?.toolName);
+}
+
+/** One retry owner for both registry and direct graph tool paths. */
+export async function invokeRegisteredTool(tool, input, { signal, scope, requestId, traceId, spanId, subtaskId } = {}) {
+    if (isMcpTool(tool)) {
+        return tool.invoke(input, { signal, scope, requestId, traceId, spanId, subtaskId });
+    }
+    return withRetry((_, retrySignal) => tool.invoke(input, { signal: retrySignal }), { retries: 1, signal });
 }
 
 export { ToolRegistry };

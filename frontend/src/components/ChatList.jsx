@@ -39,7 +39,16 @@ function Row({ index, style, data }) {
     }, [index, message?.content, setSize]);
 
     return (
-        <div style={style}>
+        <div
+            style={{
+                ...style,
+                // VariableSizeList positions rows absolutely. Contain a stale
+                // estimate for one paint so a growing Markdown row cannot paint
+                // over the adjacent message while ResizeObserver catches up.
+                overflow: 'hidden',
+                minWidth: 0,
+            }}
+        >
             <div ref={rowRef} className="message-row-shell">
                 <MessageItem message={message} />
             </div>
@@ -59,6 +68,8 @@ export default function ChatList({ hideInitialPlaceholder = false }) {
     const hasInitializedScrollRef = useRef(false);
     const isNearBottomRef = useRef(true);
     const scrollRafRef = useRef(null);
+    const measureRafRef = useRef(null);
+    const pendingResetIndexRef = useRef(null);
     const showBackToBottomRef = useRef(false);
     const [listHeight, setListHeight] = useState(0);
     const [showBackToBottom, setShowBackToBottom] = useState(false);
@@ -148,6 +159,18 @@ export default function ChatList({ hideInitialPlaceholder = false }) {
     useEffect(() => {
         sizeMapRef.current = {};
         hasInitializedScrollRef.current = false;
+        isNearBottomRef.current = true;
+        showBackToBottomRef.current = false;
+        setShowBackToBottom(false);
+        if (scrollRafRef.current !== null) {
+            cancelAnimationFrame(scrollRafRef.current);
+            scrollRafRef.current = null;
+        }
+        if (measureRafRef.current !== null) {
+            cancelAnimationFrame(measureRafRef.current);
+            measureRafRef.current = null;
+        }
+        pendingResetIndexRef.current = null;
         listRef.current?.resetAfterIndex(0, true);
     }, [currentSessionId, normalizedKeyword, hideInitialPlaceholder]);
 
@@ -163,8 +186,16 @@ export default function ChatList({ hideInitialPlaceholder = false }) {
             return;
         }
 
+        // Streaming updates can replace the message object many times per second. Only
+        // follow the bottom with one instant correction per frame; never animate from
+        // arbitrary content/measurement updates.
         if (isNearBottomRef.current && outerRef.current) {
-            scrollOuterToBottom('smooth');
+            if (scrollRafRef.current === null) {
+                scrollRafRef.current = requestAnimationFrame(() => {
+                    scrollRafRef.current = null;
+                    scrollOuterToBottom('auto');
+                });
+            }
         }
     }, [displayedMessages, updateNearBottom, scrollOuterToBottom]);
 
@@ -176,16 +207,28 @@ export default function ChatList({ hideInitialPlaceholder = false }) {
         }
 
         sizeMapRef.current[index] = size;
-        if (listRef.current) {
-            listRef.current.resetAfterIndex(index);
+        // Row measurement runs in useLayoutEffect. Apply the new height before the
+        // browser paints; otherwise a long assistant row can visually extend into
+        // the following user row while the RAF is waiting.
+        listRef.current?.resetAfterIndex(index, true);
 
-            if (isNearBottomRef.current) {
-                requestAnimationFrame(() => {
-                    scrollOuterToBottom('smooth');
-                });
-            }
+        // Multiple ResizeObserver callbacks can still arrive in one frame. Keep a
+        // lightweight invalidation pass for any later measurements, but never scroll
+        // from this path.
+        pendingResetIndexRef.current = pendingResetIndexRef.current === null
+            ? index
+            : Math.min(pendingResetIndexRef.current, index);
+        if (listRef.current && measureRafRef.current === null) {
+            measureRafRef.current = requestAnimationFrame(() => {
+                measureRafRef.current = null;
+                const resetIndex = pendingResetIndexRef.current;
+                pendingResetIndexRef.current = null;
+                if (resetIndex !== null) {
+                    listRef.current?.resetAfterIndex(resetIndex, false);
+                }
+            });
         }
-    }, [scrollOuterToBottom]);
+    }, []);
 
     const getItemSize = useCallback((index) => sizeMapRef.current[index] || ESTIMATED_ITEM_HEIGHT, []);
     const listItemData = useMemo(() => ({ messages: displayedMessages, setSize }), [displayedMessages, setSize]);
@@ -194,6 +237,10 @@ export default function ChatList({ hideInitialPlaceholder = false }) {
         if (scrollRafRef.current !== null) {
             cancelAnimationFrame(scrollRafRef.current);
             scrollRafRef.current = null;
+        }
+        if (measureRafRef.current !== null) {
+            cancelAnimationFrame(measureRafRef.current);
+            measureRafRef.current = null;
         }
     }, []);
 
@@ -227,6 +274,7 @@ export default function ChatList({ hideInitialPlaceholder = false }) {
 
             {listHeight > 0 && (
                 <List
+                    key={`${currentSessionId || 'none'}-${normalizedKeyword}-${hideInitialPlaceholder ? 'hidden' : 'shown'}`}
                     ref={listRef}
                     outerRef={outerRef}
                     height={listHeight}

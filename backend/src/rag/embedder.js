@@ -22,6 +22,8 @@ import { OpenAIEmbeddings } from "@langchain/openai";
 import { withRetry } from "../services/resilience.js";
 
 const OPENAI_EMBEDDING_MODEL = "qwen3.7-text-embedding";
+const DEFAULT_MAX_BATCH_CHARS = 12_000;
+const DEFAULT_EMBED_TIMEOUT_MS = 30_000;
 
 function fnv1a(str) {
     let h = 0x811c9dc5;
@@ -113,9 +115,13 @@ function resolveBaseUrl() {
 export function createOpenAiEmbedder({
     modelName = process.env.OPENAI_EMBEDDING_MODEL || OPENAI_EMBEDDING_MODEL,
     batchSize = 25,
+    maxBatchChars = Number(process.env.RAG_EMBED_BATCH_MAX_CHARS) || DEFAULT_MAX_BATCH_CHARS,
+    timeoutMs = Number(process.env.RAG_EMBED_TIMEOUT_MS) || DEFAULT_EMBED_TIMEOUT_MS,
 } = {}) {
     const name = String(modelName || OPENAI_EMBEDDING_MODEL);
     const size = Math.max(1, Math.min(100, Number(batchSize) || 25));
+    const charLimit = Math.max(1_000, Math.min(50_000, Number(maxBatchChars) || DEFAULT_MAX_BATCH_CHARS));
+    const safeTimeout = Math.max(1_000, Math.min(120_000, Number(timeoutMs) || DEFAULT_EMBED_TIMEOUT_MS));
     let client = null;
     const ensureClient = () => {
         if (client) return client;
@@ -130,6 +136,7 @@ export function createOpenAiEmbedder({
                 apiKey: resolveApiKey(),
                 baseURL: resolveBaseUrl(),
             },
+            timeout: safeTimeout,
         });
         return client;
     };
@@ -137,7 +144,26 @@ export function createOpenAiEmbedder({
         dimension: null,
         async embed(texts) {
             const list = (Array.isArray(texts) ? texts : [texts]).map(String);
-            return withRetry(() => ensureClient().embedDocuments(list), { retries: 2 });
+            const vectors = [];
+            for (let start = 0; start < list.length;) {
+                let end = start;
+                let chars = 0;
+                while (end < list.length && (end === start || (end - start < size && chars + list[end].length <= charLimit))) {
+                    chars += list[end].length;
+                    end += 1;
+                }
+                const batch = list.slice(start, end);
+                const result = await withRetry(
+                    () => ensureClient().embedDocuments(batch),
+                    { retries: 2, deadlineMs: safeTimeout },
+                );
+                if (!Array.isArray(result) || result.length !== batch.length) {
+                    throw Object.assign(new Error("embedding response count mismatch"), { code: "EMBEDDING_RESPONSE_MISMATCH" });
+                }
+                vectors.push(...result);
+                start = end;
+            }
+            return vectors;
         },
         async embedOne(text) {
             const [vector] = await this.embed([text]);
@@ -146,4 +172,5 @@ export function createOpenAiEmbedder({
     };
 }
 
+export { DEFAULT_MAX_BATCH_CHARS, DEFAULT_EMBED_TIMEOUT_MS };
 export default { createFakeEmbedder, createOpenAiEmbedder, fnv1a };

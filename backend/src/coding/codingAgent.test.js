@@ -142,6 +142,19 @@ describe("resolveCodingRunTask — server /chat coding-execution gate", () => {
 });
 
 describe("CodeAgentService — bounded, resumable coding loop over a disposable worktree", () => {
+    it("uses safe defaults when the resolver supplies a null budget", () => {
+        const service = new CodeAgentService();
+        const session = service.begin({ userId: OWNER.id }, {
+            run: { id: "run_null_budget", projectId },
+            project: { id: projectId },
+            goal: "smoke",
+            decide: async () => ({ type: "done", summary: "ok" }),
+            budget: null,
+        });
+        expect(session.budget.maxTurns).toBe(8);
+        expect(session.budget.maxActions).toBe(24);
+    });
+
     it("fixes a deterministic bug in the worktree, pauses for an approved command, resumes and summarizes", async () => {
         setCommandAllowlistOverride(["node"]);
         try {
@@ -199,16 +212,46 @@ describe("CodeAgentService — bounded, resumable coding loop over a disposable 
             expect(Array.isArray(finalSnap.result.subTasks)).toBe(true);
             expect(finalSnap.result.subTasks[0].status).toBe("completed");
             expect(finalSnap.result.tokenUsage).toBeNull();
-            // Transcript: read + trusted write + owner-approved command resume = 3 steps;
-            // the resume step is the one that reports ok:true (approved side effect ran).
+            // Transcript: read + trusted write + owner-approved command resume = 3
+            // steps. Every EXECUTED op now reports ok:true (read + write + resume),
+            // so completion guards / the decider ctx can tell the work actually ran.
             expect(finalSnap.result.stepCount).toBe(3);
-            expect(session.steps.filter((s) => s.ok === true).length).toBe(1);
+            expect(session.steps.filter((s) => s.ok === true).length).toBe(3);
             // Budgets held: 3 ops + 1 resume, well under caps.
             expect(finalSnap.actionCount).toBeLessThanOrEqual(6);
             expect(mainStatus()).toBe(""); // main checkout zero changes
         } finally {
             clearCommandAllowlistOverride();
         }
+    });
+
+    it("forces exactly ONE create-file write for the smoke goal even when the decider says done, then completes cleanly", async () => {
+        // Regression: the create-file guard (requiredFileWrite) must fire, the write
+        // must land ok:true, and the NEXT turn the guard must see it done instead of
+        // re-firing the same write until the turn budget halts the session. A decider
+        // that would immediately answer `done` proves the guard — not the model —
+        // drives the mutation.
+        const run = defaultRunService.createRun({ userId: OWNER.id }, { projectId, mode: "trusted" });
+        const goal = "请在当前项目根目录创建一个文件 coding-agent-smoke.txt，只写入一行：coding-agent smoke test。不要修改其他文件，也不要执行命令。";
+        const decider = async () => ({ type: "done", summary: "already satisfied" });
+        const session = defaultCodingAgentService.begin({ userId: OWNER.id }, {
+            run,
+            project: defaultProjectService.get({ userId: OWNER.id }, projectId),
+            goal,
+            decide: decider,
+            budget: { maxTurns: 8, maxActions: 12 },
+        });
+        const snap = await defaultCodingAgentService.run(session);
+
+        expect(snap.phase).toBe("done");
+        const writes = session.steps.filter((s) => s.op === "create_file");
+        expect(writes).toHaveLength(1);
+        expect(writes[0].ok).toBe(true);
+        // The file actually landed in the run's disposable worktree; main checkout untouched.
+        const runFresh = defaultRunService.getRun({ userId: OWNER.id }, run.id);
+        const created = path.join(runFresh.worktreePath, "coding-agent-smoke.txt");
+        expect(fs.readFileSync(created, "utf8")).toBe("coding-agent smoke test\n");
+        expect(mainStatus()).toBe("");
     });
 
     it("halts on the repeated-failure budget when the same op keeps failing", async () => {
@@ -361,5 +404,128 @@ describe("code_agent thin adapter (graph)", () => {
         expect(result.codeResults).toContain("fixed in worktree");
         expect(result.plan).toEqual([]);
         expect(result.tokenUsage).toBeNull();
+    });
+});
+
+describe("R5 — read observation feed (ctx.observations, never durable)", () => {
+    it("feeds read content to the decider and shows the WORKTREE state after a write (refresh)", async () => {
+        const run = defaultRunService.createRun({ userId: OWNER.id }, { projectId, mode: "trusted" });
+        const FIXED = "// intent: return a + b\nexport function add(a, b) {\n  return a + b;\n}\n";
+        const seen = []; // [label, [...ctx.observations]]
+        let phase = 0;
+        const decider = async (ctx) => {
+            const obs = Array.isArray(ctx.observations) ? [...ctx.observations] : [];
+            if (phase === 0) { phase = 1; seen.push(["read1", obs]); return { type: "op", op: "read_file", args: { path: "src/calc.js" }, note: "read bug" }; }
+            if (phase === 1) { phase = 2; seen.push(["beforeWrite", obs]); return { type: "op", op: "write_file", args: { path: "src/calc.js", content: FIXED }, note: "fix sign" }; }
+            if (phase === 2) { phase = 3; seen.push(["read2", obs]); return { type: "op", op: "read_file", args: { path: "src/calc.js" }, note: "read fixed" }; }
+            seen.push(["done", obs]); return { type: "done", summary: "confirmed calc.js fixed in worktree" };
+        };
+
+        const session = defaultCodingAgentService.begin({ userId: OWNER.id }, {
+            run,
+            project: defaultProjectService.get({ userId: OWNER.id }, projectId),
+            goal: "fix calc.js",
+            decide: decider,
+            budget: { maxTurns: 8, maxActions: 12 },
+        });
+        const snap = await defaultCodingAgentService.run(session);
+        expect(snap.phase).toBe("done");
+
+        // ctx.observations reach the decision layer WITHOUT file content ever being
+        // persisted to a step note / transcript.
+        const seenMap = Object.fromEntries(seen);
+        // First read (main checkout — worktree not provisioned yet) saw the buggy line.
+        expect(seenMap.beforeWrite.join("")).toContain("return a - b; // BUG");
+        // Second read (after the write) saw the FIXED line → _refreshRunState re-pinned
+        // capabilityRoot to the freshly-provisioned worktree.
+        expect(seenMap.done.join("")).toContain("return a + b;");
+        expect(session.observations.length).toBeGreaterThanOrEqual(2);
+
+        // Observations live ONLY on the session — steps keep just the decider note.
+        for (const step of session.steps) {
+            const text = `${step.note || ""} ${step.summary || ""}`;
+            expect(text).not.toContain("return a + b;");
+            expect(text).not.toContain("// BUG");
+        }
+        expect(mainStatus()).toBe(""); // main checkout zero changes
+    });
+
+    it("does not count observation snippets toward the transcript budget", async () => {
+        const run = defaultRunService.createRun({ userId: OWNER.id }, { projectId, mode: "trusted" });
+        const decider = async (ctx) => {
+            if (ctx.turn === 1) return { type: "op", op: "read_file", args: { path: "src/calc.js" }, note: "n" };
+            return { type: "done", summary: "d" };
+        };
+        const session = defaultCodingAgentService.begin({ userId: OWNER.id }, {
+            run,
+            project: defaultProjectService.get({ userId: OWNER.id }, projectId),
+            goal: "observe",
+            decide: decider,
+            budget: { maxTurns: 4 },
+        });
+        const snap = await defaultCodingAgentService.run(session);
+        expect(snap.phase).toBe("done");
+        const obsChars = session.observations.join("").length;
+        expect(obsChars).toBeGreaterThan(0);
+        // transcriptChars tracks ONLY step notes/summaries — never the obs snippets.
+        expect(session.transcriptChars).toBeLessThan(obsChars);
+    });
+});
+
+describe("R5 — graph adapter + run lifecycle (real run → completed)", () => {
+    it("runCodingAgentNode completes the run row when the bounded loop finishes", async () => {
+        const run = defaultRunService.createRun({ userId: OWNER.id }, { projectId, mode: "trusted" });
+        const FIXED = "// intent: return a + b\nexport function add(a, b) {\n  return a + b;\n}\n";
+        const steps = [
+            { type: "op", op: "read_file", args: { path: "src/calc.js" }, note: "read bug" },
+            { type: "op", op: "write_file", args: { path: "src/calc.js", content: FIXED }, note: "fix sign" },
+            { type: "op", op: "git.diff", args: {}, note: "confirm" },
+            { type: "done", summary: "fixed calc.js in the worktree (auto-decider mode)" },
+        ];
+        let i = 0;
+        const decider = async () => steps[Math.min(i++, steps.length - 1)];
+        const state = { userInput: "fix calc", plan: [], subTasks: [], currentSubTask: null };
+        const result = await runCodingAgentNode(state, { configurable: {} }, {
+            active: true,
+            scope: { userId: OWNER.id },
+            run,
+            project: defaultProjectService.get({ userId: OWNER.id }, projectId),
+            preset: "trusted",
+            goal: "fix calc",
+            budget: { maxTurns: 8, maxActions: 12 },
+            runService: defaultRunService,
+            lifecycle: true, // ← node must converge the durable run row
+            decider,
+        });
+        expect(result.codeResults).toContain("fixed calc.js");
+        // Durable run is now terminal/completed.
+        const fresh = defaultRunService.getRun({ userId: OWNER.id }, run.id);
+        expect(fresh.status).toBe("completed");
+        // The write landed in the worktree (never the main checkout), and the diff is
+        // reviewable via the run's git.diff read op.
+        const worktreeFile = path.join(fresh.worktreePath, "src", "calc.js");
+        expect(fs.readFileSync(worktreeFile, "utf8")).toContain("return a + b;");
+        expect(mainStatus()).toBe("");
+    });
+
+    it("converges a loop that halts on a budget to failed — never dangles", async () => {
+        const run = defaultRunService.createRun({ userId: OWNER.id }, { projectId, mode: "trusted" });
+        const decider = async () => ({ type: "op", op: "read_file", args: { path: "no-such-file.js" } });
+        const state = { userInput: "boom", plan: [], subTasks: [], currentSubTask: null };
+        await runCodingAgentNode(state, { configurable: {} }, {
+            active: true,
+            scope: { userId: OWNER.id },
+            run,
+            project: defaultProjectService.get({ userId: OWNER.id }, projectId),
+            preset: "trusted",
+            goal: "boom",
+            budget: { maxTurns: 20, maxActions: 20 },
+            runService: defaultRunService,
+            lifecycle: true,
+            decider,
+        });
+        const fresh = defaultRunService.getRun({ userId: OWNER.id }, run.id);
+        expect(fresh.status).toBe("failed");
+        expect(mainStatus()).toBe("");
     });
 });

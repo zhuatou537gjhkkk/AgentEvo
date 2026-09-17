@@ -1,9 +1,13 @@
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { createServer } from "node:http";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { createApp } from "../app.js";
 import { issueAuthToken } from "../auth.js";
 import { initDB } from "../db/index.js";
 import { clearRagFlags } from "../rag/flags.js";
+import { createIngestJob } from "../rag/ingestStore.js";
 
 /**
  * Phase 7 / R4 (roadmap #9) — owner-scoped /rag HTTP contract (real app, native
@@ -20,6 +24,7 @@ import { clearRagFlags } from "../rag/flags.js";
  */
 const PROJECT = "proj_rag_1";
 const servers = [];
+let ingestRoot = null;
 
 async function open(app) {
     const server = createServer(app);
@@ -35,6 +40,8 @@ afterEach(async () => {
         await new Promise((resolve) => server.close(resolve));
     }
     clearRagFlags();
+    if (ingestRoot) await fs.rm(ingestRoot, { recursive: true, force: true });
+    ingestRoot = null;
 });
 
 beforeAll(() => {
@@ -103,12 +110,15 @@ describe("R4 /rag registrar — default dark (all RAG flags off)", () => {
         const base = await open(createApp({ dependencies: { auth: authFor(users) } }));
         const paths = [
             "/rag/telemetry",
+            "/rag/eval-report",
+            "/rag/ingest/ing_not-a-real-job",
+            "/rag/documents",
             `/rag/project/${PROJECT}/index`,
             `/rag/project/${PROJECT}/query`,
             `/rag/project/${PROJECT}/rebuild`,
         ];
         for (const p of paths) {
-            const method = p.endsWith("telemetry") ? "GET" : "POST";
+            const method = p.endsWith("telemetry") || p.endsWith("eval-report") ? "GET" : "POST";
             const response = await fetch(`${base}${p}`, { method });
             expect(response.status).toBe(401);
         }
@@ -120,6 +130,10 @@ describe("R4 /rag registrar — default dark (all RAG flags off)", () => {
         const telemetry = await get(base, "/rag/telemetry", 1);
         expect(telemetry.status).toBe(403);
         expect(telemetry.body.errorCode).toBe("RAG_FEATURE_DISABLED");
+
+        const evalReport = await get(base, "/rag/eval-report", 1);
+        expect(evalReport.status).toBe(403);
+        expect(evalReport.body.errorCode).toBe("RAG_FEATURE_DISABLED");
 
         const index = await post(base, `/rag/project/${PROJECT}/index`, 1, { files: [{ path: "a.js", text: "x" }] });
         expect(index.status).toBe(403);
@@ -400,5 +414,46 @@ describe("R4 /upload durable dual-write wiring", () => {
         });
         expect(response.status).toBe(200);
         expect(await response.json()).toMatchObject({ ok: true });
+    });
+});
+
+describe("K3 asynchronous knowledge ingest HTTP contract", () => {
+    const users = { 1: user(1), 2: user(2) };
+
+    it("returns 202 for a V2 txt upload, exposes only a safe poll contract, and enforces owner scope", async () => {
+        process.env.KNOWLEDGE_INGEST_V2 = "true";
+        ingestRoot = await fs.mkdtemp(path.join(os.tmpdir(), "agentevo-k3-http-"));
+        process.env.KNOWLEDGE_INGEST_STORAGE_ROOT = ingestRoot;
+        const { quota } = uploadFakes();
+        const base = await open(createApp({ dependencies: { auth: authFor(users), quota } }));
+        const form = new FormData();
+        form.append("file", new Blob(["# K3\n\nasync document"], { type: "text/markdown" }), "k3.md");
+        const response = await fetch(`${base}/upload`, { method: "POST", headers: headers(1), body: form });
+        const body = await response.json();
+        expect(response.status).toBe(202);
+        expect(body).toMatchObject({ ok: true, data: { status: "queued", parser: "native" } });
+        expect(body.data.pollUrl).toBe(`/rag/ingest/${body.data.jobId}`);
+        expect(JSON.stringify(body)).not.toContain("storage_key");
+        expect(JSON.stringify(body)).not.toContain("provider_batch_id");
+
+        const own = await get(base, body.data.pollUrl, 1);
+        expect(own.status).toBe(200);
+        expect(own.body.job.id).toBe(body.data.jobId);
+        const crossOwner = await get(base, body.data.pollUrl, 2);
+        expect(crossOwner.status).toBe(404);
+    });
+
+    it("supports retry/cancel endpoints and hides staging/provider fields", async () => {
+        process.env.KNOWLEDGE_INGEST_V2 = "true";
+        const job = createIngestJob({ scope: { userId: 1, tenantId: "user:1" }, fileName: "failed.md", storageKey: "jobs/fail/source.md", mimeType: "text/markdown", fileHash: "a".repeat(64), parser: "native" });
+        // retry is intentionally owner scoped; a queued job cannot be retried,
+        // while cancel remains available before the worker claims it.
+        const base = await open(createApp({ dependencies: { auth: authFor(users) } }));
+        const cancelled = await post(base, `/rag/ingest/${job.id}/cancel`, 1, {});
+        expect(cancelled.status).toBe(200);
+        expect(cancelled.body.job.status).toBe("cancelled");
+        expect(JSON.stringify(cancelled.body)).not.toContain("storage_key");
+        const crossOwner = await post(base, `/rag/ingest/${job.id}/cancel`, 2, {});
+        expect(crossOwner.status).toBe(404);
     });
 });

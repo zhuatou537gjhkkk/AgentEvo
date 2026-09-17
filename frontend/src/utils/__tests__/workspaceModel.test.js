@@ -146,6 +146,15 @@ describe('buildRepoContextRef', () => {
     });
 });
 
+describe('whole-file repository attachment', () => {
+    it('uses a scoped whole_file mode without a fake line range', () => {
+        expect(buildRepoContextRef({ projectId: 'proj_1', path: 'src/chatGraph.js', mode: 'whole_file' })).toEqual({
+            projectId: 'proj_1',
+            refs: [{ path: 'src/chatGraph.js', mode: 'whole_file' }],
+        });
+    });
+});
+
 describe('lineWindowLabel', () => {
     it('renders single-line and range forms', () => {
         expect(lineWindowLabel('src/a.js', 5, 5)).toBe('src/a.js:5');

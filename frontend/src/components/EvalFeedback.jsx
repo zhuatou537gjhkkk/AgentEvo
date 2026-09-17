@@ -8,6 +8,12 @@
 import { useState, useEffect } from "react";
 import { useChatStore } from "../store/chatStore";
 
+// react-window 虚拟列表在流式输出/高度变化/滚动时会把行反复卸载→重挂载,而本组件
+// 每次挂载都会尝试恢复 👍/👎。若每次都发 GET /eval/feedback/:id,配合前端对 429 的
+// 自动重试,会把后端限流瞬间打爆成自持的 429 风暴。这里用整页生命周期去重：
+// 每条真实消息最多只发起一次恢复请求（刷新后本模块重新加载,Set 自然清空,仍能恢复）。
+const restoredMessageIds = new Set();
+
 export default function EvalFeedback({ messageId }) {
     const messageFeedback = useChatStore((s) => s.messageFeedback);
     const submitMessageFeedback = useChatStore((s) => s.submitMessageFeedback);
@@ -19,6 +25,11 @@ export default function EvalFeedback({ messageId }) {
     // 页面刷新后从 DB 恢复已持久化的反馈状态
     useEffect(() => {
         if (loaded || current) return;
+        // 本地临时 id（assistant-* / user-*）从未入库,不可能有持久化反馈,跳过
+        if (!/^\d+$/.test(String(messageId ?? ''))) return;
+        // 该消息在本页生命周期内已尝试过恢复,跳过（虚拟列表重挂载去重）
+        if (restoredMessageIds.has(messageId)) return;
+        restoredMessageIds.add(messageId);
         let cancelled = false;
         (async () => {
             try {

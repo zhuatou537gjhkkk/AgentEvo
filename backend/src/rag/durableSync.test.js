@@ -344,7 +344,7 @@ describe("dualReadUpload", () => {
         expect(canaryRow.status).toBe("hit");
     });
 
-    it("canary ON + durable no_match → rollback servedBy memory with canary-fallback note", async () => {
+    it("canary ON + durable no_match → serves durable no_match instead of unrelated memory hits", async () => {
         enableWrite();
         enableRead();
         const owner = freshOwner();
@@ -353,10 +353,10 @@ describe("dualReadUpload", () => {
             query: "gamma",
             deps: { memoryReader: memoryOk, durableReader: durableNoMatch },
         });
-        expect(result.servedBy).toBe("memory");
+        expect(result.servedBy).toBe("durable");
         expect(result.canary).toBe(true);
-        expect(result.note).toBe("canary-fallback");
-        expect(result.items[0].source).toBe("mem.txt");
+        expect(result.note).toBeNull();
+        expect(result.items).toEqual([]);
         expect(result.durable.status).toBe("no_match");
         expect(result.durable.itemsCount).toBe(0);
         expect(result.agree).toBe(false); // memory hit vs durable miss
@@ -366,11 +366,11 @@ describe("dualReadUpload", () => {
         const durableDual = rows.find((r) => r.mode === "dual-read" && r.source === "durable");
         expect(durableDual.status).toBe("no_match");
         const canaryRow = rows.find((r) => r.mode === "canary");
-        expect(canaryRow.source).toBe("memory");
-        expect(canaryRow.status).toBe("hit");
+        expect(canaryRow.source).toBe("durable");
+        expect(canaryRow.status).toBe("no_match");
     });
 
-    it("canary ON + durable store empty (reader yields null) → memory fallback, no throw", async () => {
+    it("canary ON + durable store empty (reader yields null) → serves durable empty state", async () => {
         enableWrite();
         enableRead();
         const owner = freshOwner();
@@ -380,12 +380,12 @@ describe("dualReadUpload", () => {
             query: "delta",
             deps: { memoryReader: memoryOk, durableReader: async () => null },
         });
-        expect(result.servedBy).toBe("memory");
+        expect(result.servedBy).toBe("durable");
         expect(result.canary).toBe(true);
-        expect(result.note).toBe("canary-fallback");
+        expect(result.note).toBeNull();
         expect(result.durable.status).toBe("empty_store");
         expect(result.durable.itemsCount).toBe(0);
-        expect(result.items[0].source).toBe("mem.txt");
+        expect(result.items).toEqual([]);
 
         const rows = readLog(owner);
         expect(rows).toHaveLength(3);
@@ -393,7 +393,7 @@ describe("dualReadUpload", () => {
         expect(durableDual.status).toBe("no_match");
     });
 
-    it("memoryReader absence (no legacy faiss) + durable empty → memory served, no throw", async () => {
+    it("memoryReader absence (no legacy faiss) + durable empty → durable empty state is served", async () => {
         enableWrite();
         enableRead();
         const owner = freshOwner();
@@ -406,8 +406,8 @@ describe("dualReadUpload", () => {
             query: "epsilon",
             deps: { durableReader: async () => null },
         });
-        expect(result.servedBy).toBe("memory");
-        expect(result.note).toBe("canary-fallback");
+        expect(result.servedBy).toBe("durable");
+        expect(result.note).toBeNull();
         expect(result.memory.status).toBe("no_match"); // empty store normalized
         expect(result.memory.emptyStore).toBe(true);
         expect(result.memory.itemsCount).toBe(0);

@@ -149,11 +149,17 @@ export function normalizeLineRange(startLine, endLine) {
  * Shape sent to /chat as `repo_context`: which trusted project + which file
  * ranges the Graph should attach. Only the server can map this to content.
  */
-export function buildRepoContextRef({ projectId, path, startLine, endLine }) {
-    const { startLine: start, endLine: end } = normalizeLineRange(startLine, endLine);
+export function buildRepoContextRef({ projectId, path, startLine, endLine, mode = 'range' }) {
     if (!projectId || !path) {
         return null;
     }
+    if (mode === 'whole_file') {
+        return {
+            projectId: String(projectId),
+            refs: [{ path: String(path), mode: 'whole_file' }],
+        };
+    }
+    const { startLine: start, endLine: end } = normalizeLineRange(startLine, endLine);
     return {
         projectId: String(projectId),
         refs: [{ path: String(path), startLine: start, endLine: end }],

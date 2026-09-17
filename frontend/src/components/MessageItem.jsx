@@ -194,14 +194,14 @@ function CodeRenderer({ inline, className, children, ...props }) {
 
     return (
         <div className="code-block my-3 overflow-hidden rounded-xl shadow-sm">
-            <div className="flex items-center justify-between border-b border-white/10 px-3 py-2 text-xs text-[var(--code-text)]">
-                <span className="rounded bg-white/10 px-2 py-0.5 font-mono uppercase tracking-wide text-[var(--code-text)]">
+            <div className="code-block-header flex items-center justify-between px-3 py-2 text-xs">
+                <span className="code-block-language rounded px-2 py-0.5 font-mono uppercase tracking-wide">
                     {language}
                 </span>
                 <button
                     type="button"
                     onClick={handleCopy}
-                    className="rounded border border-white/20 px-2 py-0.5 text-[11px] font-medium text-[var(--code-text)] transition hover:bg-white/10"
+                    className="code-block-copy rounded px-2 py-0.5 text-[11px] font-medium transition"
                 >
                     {copied ? '已复制' : '复制代码'}
                 </button>
@@ -216,6 +216,7 @@ function CodeRenderer({ inline, className, children, ...props }) {
                             margin: 0,
                             background: 'transparent',
                             borderRadius: 0,
+                            padding: '0.75rem',
                             fontSize: '0.85rem',
                             lineHeight: 1.6,
                         }}
@@ -372,9 +373,9 @@ function MessageItem({ message }) {
         }
 
         return (
-            <details className="mb-2 rounded-md border border-indigo-200 bg-indigo-50 px-2 py-1 text-xs text-indigo-800 dark:border-indigo-900 dark:bg-indigo-950/40 dark:text-indigo-200">
-                <summary className="cursor-pointer select-none font-medium">思考过程</summary>
-                <div className="mt-2 space-y-1">
+            <details className="thought-card mb-2 rounded-xl px-3 py-2 text-xs">
+                <summary className="thought-card-summary cursor-pointer select-none font-semibold">思考过程</summary>
+                <div className="thought-card-body mt-2 space-y-1">
                     {thoughtLogs.map((log, index) => (
                         <div key={`${log.at || 'thought'}-${index}`} className="whitespace-pre-wrap break-words">
                             {`- ${log.text}${log.status === 'done' ? ' ✅' : log.status === 'error' ? ' ❌' : ''}`}
@@ -504,14 +505,12 @@ function MessageItem({ message }) {
             <div className={`flex w-full gap-3 ${isUser ? 'max-w-[82%] flex-row-reverse sm:max-w-[76%] lg:max-w-[70%]' : 'max-w-full'}`}>
                 <div
                     className={[
-                        'mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[11px] font-bold',
-                        isUser
-                            ? 'bg-[var(--brand)] text-white'
-                            : 'bg-emerald-600 text-white',
+                        'message-avatar mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[11px] font-bold',
+                        isUser ? 'message-avatar-user' : 'message-avatar-assistant',
                     ].join(' ')}
                     aria-hidden="true"
                 >
-                    {isUser ? '你' : 'AI'}
+                    {isUser ? '你' : '✦'}
                 </div>
 
                 <div
@@ -579,6 +578,11 @@ function MessageItem({ message }) {
                             {renderTaskProgress()}
                             {renderToolLogs()}
                             {renderQuestionLogs()}
+                            {message?.memoryCandidateNotice?.count > 0 && (
+                                <div className="mb-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+                                    发现 {message.memoryCandidateNotice.count} 条待确认记忆候选，可在“设置 → 记忆”中审核。
+                                </div>
+                            )}
                             {renderAssistantContent()}
                             {message?.metrics && (
                                 <div className="mt-2 inline-flex flex-wrap items-center gap-2 rounded-md border border-[var(--panel-border)] bg-[var(--panel-bg)] px-2 py-1 text-[11px] text-[var(--text-muted)]">
@@ -660,6 +664,8 @@ export default memo(
         const nextThoughtLogs = nextProps.message?.thoughtLogs || [];
         const prevQuestionLogs = prevProps.message?.questionLogs || [];
         const nextQuestionLogs = nextProps.message?.questionLogs || [];
+        const prevTaskProgress = prevProps.message?.taskProgress || [];
+        const nextTaskProgress = nextProps.message?.taskProgress || [];
 
         const prevLastLog = prevLogs[prevLogs.length - 1];
         const nextLastLog = nextLogs[nextLogs.length - 1];
@@ -678,6 +684,7 @@ export default memo(
             prevLogs.length === nextLogs.length &&
             prevThoughtLogs.length === nextThoughtLogs.length &&
             prevQuestionLogs.length === nextQuestionLogs.length &&
+            JSON.stringify(prevTaskProgress) === JSON.stringify(nextTaskProgress) &&
             prevLastLog?.id === nextLastLog?.id &&
             prevLastLog?.name === nextLastLog?.name &&
             prevLastLog?.status === nextLastLog?.status &&

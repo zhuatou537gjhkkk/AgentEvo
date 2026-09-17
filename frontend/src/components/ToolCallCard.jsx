@@ -29,44 +29,44 @@ const AGENT_LABELS = {
 // ── 状态配置 ───────────────────────────────────────────────
 const STATUS_CONFIG = {
   [ToolStatus.PENDING]: {
-    border: 'border-l-slate-400',
+    border: 'border-l-[var(--status-neutral)]',
     bg: 'bg-[var(--status-neutral-soft)]',
     text: 'text-[var(--status-neutral)]',
     label: '等待中',
   },
   [ToolStatus.EXECUTING]: {
-    border: 'border-l-indigo-400',
+    border: 'border-l-[var(--status-info)]',
     bg: 'bg-[var(--status-info-soft)]',
     text: 'text-[var(--status-info)]',
     label: '执行中',
     pulse: true,
   },
   [ToolStatus.SUCCESS]: {
-    border: 'border-l-emerald-500',
+    border: 'border-l-[var(--status-success)]',
     bg: 'bg-[var(--status-success-soft)]',
     text: 'text-[var(--status-success)]',
     label: '成功',
   },
   [ToolStatus.ERROR]: {
-    border: 'border-l-red-500',
+    border: 'border-l-[var(--status-danger)]',
     bg: 'bg-[var(--status-danger-soft)]',
     text: 'text-[var(--status-danger)]',
     label: '失败',
   },
   [ToolStatus.TIMEOUT]: {
-    border: 'border-l-amber-500',
+    border: 'border-l-[var(--status-warning)]',
     bg: 'bg-[var(--status-warning-soft)]',
     text: 'text-[var(--status-warning)]',
     label: '超时',
   },
   [ToolStatus.CANCELLED]: {
-    border: 'border-l-slate-400',
+    border: 'border-l-[var(--status-neutral)]',
     bg: 'bg-[var(--status-neutral-soft)]',
     text: 'text-[var(--status-neutral)]',
     label: '已取消',
   },
   [ToolStatus.WAITING_USER]: {
-    border: 'border-l-amber-500',
+    border: 'border-l-[var(--status-warning)]',
     bg: 'bg-[var(--status-warning-soft)]',
     text: 'text-[var(--status-warning)]',
     label: '等待回答',
@@ -77,35 +77,35 @@ const STATUS_CONFIG = {
 // ── 工具组聚合状态配置 ────────────────────────────────────
 const GROUP_STATUS_CONFIG = {
   [ToolStatus.EXECUTING]: {
-    border: 'border-l-indigo-400',
+    border: 'border-l-[var(--status-info)]',
     bg: 'bg-[var(--status-info-soft)]',
     text: 'text-[var(--status-info)]',
     label: '正在执行',
     pulse: true,
   },
   [ToolStatus.SUCCESS]: {
-    border: 'border-l-emerald-500',
+    border: 'border-l-[var(--status-success)]',
     bg: 'bg-[var(--status-success-soft)]',
     text: 'text-[var(--status-success)]',
     label: '执行完成',
     pulse: false,
   },
   [ToolStatus.ERROR]: {
-    border: 'border-l-red-500',
+    border: 'border-l-[var(--status-danger)]',
     bg: 'bg-[var(--status-danger-soft)]',
     text: 'text-[var(--status-danger)]',
     label: '部分失败',
     pulse: false,
   },
   [ToolStatus.PENDING]: {
-    border: 'border-l-slate-500',
+    border: 'border-l-[var(--status-neutral)]',
     bg: 'bg-[var(--status-neutral-soft)]',
     text: 'text-[var(--status-neutral)]',
     label: '等待中',
     pulse: false,
   },
   [ToolStatus.WAITING_USER]: {
-    border: 'border-l-amber-400',
+    border: 'border-l-[var(--status-warning)]',
     bg: 'bg-[var(--status-warning-soft)]',
     text: 'text-[var(--status-warning)]',
     label: '等待用户回答',
@@ -170,7 +170,7 @@ function ToolGroupCard({ group, isTyping }) {
       >
         {/* Spinner */}
         {aggregate.hasExecuting && (
-          <span className="inline-block h-3 w-3 shrink-0 rounded-full border-2 border-blue-400 border-t-transparent animate-tool-spin" />
+          <span className="inline-block h-3 w-3 shrink-0 rounded-full border-2 border-[var(--status-info)] border-t-transparent animate-tool-spin" />
         )}
 
         <span className={config.text}>
@@ -180,7 +180,7 @@ function ToolGroupCard({ group, isTyping }) {
 
         {/* 成功/失败计数 */}
         {aggregate.hasError && !aggregate.hasExecuting && (
-          <span className="text-red-400/70">
+          <span className="text-[var(--status-danger)]">
             (
             {group.filter((e) => e.status === ToolStatus.SUCCESS).length} 成功 /{' '}
             {group.filter((e) => e.status === ToolStatus.ERROR || e.status === ToolStatus.TIMEOUT).length} 失败
@@ -225,7 +225,7 @@ function ToolCallCard({ log, isTyping }) {
       <div className="flex items-center gap-2 text-xs">
         {/* Spinner */}
         {status === ToolStatus.EXECUTING && (
-          <span className="inline-block h-3 w-3 shrink-0 rounded-full border-2 border-blue-400 border-t-transparent animate-tool-spin" />
+          <span className="inline-block h-3 w-3 shrink-0 rounded-full border-2 border-[var(--status-info)] border-t-transparent animate-tool-spin" />
         )}
 
         {/* 图标 + 名称 */}
@@ -235,7 +235,7 @@ function ToolCallCard({ log, isTyping }) {
 
         {/* Phase 2: Agent 身份徽章 — 仅非默认 react 类型时显示 */}
         {log.agentType && log.agentType !== 'react' && (
-          <span className="rounded bg-purple-500/10 px-1.5 py-0.5 text-[10px] text-purple-400 border border-purple-500/20">
+          <span className="rounded bg-purple-500/10 px-1.5 py-0.5 text-[10px] text-[var(--brand-start)] border border-[var(--glass-border)]">
             {AGENT_LABELS[log.agentType] || log.agentName || log.agentType}
           </span>
         )}
@@ -249,7 +249,7 @@ function ToolCallCard({ log, isTyping }) {
 
         {/* 重试次数 */}
         {log.retryCount > 0 && (
-          <span className="text-amber-400">
+          <span className="text-[var(--status-warning)]">
             (重试 {log.retryCount} 次)
           </span>
         )}
@@ -264,7 +264,7 @@ function ToolCallCard({ log, isTyping }) {
           <button
             type="button"
             onClick={() => retryToolCall(log.id)}
-            className="ml-auto rounded border border-red-500/40 px-2 py-0.5 text-[10px] text-red-300 hover:bg-red-500/10 transition"
+            className="ml-auto rounded border border-[var(--status-danger)] px-2 py-0.5 text-[10px] text-[var(--status-danger)] hover:bg-[var(--status-danger-soft)] transition"
           >
             重试
           </button>

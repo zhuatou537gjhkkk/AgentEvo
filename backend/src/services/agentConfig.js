@@ -62,6 +62,10 @@ const DEFAULTS = {
     "memory.consolidateThreshold": "0.7",
     "memory.autoForgetThreshold": "0.3",
     "memory.autoForgetDays": "30",
+    "memory.crossSource.experimentAllocation": "0",
+    "memory.crossSource.experimentKey": "memory-cross-source-v1",
+    "memory.crossSource.scoreWeights": "{\"relevance\":0.5,\"confidence\":0.2,\"importance\":0.1,\"recency\":0.1,\"trust\":0.1}",
+    "memory.crossSource.configVersionId": "",
 };
 
 // 缓存 TTL：5 分钟

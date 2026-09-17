@@ -12,6 +12,7 @@ import { notFoundResource } from "../security/resourceScope.js";
 import { codingCapabilities, codingEventLogEnabled, codingWorkspaceEnabled } from "../coding/flags.js";
 import { scopeFromRequest } from "../security/resourceScope.js";
 import { prepareRunOpRequest } from "../coding/runner/protocol.js";
+import { defaultLandToMainService } from "../coding/landToMain.js";
 
 function workspaceGate(req, res, next) {
     if (!codingWorkspaceEnabled()) {
@@ -361,6 +362,21 @@ export function registerCodingRoutes(router, { requireAuth }) {
         try {
             const run = await services(req).worktrees.teardown(ctx.scope, { project: ctx.project, run: ctx.run });
             return res.json({ ok: true, run });
+        } catch (error) {
+            return sendError(res, req.requestId, error);
+        }
+    });
+
+    // Apply a COMPLETED run's disposable-worktree changes onto the real project
+    // checkout's WORKING TREE (no commit, no staging). Owner-invoked bridge across
+    // the run-isolation boundary; the patch is re-checked for conflicts before any
+    // real file is touched (see landToMain.js). Never commits on the owner's repo.
+    coding.post("/runs/:runId/land", async (req, res) => {
+        const ctx = fetchRunProject(req, res, services(req));
+        if (!ctx) return;
+        try {
+            const result = await defaultLandToMainService.land(ctx.scope, { run: ctx.run, project: ctx.project });
+            return res.json({ ok: true, ...result });
         } catch (error) {
             return sendError(res, req.requestId, error);
         }

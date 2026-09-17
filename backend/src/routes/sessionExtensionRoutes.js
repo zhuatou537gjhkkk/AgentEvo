@@ -1,5 +1,8 @@
 import { toErrorEnvelope } from "../services/resilience.js";
 import { calculateContextUsage } from "../services/contextUsage.js";
+import { parseCompactionResult } from "../services/workingMemory.js";
+import { workingMemoryEnabled } from "../services/memoryFlags.js";
+import { MemoryService } from "../services/memory.js";
 
 function dependency(req, name) {
     const db = req.locals?.dependencies?.db || req.app?.locals?.dependencies?.db;
@@ -18,6 +21,18 @@ function invalid(res, requestId, code, message) {
         code,
         statusCode: 400,
     }), requestId));
+}
+
+async function persistCompactionWorkingState(req, sessionId, taskState) {
+    if (!workingMemoryEnabled() || !taskState) return;
+    try {
+        const services = req.locals?.dependencies?.services || req.app?.locals?.dependencies?.services || {};
+        const createMemoryService = services.createMemoryService || ((userId) => new MemoryService(userId));
+        const memory = createMemoryService(req.user.id);
+        await memory.upsertSessionWorkingState(sessionId, taskState, { source: "compression", taskStatus: "active" });
+    } catch (error) {
+        console.warn(`[memory][working] compaction state write failed code=${error?.code || "WORKING_MEMORY_COMPACTION_FAILED"}`);
+    }
 }
 
 /**
@@ -57,7 +72,8 @@ export function registerSessionExtensionRoutes(router, { requireAuth, estimateTo
                 .map((message) => `[${message.role === "user" ? "用户" : "助手"}]: ${message.content}`)
                 .join("\n\n");
             const tokensBefore = messagesToCompact.reduce((sum, message) => sum + (message.metrics?.total_tokens || estimateTokens(String(message.content || ""))), 0);
-            const summaryContent = String(await buildCompactionSummary(conversationText.slice(0, 12000), req) || "").trim();
+            const compaction = parseCompactionResult(await buildCompactionSummary(conversationText.slice(0, 12000), req));
+            const summaryContent = compaction.summary;
             if (!summaryContent) throw Object.assign(new Error("summary unavailable"), { code: "LLM_FAILED", statusCode: 503 });
             const summaryTokens = estimateTokens(summaryContent);
             dependency(req, "saveMessage")(
@@ -66,6 +82,7 @@ export function registerSessionExtensionRoutes(router, { requireAuth, estimateTo
                 "system",
                 `[上下文压缩摘要 — ${new Date().toLocaleString("zh-CN")}]\n${summaryContent}`
             );
+            await persistCompactionWorkingState(req, sessionId, compaction.taskState);
             return res.json({ ok: true, data: {
                 summary: summaryContent,
                 tokensSaved: Math.max(0, tokensBefore - summaryTokens),

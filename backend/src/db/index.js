@@ -3,6 +3,9 @@ import crypto from "node:crypto";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { evaluateMemoryRetention } from "../services/memoryRetention.js";
+import { memoryContractEnabled } from "../services/memoryFlags.js";
+import { buildUserMemoryProvenance } from "../services/memoryContract.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -187,6 +190,56 @@ function ensureScopedSchema(defaultUserId) {
     )`).run();
     db.prepare("CREATE INDEX IF NOT EXISTS idx_config_overrides_scope ON agent_config_overrides(owner_user_id, tenant_id)").run();
 
+    // M14: content-free, owner-scoped experiment snapshots and manual release
+    // decisions. Reports are append-only observations; approvals never mutate
+    // AgentConfig and are kept as an audit trail for a later manual change.
+    db.prepare(`CREATE TABLE IF NOT EXISTS cross_source_experiment_reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_user_id INTEGER NOT NULL,
+        tenant_id TEXT NOT NULL,
+        report_key TEXT NOT NULL,
+        period_start DATETIME,
+        period_end DATETIME,
+        experiment_key TEXT,
+        config_version_id INTEGER,
+        report_json TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_cross_source_reports_scope ON cross_source_experiment_reports(owner_user_id, tenant_id, created_at)").run();
+    db.prepare(`CREATE TABLE IF NOT EXISTS cross_source_experiment_approvals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        report_id INTEGER,
+        owner_user_id INTEGER NOT NULL,
+        tenant_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        from_config_version_id INTEGER,
+        target_config_version_id INTEGER,
+        note TEXT,
+        actor_user_id INTEGER NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id),
+        FOREIGN KEY (actor_user_id) REFERENCES users(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_cross_source_approvals_scope ON cross_source_experiment_approvals(owner_user_id, tenant_id, created_at)").run();
+    db.prepare(`CREATE TABLE IF NOT EXISTS cross_source_experiment_jobs (
+        owner_user_id INTEGER NOT NULL,
+        tenant_id TEXT NOT NULL,
+        job_name TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'ready',
+        holder_token TEXT,
+        lease_expires_at DATETIME,
+        next_run_at DATETIME,
+        last_run_at DATETIME,
+        last_report_id INTEGER,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_error_code TEXT,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (owner_user_id, tenant_id, job_name),
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_cross_source_jobs_due ON cross_source_experiment_jobs(status, next_run_at, lease_expires_at)").run();
+
     db.prepare(`CREATE TABLE IF NOT EXISTS mcp_server_configs (
         id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
         scope_type TEXT NOT NULL DEFAULT 'user', owner_user_id INTEGER, tenant_id TEXT,
@@ -196,6 +249,68 @@ function ensureScopedSchema(defaultUserId) {
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (owner_user_id) REFERENCES users(id)
     )`).run();
     db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_configs_scope_name ON mcp_server_configs(scope_type, owner_user_id, tenant_id, name)").run();
+
+    // MCP observability/evaluation — additive and owner-scoped. These tables
+    // intentionally stay separate from eval_scores: protocol availability,
+    // tool-call quality, and end-to-end answer quality are different layers.
+    db.prepare(`CREATE TABLE IF NOT EXISTS mcp_operation_observations (
+        operation_id TEXT PRIMARY KEY,
+        owner_user_id INTEGER NOT NULL,
+        tenant_id TEXT NOT NULL,
+        request_id TEXT,
+        trace_id TEXT,
+        span_id TEXT,
+        server_name TEXT NOT NULL,
+        tool_name TEXT,
+        operation TEXT NOT NULL,
+        status TEXT NOT NULL,
+        error_code TEXT,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        schema_status TEXT NOT NULL DEFAULT 'not_checked',
+        subtask_id TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_mcp_obs_scope_time ON mcp_operation_observations(owner_user_id, tenant_id, created_at)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_mcp_obs_server_tool ON mcp_operation_observations(owner_user_id, tenant_id, server_name, tool_name, created_at)").run();
+    db.prepare(`CREATE TABLE IF NOT EXISTS mcp_eval_runs (
+        run_id TEXT PRIMARY KEY,
+        owner_user_id INTEGER NOT NULL,
+        tenant_id TEXT NOT NULL,
+        dataset_version TEXT NOT NULL,
+        case_ids_json TEXT NOT NULL DEFAULT '[]',
+        config_id TEXT,
+        variant TEXT NOT NULL DEFAULT 'fixture',
+        status TEXT NOT NULL DEFAULT 'running',
+        summary_json TEXT NOT NULL DEFAULT '{}',
+        started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        completed_at DATETIME,
+        baseline_run_id TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_mcp_eval_runs_scope ON mcp_eval_runs(owner_user_id, tenant_id, created_at)").run();
+    db.prepare(`CREATE TABLE IF NOT EXISTS mcp_eval_case_results (
+        run_id TEXT NOT NULL,
+        case_id TEXT NOT NULL,
+        owner_user_id INTEGER NOT NULL,
+        tenant_id TEXT NOT NULL,
+        layer TEXT NOT NULL,
+        status TEXT NOT NULL,
+        checks_json TEXT NOT NULL DEFAULT '[]',
+        failure_class TEXT,
+        observation_ids_json TEXT NOT NULL DEFAULT '[]',
+        trace_ids_json TEXT NOT NULL DEFAULT '[]',
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        sample_json TEXT NOT NULL DEFAULT '{}',
+        evidence_summary TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (run_id, case_id),
+        FOREIGN KEY (run_id) REFERENCES mcp_eval_runs(run_id),
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_mcp_eval_cases_scope ON mcp_eval_case_results(owner_user_id, tenant_id, created_at)").run();
 
     db.prepare(`CREATE TABLE IF NOT EXISTS chat_idempotency (
         owner_user_id INTEGER NOT NULL,
@@ -456,6 +571,27 @@ function ensureScopedSchema(defaultUserId) {
     )`).run();
     db.prepare("CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_scope_project ON knowledge_chunks(owner_user_id, tenant_id, project_id, stale)").run();
     db.prepare("CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_doc ON knowledge_chunks(document_id, chunk_index)").run();
+    // K4 structure-aware document chunks. Existing project-code rows default to
+    // leaf/null-compatible values and remain searchable without a rewrite.
+    ensureColumn("knowledge_chunks", "chunk_level", "TEXT NOT NULL DEFAULT 'leaf'");
+    ensureColumn("knowledge_chunks", "parent_chunk_id", "INTEGER");
+    ensureColumn("knowledge_chunks", "page_start", "INTEGER");
+    ensureColumn("knowledge_chunks", "page_end", "INTEGER");
+    ensureColumn("knowledge_chunks", "heading_path", "TEXT NOT NULL DEFAULT '[]'");
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_parent ON knowledge_chunks(document_id, parent_chunk_id, chunk_level)").run();
+
+    // K13 — one durable generation per owner/tenant/project. Readers in other
+    // backend processes use this small row to detect an activated revision and
+    // rebuild their local vector cache without an in-process notification.
+    db.prepare(`CREATE TABLE IF NOT EXISTS knowledge_index_generations (
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        generation INTEGER NOT NULL DEFAULT 0,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (owner_user_id, tenant_id, project_id),
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_knowledge_index_generations_updated ON knowledge_index_generations(updated_at)").run();
 
     db.prepare(`CREATE TABLE IF NOT EXISTS project_memory (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -490,11 +626,134 @@ function ensureScopedSchema(defaultUserId) {
         items INTEGER NOT NULL DEFAULT 0,
         latency_ms REAL NOT NULL DEFAULT 0,
         groundedness REAL,
+        lexical_count INTEGER NOT NULL DEFAULT 0,
+        embedding_count INTEGER NOT NULL DEFAULT 0,
+        fusion_count INTEGER NOT NULL DEFAULT 0,
+        rerank_count INTEGER NOT NULL DEFAULT 0,
+        rerank_latency_ms REAL NOT NULL DEFAULT 0,
+        compression_ratio REAL,
+        embedding_calls INTEGER NOT NULL DEFAULT 0,
+        embedding_latency_ms REAL NOT NULL DEFAULT 0,
+        embedding_error_code TEXT,
+        rewrite_applied INTEGER NOT NULL DEFAULT 0,
+        rewrite_latency_ms REAL NOT NULL DEFAULT 0,
+        rewrite_model TEXT,
+        rewrite_calls INTEGER NOT NULL DEFAULT 0,
+        rewrite_fallback INTEGER NOT NULL DEFAULT 0,
+        rewrite_fallback_code TEXT,
+        rewrite_contextual INTEGER NOT NULL DEFAULT 0,
+        rewrite_context_used TEXT NOT NULL DEFAULT '[]',
+        rewrite_recent_turn_count INTEGER NOT NULL DEFAULT 0,
+        rewrite_summary_present INTEGER NOT NULL DEFAULT 0,
+        rewrite_working_memory_present INTEGER NOT NULL DEFAULT 0,
+        rewrite_context_tokens INTEGER NOT NULL DEFAULT 0,
+        rerank_applied INTEGER NOT NULL DEFAULT 0,
+        rerank_fallback INTEGER NOT NULL DEFAULT 0,
+        rerank_model TEXT,
+        rerank_calls INTEGER NOT NULL DEFAULT 0,
+        llm_calls INTEGER NOT NULL DEFAULT 0,
+        llm_input_tokens INTEGER NOT NULL DEFAULT 0,
+        llm_output_tokens INTEGER NOT NULL DEFAULT 0,
+        served_mode TEXT,
+        fallback_code TEXT,
+        vector_backend TEXT,
+        vector_search_latency_ms REAL NOT NULL DEFAULT 0,
+        vector_index_load_ms REAL NOT NULL DEFAULT 0,
+        vector_index_build_ms REAL NOT NULL DEFAULT 0,
+        vector_index_generation INTEGER,
+        vector_index_chunk_count INTEGER NOT NULL DEFAULT 0,
+        faiss_fallback_code TEXT,
+        faiss_compare_overlap REAL,
+        faiss_compare_score_delta REAL,
+        faiss_compare_linear_latency_ms REAL NOT NULL DEFAULT 0,
+        faiss_compare_search_latency_ms REAL NOT NULL DEFAULT 0,
+        selected_chunk_ids TEXT NOT NULL DEFAULT '[]',
+        selected_document_ids TEXT NOT NULL DEFAULT '[]',
         query_preview TEXT NOT NULL DEFAULT '',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (owner_user_id) REFERENCES users(id)
     )`).run();
+    addColumn("knowledge_query_log", "lexical_count", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "embedding_count", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "fusion_count", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "rerank_count", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "rerank_latency_ms", "REAL NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "compression_ratio", "REAL");
+    addColumn("knowledge_query_log", "embedding_calls", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "embedding_latency_ms", "REAL NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "embedding_error_code", "TEXT");
+    addColumn("knowledge_query_log", "rewrite_applied", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "rewrite_latency_ms", "REAL NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "rewrite_model", "TEXT");
+    addColumn("knowledge_query_log", "rewrite_calls", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "rewrite_fallback", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "rewrite_fallback_code", "TEXT");
+    addColumn("knowledge_query_log", "rewrite_contextual", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "rewrite_context_used", "TEXT NOT NULL DEFAULT '[]'");
+    addColumn("knowledge_query_log", "rewrite_recent_turn_count", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "rewrite_summary_present", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "rewrite_working_memory_present", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "rewrite_context_tokens", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "rerank_applied", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "rerank_fallback", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "rerank_model", "TEXT");
+    addColumn("knowledge_query_log", "rerank_calls", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "llm_calls", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "llm_input_tokens", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "llm_output_tokens", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "served_mode", "TEXT");
+    addColumn("knowledge_query_log", "fallback_code", "TEXT");
+    addColumn("knowledge_query_log", "vector_backend", "TEXT");
+    addColumn("knowledge_query_log", "vector_search_latency_ms", "REAL NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "vector_index_load_ms", "REAL NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "vector_index_build_ms", "REAL NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "vector_index_generation", "INTEGER");
+    addColumn("knowledge_query_log", "vector_index_chunk_count", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "faiss_fallback_code", "TEXT");
+    addColumn("knowledge_query_log", "faiss_compare_overlap", "REAL");
+    addColumn("knowledge_query_log", "faiss_compare_score_delta", "REAL");
+    addColumn("knowledge_query_log", "faiss_compare_linear_latency_ms", "REAL NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "faiss_compare_search_latency_ms", "REAL NOT NULL DEFAULT 0");
+    addColumn("knowledge_query_log", "selected_chunk_ids", "TEXT NOT NULL DEFAULT '[]'");
+    addColumn("knowledge_query_log", "selected_document_ids", "TEXT NOT NULL DEFAULT '[]'");
     db.prepare("CREATE INDEX IF NOT EXISTS idx_knowledge_query_log_scope_at ON knowledge_query_log(owner_user_id, tenant_id, created_at)").run();
+
+    // Phase 7 / K2 — asynchronous knowledge ingest jobs. The row stores only
+    // lifecycle facts and relative storage keys; provider credentials, signed
+    // URLs, raw provider messages, and document正文 never cross this boundary.
+    db.prepare(`CREATE TABLE IF NOT EXISTS knowledge_ingest_jobs (
+        id TEXT PRIMARY KEY,
+        owner_user_id INTEGER NOT NULL, tenant_id TEXT NOT NULL,
+        source_session_id INTEGER,
+        project_id TEXT NOT NULL DEFAULT 'uploaded-documents',
+        file_name TEXT NOT NULL, storage_key TEXT NOT NULL,
+        mime_type TEXT NOT NULL, file_hash TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL DEFAULT 0,
+        parser TEXT NOT NULL DEFAULT 'native', parser_version TEXT,
+        status TEXT NOT NULL DEFAULT 'queued',
+        provider_batch_id TEXT, provider_task_id TEXT, provider_trace_id TEXT,
+        progress_current INTEGER NOT NULL DEFAULT 0,
+        progress_total INTEGER NOT NULL DEFAULT 0,
+        progress_unit TEXT NOT NULL DEFAULT 'stage',
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 3,
+        next_attempt_at DATETIME,
+        lease_token TEXT, lease_expires_at DATETIME,
+        document_id TEXT, error_code TEXT, retryable INTEGER NOT NULL DEFAULT 0,
+        options_json TEXT NOT NULL DEFAULT '{}',
+        result_meta_json TEXT NOT NULL DEFAULT '{}',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        started_at DATETIME, finished_at DATETIME,
+        FOREIGN KEY (owner_user_id) REFERENCES users(id)
+    )`).run();
+    ensureColumn("knowledge_ingest_jobs", "heartbeat_at", "DATETIME");
+    ensureColumn("knowledge_ingest_jobs", "failure_count", "INTEGER NOT NULL DEFAULT 0");
+    ensureColumn("knowledge_ingest_jobs", "reclaim_count", "INTEGER NOT NULL DEFAULT 0");
+    ensureColumn("knowledge_ingest_jobs", "last_backoff_seconds", "INTEGER NOT NULL DEFAULT 0");
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ingest_jobs_scope_status ON knowledge_ingest_jobs(owner_user_id, tenant_id, status, created_at)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ingest_jobs_due ON knowledge_ingest_jobs(status, next_attempt_at, lease_expires_at)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ingest_jobs_hash ON knowledge_ingest_jobs(owner_user_id, tenant_id, file_hash, parser, status)").run();
 
     // ── Phase 7 / R6 — offline coding benchmark runs (additive) ──
     // One row per benchmark execution of a fixed-revision scenario. It records the
@@ -578,9 +837,33 @@ function ensureScopedSchema(defaultUserId) {
     db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
         .run("R4-KNOWLEDGE-1", JSON.stringify({ policy: "additive owner/tenant/project-scoped knowledge_documents/knowledge_chunks/project_memory/knowledge_query_log; file-hash revisions supersede old chunks (stale); durable vectors persisted as chunk embedding JSON in the same DB for restart rebuild; no legacy rewrite", tables: 4 }));
     db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("RAG-KB-V2-1", JSON.stringify({ policy: "additive owner/tenant-scoped asynchronous knowledge ingest jobs; SQLite lease reclaim after expiry; no provider secrets, signed URLs, raw provider messages, or document正文 in rows", table: "knowledge_ingest_jobs" }));
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("RAG-KB-V2-2", JSON.stringify({ policy: "additive structure-aware parent/leaf chunk metadata; staged document revision activation keeps prior active revision readable until indexing completes", columns: ["chunk_level", "parent_chunk_id", "page_start", "page_end", "heading_path"] }));
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("RAG-KB-V2-3", JSON.stringify({ policy: "additive owner-scoped retrieval quality telemetry; IDs/counts/latency only, never正文/token/provider raw errors", table: "knowledge_query_log", columns: ["lexical_count", "embedding_count", "fusion_count", "rerank_count", "rerank_latency_ms", "compression_ratio", "embedding_calls", "served_mode", "fallback_code", "selected_chunk_ids", "selected_document_ids"] }));
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("RAG-KB-V2-4", JSON.stringify({ policy: "additive owner-scoped LLM retrieval telemetry; aliases/counts/latency/token counts only, never prompt/body/provider raw", table: "knowledge_query_log", columns: ["rewrite_applied", "rewrite_latency_ms", "rewrite_model", "rerank_applied", "rerank_fallback", "rerank_model", "llm_calls", "llm_input_tokens", "llm_output_tokens"] }));
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("RAG-KB-V2-5", JSON.stringify({ policy: "additive per-stage retrieval telemetry; statuses/call counts/latencies/fallback codes only, never prompt/body/provider raw", table: "knowledge_query_log", columns: ["embedding_latency_ms", "embedding_error_code", "rewrite_calls", "rewrite_fallback", "rewrite_fallback_code", "rerank_calls"] }));
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("RAG-KB-CONTEXT-REWRITE-1", JSON.stringify({ policy: "additive contextual rewrite diagnostics; source names/counts/token budgets only, never history/summary/working-memory content", table: "knowledge_query_log", columns: ["rewrite_contextual", "rewrite_context_used", "rewrite_recent_turn_count", "rewrite_summary_present", "rewrite_working_memory_present", "rewrite_context_tokens"] }));
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("RAG-KB-K13-1", JSON.stringify({ policy: "additive owner/tenant/project index generation plus ingest heartbeat/failure/reclaim/backoff counters; SQLite is single-host multi-process candidate only", tables: ["knowledge_index_generations"], columns: ["heartbeat_at", "failure_count", "reclaim_count", "last_backoff_seconds"] }));
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("RAG-KB-FAISS-1", JSON.stringify({ policy: "additive owner/tenant/project FAISS telemetry only; SQLite embeddings remain the source of truth; IndexFlatIP derived files are rebuildable and never contain document text/query/token/provider/path data", table: "knowledge_query_log", columns: ["vector_backend", "vector_search_latency_ms", "vector_index_load_ms", "vector_index_build_ms", "vector_index_generation", "vector_index_chunk_count", "faiss_fallback_code", "faiss_compare_overlap", "faiss_compare_score_delta", "faiss_compare_linear_latency_ms", "faiss_compare_search_latency_ms"] }));
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
         .run("R6-BENCH-1", JSON.stringify({ policy: "additive owner-scoped bench_runs (offline coding benchmark results: scenario/head/driver/linkage + sanitized metrics/reward/result); consent gates export; no legacy rewrite", table: "bench_runs" }));
     db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
         .run("R6-BENCH-2", JSON.stringify({ policy: "additive bench_run_raws (sanitized canonical raw per bench run, owner-consented source for trajectory/dataset export); no legacy rewrite", table: "bench_run_raws" }));
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("MEMORY-M3-1", JSON.stringify({ policy: "additive trusted-memory category and relation provenance; no legacy rewrite", columns: ["category", "relation_type", "related_memory_id"] }));
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("MEMORY-M14-1", JSON.stringify({ policy: "additive owner-scoped cross-source experiment reports and manual approval audit; content-free aggregates only; no legacy rewrite", tables: ["cross_source_experiment_reports", "cross_source_experiment_approvals"] }));
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("MEMORY-M15-1", JSON.stringify({ policy: "additive owner-scoped cross-source sampler lease; expired leases are reclaimable; no legacy rewrite", table: "cross_source_experiment_jobs" }));
+    db.prepare(`INSERT OR IGNORE INTO security_migration_audit (migration, details) VALUES (?, ?)`)
+        .run("MEMORY-WORKING-1", JSON.stringify({ policy: "additive session-scoped working-memory expiry; fixed-key upsert and soft invalidation; no legacy rewrite", column: "agent_memory.expires_at" }));
 
 }
 
@@ -763,6 +1046,40 @@ export function initDB() {
         `
     ).run();
 
+    // Phase 4 / trusted memory lifecycle — additive migration. Existing rows
+    // are active by default so enabling the new reader does not erase the
+    // behavior users already rely on.
+    ensureColumn("agent_memory", "status", "TEXT NOT NULL DEFAULT 'active'");
+    ensureColumn("agent_memory", "source", "TEXT NOT NULL DEFAULT 'manual'");
+    ensureColumn("agent_memory", "confidence", "REAL NOT NULL DEFAULT 1.0");
+    ensureColumn("agent_memory", "memory_key", "TEXT");
+    ensureColumn("agent_memory", "supersedes_id", "INTEGER");
+    ensureColumn("agent_memory", "superseded_by", "INTEGER");
+    ensureColumn("agent_memory", "invalidated_at", "DATETIME");
+    ensureColumn("agent_memory", "invalidate_reason", "TEXT");
+    ensureColumn("agent_memory", "pinned", "INTEGER NOT NULL DEFAULT 0");
+    ensureColumn("agent_memory", "last_recalled_at", "DATETIME");
+    ensureColumn("agent_memory", "recall_count", "INTEGER NOT NULL DEFAULT 0");
+    // Trusted memory M3 — relation semantics remain additive. Old rows are
+    // independent/uncategorized until they are edited or re-observed.
+    ensureColumn("agent_memory", "category", "TEXT NOT NULL DEFAULT 'uncategorized'");
+    ensureColumn("agent_memory", "relation_type", "TEXT NOT NULL DEFAULT 'independent'");
+    ensureColumn("agent_memory", "related_memory_id", "INTEGER");
+    // Optional user-memory vector recall. Vectors remain physically isolated
+    // from project knowledge_chunks and are only used for active user memory.
+    ensureColumn("agent_memory", "embedding", "TEXT");
+    ensureColumn("agent_memory", "embedding_model", "TEXT");
+    ensureColumn("agent_memory", "embedding_source_hash", "TEXT");
+    ensureColumn("agent_memory", "embedding_updated_at", "DATETIME");
+    // Working-memory V1 uses the existing agent_memory table. The expiry is
+    // additive so active working snapshots can be filtered without trusting a
+    // JSON metadata field or physically deleting history.
+    ensureColumn("agent_memory", "expires_at", "DATETIME");
+    db.prepare("UPDATE agent_memory SET status = 'active' WHERE status IS NULL OR TRIM(status) = ''").run();
+    db.prepare("UPDATE agent_memory SET source = 'manual' WHERE source IS NULL OR TRIM(source) = ''").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_agent_memory_lifecycle ON agent_memory(user_id, status, memory_type)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_agent_memory_key ON agent_memory(user_id, memory_key, status)").run();
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_agent_memory_relation ON agent_memory(user_id, related_memory_id, relation_type)").run();
     db.prepare(
         `CREATE INDEX IF NOT EXISTS idx_agent_memory_user_id ON agent_memory(user_id)`
     ).run();
@@ -771,6 +1088,10 @@ export function initDB() {
     ).run();
     db.prepare(
         `CREATE INDEX IF NOT EXISTS idx_agent_memory_session ON agent_memory(session_id)`
+    ).run();
+    db.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_agent_memory_working_scope
+         ON agent_memory(user_id, session_id, memory_type, memory_key, status, expires_at)`
     ).run();
 
     // ── Phase 5: 评估系统 ──
@@ -1580,12 +1901,16 @@ let selectMemorySummaryStmt = null;
 let updateMemoryStmt = null;
 let deleteMemoryByIdStmt = null;
 let clearAllMemoriesStmt = null;
+let touchMemoryRecallStmt = null;
 
 function ensureMemoryStatements() {
     if (!insertMemoryStmt) {
         insertMemoryStmt = db.prepare(
-            `INSERT INTO agent_memory (user_id, session_id, content, memory_type, importance, metadata)
-             VALUES (?, ?, ?, ?, ?, ?)`
+            `INSERT INTO agent_memory
+             (user_id, session_id, content, memory_type, importance, metadata,
+             status, source, confidence, memory_key, supersedes_id, pinned,
+              category, relation_type, related_memory_id, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
     }
     if (!searchMemoriesStmt) {
@@ -1594,6 +1919,7 @@ function ensureMemoryStatements() {
              WHERE user_id = ?
                AND (memory_type = ? OR ? IS NULL)
                AND importance >= ?
+               AND status = ?
              ORDER BY created_at DESC
              LIMIT ?`
         );
@@ -1601,14 +1927,16 @@ function ensureMemoryStatements() {
     if (!consolidateFromTypeStmt) {
         consolidateFromTypeStmt = db.prepare(
             `SELECT * FROM agent_memory
-             WHERE user_id = ? AND memory_type = ? AND importance >= ?
+             WHERE user_id = ? AND memory_type = ? AND importance >= ? AND status = 'active'
              ORDER BY importance DESC`
         );
     }
     if (!insertConsolidatedStmt) {
         insertConsolidatedStmt = db.prepare(
-            `INSERT INTO agent_memory (user_id, session_id, content, memory_type, importance, metadata)
-             VALUES (?, ?, ?, ?, ?, ?)`
+            `INSERT INTO agent_memory
+             (user_id, session_id, content, memory_type, importance, metadata,
+              status, source, confidence, memory_key, supersedes_id, pinned)
+             VALUES (?, ?, ?, ?, ?, ?, 'active', 'consolidated', ?, ?, NULL, ?)`
         );
     }
     if (!deleteLowImportanceStmt) {
@@ -1643,7 +1971,11 @@ function ensureMemoryStatements() {
     if (!updateMemoryStmt) {
         updateMemoryStmt = db.prepare(
             `UPDATE agent_memory
-             SET content = ?, importance = ?, memory_type = ?, updated_at = CURRENT_TIMESTAMP
+             SET content = ?, importance = ?, memory_type = ?, metadata = ?,
+                 source = ?, confidence = ?, memory_key = ?, pinned = ?,
+                 category = ?, relation_type = ?, related_memory_id = ?,
+                 supersedes_id = ?, expires_at = ?,
+                 updated_at = CURRENT_TIMESTAMP
              WHERE id = ? AND user_id = ?`
         );
     }
@@ -1655,6 +1987,14 @@ function ensureMemoryStatements() {
     if (!clearAllMemoriesStmt) {
         clearAllMemoriesStmt = db.prepare(
             `DELETE FROM agent_memory WHERE user_id = ?`
+        );
+    }
+    if (!touchMemoryRecallStmt) {
+        touchMemoryRecallStmt = db.prepare(
+            `UPDATE agent_memory
+             SET recall_count = COALESCE(recall_count, 0) + 1,
+                 last_recalled_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND user_id = ? AND status = 'active'`
         );
     }
 }
@@ -1937,6 +2277,99 @@ export function deleteConfigVersion(id, scope = null) {
     return result.changes > 0;
 }
 
+const MEMORY_STATUSES = new Set(["pending", "active", "rejected", "superseded", "invalidated"]);
+const MEMORY_CATEGORIES = new Set(["fact", "preference", "constraint", "goal", "event", "uncategorized"]);
+const MEMORY_RELATIONS = new Set(["independent", "duplicate", "supplement", "conflict", "expiration"]);
+const WORKING_MEMORY_KEYS = [
+    "working_current_goal",
+    "working_constraints",
+    "working_progress",
+    "working_next_step",
+];
+
+function normalizeMemoryStatus(status, fallback = "active") {
+    const value = String(status ?? fallback).trim().toLowerCase();
+    return MEMORY_STATUSES.has(value) ? value : fallback;
+}
+
+function clampMemoryConfidence(value, fallback = 0.5) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(0, Math.min(1, n));
+}
+
+function normalizeMemoryCategory(value, fallback = "uncategorized") {
+    const category = String(value || "").trim().toLowerCase();
+    return MEMORY_CATEGORIES.has(category) ? category : fallback;
+}
+
+function normalizeMemoryRelation(value, fallback = "independent") {
+    const relation = String(value || "").trim().toLowerCase();
+    return MEMORY_RELATIONS.has(relation) ? relation : fallback;
+}
+
+function relatedMemoryPreview(userId, relatedMemoryId) {
+    if (!relatedMemoryId) return null;
+    const row = db.prepare(
+        `SELECT id, content, status, memory_key, category, relation_type, created_at
+         FROM agent_memory WHERE id = ? AND user_id = ?`
+    ).get(Number(relatedMemoryId), Number(userId));
+    return row ? {
+        id: row.id,
+        content: row.content,
+        status: row.status || "active",
+        memory_key: row.memory_key || null,
+        category: row.category || "uncategorized",
+        relation_type: row.relation_type || "independent",
+        created_at: row.created_at,
+    } : null;
+}
+
+function serializeMemoryRow(row, userId, extras = {}) {
+    const serialized = {
+        id: row.id,
+        session_id: row.session_id || null,
+        content: row.content,
+        memory_type: row.memory_type,
+        importance: row.importance,
+        status: row.status || "active",
+        source: row.source || "manual",
+        confidence: row.confidence == null ? 1 : row.confidence,
+        memory_key: row.memory_key || null,
+        category: row.category || "uncategorized",
+        relation_type: row.relation_type || "independent",
+        related_memory_id: row.related_memory_id || null,
+        related_memory: relatedMemoryPreview(userId, row.related_memory_id || row.supersedes_id || row.superseded_by),
+        supersedes_id: row.supersedes_id || null,
+        superseded_by: row.superseded_by || null,
+        pinned: Boolean(row.pinned),
+        invalidated_at: row.invalidated_at || null,
+        invalidate_reason: row.invalidate_reason || null,
+        expires_at: row.expires_at || null,
+        recall_count: row.recall_count ?? 0,
+        last_recalled_at: row.last_recalled_at || null,
+        updated_at: row.updated_at || row.created_at,
+        created_at: row.created_at,
+        metadata: safeParseJSON(row.metadata),
+        ...extras,
+    };
+    if (memoryContractEnabled()) {
+        serialized.contractVersion = "memory-context-v2";
+        serialized.provenance = buildUserMemoryProvenance({
+            memoryId: row.id,
+            ownerUserId: userId,
+            sessionId: row.session_id || null,
+            source: row.source || "manual",
+            metadata: serialized.metadata,
+            confidence: serialized.confidence,
+            createdAt: row.created_at,
+            invalidatedAt: row.invalidated_at,
+            invalidationReason: row.invalidate_reason,
+        });
+    }
+    return serialized;
+}
+
 /**
  * 添加一条记忆
  * @param {number} userId
@@ -1945,18 +2378,34 @@ export function deleteConfigVersion(id, scope = null) {
  * @param {string} memoryType - "working" | "episodic" | "semantic"
  * @param {number} importance - 0.0 ~ 1.0
  * @param {object} metadata - 额外的结构化元数据
+ * @param {object} lifecycle - status/source/confidence/memoryKey/supersedesId/pinned/category/relationType/relatedMemoryId
  * @returns {number} memoryId
  */
-export function addMemory(userId, sessionId, content, memoryType = "working", importance = 0.5, metadata = {}) {
+export function addMemory(userId, sessionId, content, memoryType = "working", importance = 0.5, metadata = {}, lifecycle = {}) {
     ensureMemoryStatements();
     const safeImportance = Math.max(0, Math.min(1, Number(importance) || 0.5));
+    const meta = metadata && typeof metadata === "object" ? metadata : {};
     const result = insertMemoryStmt.run(
         Number(userId),
         sessionId ? Number(sessionId) : null,
         String(content),
         String(memoryType),
         safeImportance,
-        JSON.stringify(metadata)
+        JSON.stringify(meta),
+        normalizeMemoryStatus(lifecycle.status),
+        String(lifecycle.source || meta.source || "manual"),
+        clampMemoryConfidence(lifecycle.confidence ?? meta.confidence, 1),
+        lifecycle.memoryKey == null ? (meta.memory_key == null ? null : String(meta.memory_key)) : String(lifecycle.memoryKey),
+        lifecycle.supersedesId == null ? null : Number(lifecycle.supersedesId),
+        lifecycle.pinned ? 1 : 0,
+        normalizeMemoryCategory(lifecycle.category ?? meta.category),
+        normalizeMemoryRelation(lifecycle.relationType ?? meta.relation_type),
+        lifecycle.relatedMemoryId == null
+            ? (meta.related_memory_id == null ? null : Number(meta.related_memory_id))
+            : Number(lifecycle.relatedMemoryId),
+        lifecycle.expiresAt == null
+            ? (meta.expires_at == null ? null : String(meta.expires_at))
+            : String(lifecycle.expiresAt),
     );
     return Number(result.lastInsertRowid);
 }
@@ -1968,11 +2417,16 @@ export function addMemory(userId, sessionId, content, memoryType = "working", im
  * @param {string[]} memoryTypes - 限制搜索的记忆类型，null 表示全部
  * @param {number} limit
  * @param {number} minImportance
+ * @param {string|string[]} statuses - 默认只召回 active 记忆
  * @returns {Array} 带 relevanceScore 的记忆列表
  */
-export function searchMemory(userId, query, memoryTypes = null, limit = 10, minImportance = 0.1) {
+export function searchMemory(userId, query, memoryTypes = null, limit = 10, minImportance = 0.1, statuses = "active", options = {}) {
     ensureMemoryStatements();
     const safeUserId = Number(userId);
+    const allowedStatuses = (Array.isArray(statuses) ? statuses : [statuses])
+        .map((status) => normalizeMemoryStatus(status, "active"));
+    const statusSet = new Set(allowedStatuses.length > 0 ? allowedStatuses : ["active"]);
+    const statusPlaceholders = [...statusSet].map(() => "?").join(", ");
 
     // 批量获取候选集 — 对每种记忆类型分别查询
     const typesToSearch = (Array.isArray(memoryTypes) && memoryTypes.length > 0)
@@ -1983,7 +2437,16 @@ export function searchMemory(userId, query, memoryTypes = null, limit = 10, minI
     const allCandidates = [];
     for (const memType of typeSet) {
         // 每种类型取 3x limit 做候选池，后续混合排序
-        const rows = searchMemoriesStmt.all(safeUserId, memType, memType, minImportance, limit * 3);
+        const rows = db.prepare(
+            `SELECT * FROM agent_memory
+             WHERE user_id = ?
+               AND (memory_type = ? OR ? IS NULL)
+               AND importance >= ?
+               AND status IN (${statusPlaceholders})
+               AND (status <> 'active' OR expires_at IS NULL OR julianday(expires_at) > julianday('now'))
+             ORDER BY pinned DESC, created_at DESC
+             LIMIT ?`
+        ).all(safeUserId, memType, memType, minImportance, ...statusSet, limit * 3);
         for (const row of rows) {
             allCandidates.push(row);
         }
@@ -2050,15 +2513,7 @@ export function searchMemory(userId, query, memoryTypes = null, limit = 10, minI
         // 4. 综合评分
         const relevanceScore = (keywordScore * 0.7 + recencyScore * 0.1) * importanceWeight;
 
-        return {
-            id: row.id,
-            content: row.content,
-            memory_type: row.memory_type,
-            importance: row.importance,
-            relevanceScore,
-            created_at: row.created_at,
-            metadata: safeParseJSON(row.metadata),
-        };
+        return serializeMemoryRow(row, safeUserId, { relevanceScore });
     });
 
     // 5. 有搜索词时，过滤掉完全不匹配的结果（所有查询词都不命中内容 → 排除）
@@ -2067,8 +2522,24 @@ export function searchMemory(userId, query, memoryTypes = null, limit = 10, minI
         : scored;
 
     // 按综合评分降序排序
-    filtered.sort((a, b) => b.relevanceScore - a.relevanceScore);
-    return filtered.slice(0, limit);
+    filtered.sort((a, b) => (b.pinned - a.pinned) || (b.relevanceScore - a.relevanceScore));
+    const result = filtered.slice(0, limit);
+    if (options.touchRecall !== false) {
+        for (const item of result) {
+            touchMemoryRecallStmt.run(item.id, safeUserId);
+        }
+    }
+    return result;
+}
+
+/** Record recall only after the context layer has accepted an item. */
+export function recordMemoryRecall(userId, memoryIds = []) {
+    ensureMemoryStatements();
+    const safeUserId = Number(userId);
+    const ids = [...new Set((Array.isArray(memoryIds) ? memoryIds : []).map(Number))]
+        .filter((id) => Number.isInteger(id) && id > 0);
+    for (const id of ids) touchMemoryRecallStmt.run(id, safeUserId);
+    return ids.length;
 }
 
 /**
@@ -2088,7 +2559,7 @@ export function consolidateMemory(userId, fromType = "working", toType = "episod
 
         let consolidated = 0;
         for (const row of candidates) {
-            // 创建新记忆到目标类型，importance 获得 1.1x 提升
+            // 记忆巩固保留原始 id 与 provenance，只改变用途层级。
             const boostedImportance = Math.min(1, (row.importance || 0.5) * 1.1);
             const metadata = {
                 ...safeParseJSON(row.metadata),
@@ -2097,17 +2568,12 @@ export function consolidateMemory(userId, fromType = "working", toType = "episod
                 consolidated_at: new Date().toISOString(),
             };
 
-            insertConsolidatedStmt.run(
-                safeUserId,
-                row.session_id,
-                row.content,
-                toType,
-                boostedImportance,
-                JSON.stringify(metadata)
-            );
-
-            // 提升后删除原始记忆
-            deleteMemoryByIdStmt.run(row.id, safeUserId);
+            db.prepare(
+                `UPDATE agent_memory
+                 SET memory_type = ?, importance = ?, metadata = ?,
+                     source = 'consolidated', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ? AND user_id = ? AND status = 'active'`
+            ).run(toType, boostedImportance, JSON.stringify(metadata), row.id, safeUserId);
             consolidated++;
         }
 
@@ -2131,10 +2597,20 @@ export function forgetMemory(userId, strategy = "importance", memoryType = "work
 
     let result;
     if (strategy === "importance") {
-        result = deleteLowImportanceStmt.run(safeUserId, memoryType, threshold);
+        result = db.prepare(
+            `UPDATE agent_memory
+             SET status = 'invalidated', invalidated_at = CURRENT_TIMESTAMP,
+                 invalidate_reason = 'importance_decay', updated_at = CURRENT_TIMESTAMP
+             WHERE user_id = ? AND memory_type = ? AND importance < ? AND status = 'active'`
+        ).run(safeUserId, memoryType, threshold);
     } else if (strategy === "time") {
         const cutoffDate = new Date(Date.now() - Number(threshold) * 24 * 3600 * 1000).toISOString();
-        result = deleteOldMemoriesStmt.run(safeUserId, memoryType, cutoffDate);
+        result = db.prepare(
+            `UPDATE agent_memory
+             SET status = 'invalidated', invalidated_at = CURRENT_TIMESTAMP,
+                 invalidate_reason = 'time_decay', updated_at = CURRENT_TIMESTAMP
+             WHERE user_id = ? AND memory_type = ? AND created_at < ? AND status = 'active'`
+        ).run(safeUserId, memoryType, cutoffDate);
     } else if (strategy === "all") {
         result = clearAllMemoriesStmt.run(safeUserId);
     } else {
@@ -2152,43 +2628,328 @@ export function forgetMemory(userId, strategy = "importance", memoryType = "work
 export function getMemoryStats(userId) {
     ensureMemoryStatements();
     const safeUserId = Number(userId);
-    const rows = selectMemoryStatsStmt.all(safeUserId);
+    const rows = db.prepare(
+        `SELECT memory_type, status, COUNT(*) as count
+         FROM agent_memory
+         WHERE user_id = ?
+         GROUP BY memory_type, status`
+    ).all(safeUserId);
 
     const byType = { working: 0, episodic: 0, semantic: 0 };
+    const byStatus = { pending: 0, active: 0, rejected: 0, superseded: 0, invalidated: 0 };
     let total = 0;
     for (const row of rows) {
-        byType[row.memory_type] = row.count;
-        total += row.count;
+        if (row.status === "active" && row.memory_type in byType) byType[row.memory_type] += Number(row.count) || 0;
+        if (row.status in byStatus) byStatus[row.status] += Number(row.count) || 0;
+        total += Number(row.count) || 0;
     }
 
-    return { total, byType };
+    return { total, byType, byStatus };
 }
 
 /**
  * 获取记忆摘要
  * @param {number} userId
  * @param {number} limit
+ * @param {string|string[]|null} statuses - null 表示全部生命周期状态
  * @returns {Array}
  */
-export function getMemorySummary(userId, limit = 20) {
+export function getMemorySummary(userId, limit = 20, statuses = null) {
     ensureMemoryStatements();
     const safeUserId = Number(userId);
-    const rows = selectMemorySummaryStmt.all(safeUserId, limit);
+    const normalizedStatuses = statuses == null
+        ? null
+        : (Array.isArray(statuses) ? statuses : [statuses]).map((status) => normalizeMemoryStatus(status));
+    const statusClause = normalizedStatuses?.length
+        ? ` AND status IN (${normalizedStatuses.map(() => "?").join(", ")})`
+        : "";
+    const rows = db.prepare(
+        `SELECT * FROM agent_memory
+         WHERE user_id = ?${statusClause}
+           AND (status <> 'active' OR expires_at IS NULL OR julianday(expires_at) > julianday('now'))
+         ORDER BY pinned DESC, importance DESC, created_at DESC
+         LIMIT ?`
+    ).all(safeUserId, ...(normalizedStatuses || []), limit);
 
-    return rows.map((row) => ({
-        id: row.id,
-        content: row.content,
-        memory_type: row.memory_type,
-        importance: row.importance,
-        created_at: row.created_at,
-    }));
+    return rows.map((row) => serializeMemoryRow(row, safeUserId));
+}
+
+function assertWorkingSessionOwnership(userId, sessionId) {
+    const safeUserId = Number(userId);
+    const safeSessionId = Number(sessionId);
+    if (!Number.isInteger(safeUserId) || safeUserId <= 0 || !Number.isInteger(safeSessionId) || safeSessionId <= 0) {
+        const error = new Error("session not found");
+        error.code = "SESSION_NOT_FOUND";
+        throw error;
+    }
+    const row = db.prepare(
+        "SELECT id FROM sessions WHERE id = ? AND user_id = ?"
+    ).get(safeSessionId, safeUserId);
+    if (!row) {
+        const error = new Error("session not found");
+        error.code = "SESSION_NOT_FOUND";
+        throw error;
+    }
+    return { userId: safeUserId, sessionId: safeSessionId };
+}
+
+function workingMemoryMetadata(row) {
+    return safeParseJSON(row?.metadata);
+}
+
+function workingMemoryActiveRows(userId, sessionId) {
+    const keyPlaceholders = WORKING_MEMORY_KEYS.map(() => "?").join(", ");
+    return db.prepare(
+        `SELECT * FROM agent_memory
+         WHERE user_id = ? AND session_id = ? AND memory_type = 'working'
+           AND memory_key IN (${keyPlaceholders}) AND status = 'active'
+           AND (expires_at IS NULL OR julianday(expires_at) > julianday('now'))
+         ORDER BY id ASC`
+    ).all(userId, sessionId, ...WORKING_MEMORY_KEYS);
+}
+
+/**
+ * Idempotently replace the four server-generated working-memory slots for a
+ * session. This is deliberately separate from generic add/update semantics:
+ * memory_key is an exact protocol key and active rows are never duplicated.
+ */
+export function upsertSessionWorkingMemory(userId, sessionId, records = []) {
+    ensureMemoryStatements();
+    const scope = assertWorkingSessionOwnership(userId, sessionId);
+    const safeRecords = Array.isArray(records)
+        ? records
+            .map((record) => ({ ...record, memory_key: record?.memory_key ?? record?.memoryKey, expires_at: record?.expires_at ?? record?.expiresAt }))
+            .filter((record) => WORKING_MEMORY_KEYS.includes(String(record?.memory_key)))
+        : [];
+    const now = new Date().toISOString();
+
+    const tx = db.transaction(() => {
+        const expired = db.prepare(
+            `UPDATE agent_memory
+             SET status = 'invalidated', invalidated_at = CURRENT_TIMESTAMP,
+                 invalidate_reason = 'working_memory_ttl', updated_at = CURRENT_TIMESTAMP
+             WHERE user_id = ? AND session_id = ? AND memory_type = 'working'
+               AND memory_key IN (${WORKING_MEMORY_KEYS.map(() => "?").join(", ")})
+               AND status = 'active' AND expires_at IS NOT NULL
+               AND julianday(expires_at) <= julianday(?)`
+        ).run(scope.userId, scope.sessionId, ...WORKING_MEMORY_KEYS, now);
+
+        let created = 0;
+        let updated = 0;
+        let unchanged = 0;
+        const ids = [];
+        for (const record of safeRecords) {
+            const key = String(record.memory_key);
+            const candidates = db.prepare(
+                `SELECT * FROM agent_memory
+                 WHERE user_id = ? AND session_id = ? AND memory_type = 'working'
+                   AND memory_key = ? AND status = 'active'
+                   AND (expires_at IS NULL OR julianday(expires_at) > julianday('now'))
+                 ORDER BY updated_at DESC, id DESC`
+            ).all(scope.userId, scope.sessionId, key);
+            const current = candidates[0] || null;
+            for (const duplicate of candidates.slice(1)) {
+                db.prepare(
+                    `UPDATE agent_memory
+                     SET status = 'invalidated', invalidated_at = CURRENT_TIMESTAMP,
+                         invalidate_reason = 'working_memory_duplicate', updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ? AND user_id = ? AND status = 'active'`
+                ).run(duplicate.id, scope.userId);
+            }
+
+            const metadata = record.metadata && typeof record.metadata === "object" ? record.metadata : {};
+            const snapshotHash = String(metadata.snapshot_hash || "");
+            const currentHash = String(workingMemoryMetadata(current).snapshot_hash || "");
+            if (current && snapshotHash && snapshotHash === currentHash) {
+                unchanged++;
+                ids.push(Number(current.id));
+                continue;
+            }
+
+            const values = [
+                String(record.content || ""),
+                0.9,
+                JSON.stringify(metadata),
+                "working_memory",
+                1,
+                key,
+                record.expires_at == null ? null : String(record.expires_at),
+            ];
+            if (current) {
+                const changed = db.prepare(
+                    `UPDATE agent_memory
+                     SET content = ?, importance = ?, metadata = ?, status = 'active',
+                         source = ?, confidence = ?, memory_key = ?, category = 'goal',
+                         relation_type = 'independent', related_memory_id = NULL,
+                         supersedes_id = NULL, invalidated_at = NULL, invalidate_reason = NULL,
+                         expires_at = ?, updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ? AND user_id = ?`
+                ).run(...values, current.id, scope.userId);
+                updated += changed.changes;
+                ids.push(Number(current.id));
+            } else {
+                const result = insertMemoryStmt.run(
+                    scope.userId,
+                    scope.sessionId,
+                    values[0],
+                    "working",
+                    values[1],
+                    values[2],
+                    "active",
+                    values[3],
+                    values[4],
+                    key,
+                    null,
+                    0,
+                    "goal",
+                    "independent",
+                    null,
+                    values[6],
+                );
+                created++;
+                ids.push(Number(result.lastInsertRowid));
+            }
+        }
+        return { created, updated, unchanged, expired: expired.changes, ids, changed: created + updated > 0 };
+    });
+
+    return tx();
+}
+
+/** Return only active, unexpired fixed-key working state for one owned session. */
+export function getSessionWorkingMemory(userId, sessionId) {
+    ensureMemoryStatements();
+    const scope = assertWorkingSessionOwnership(userId, sessionId);
+    const now = new Date().toISOString();
+    db.prepare(
+        `UPDATE agent_memory
+         SET status = 'invalidated', invalidated_at = CURRENT_TIMESTAMP,
+             invalidate_reason = 'working_memory_ttl', updated_at = CURRENT_TIMESTAMP
+         WHERE user_id = ? AND session_id = ? AND memory_type = 'working'
+           AND memory_key IN (${WORKING_MEMORY_KEYS.map(() => "?").join(", ")})
+           AND status = 'active' AND expires_at IS NOT NULL
+           AND julianday(expires_at) <= julianday(?)`
+    ).run(scope.userId, scope.sessionId, ...WORKING_MEMORY_KEYS, now);
+    return workingMemoryActiveRows(scope.userId, scope.sessionId)
+        .map((row) => serializeMemoryRow(row, scope.userId));
+}
+
+/** Soft-invalidate current working state while retaining its audit trail. */
+export function invalidateSessionWorkingMemory(userId, sessionId, reason = "task_terminal") {
+    ensureMemoryStatements();
+    const scope = assertWorkingSessionOwnership(userId, sessionId);
+    const safeReason = String(reason || "task_terminal").replace(/[\r\n]/g, " ").slice(0, 120);
+    const tx = db.transaction(() => {
+        const rows = workingMemoryActiveRows(scope.userId, scope.sessionId);
+        const update = db.prepare(
+            `UPDATE agent_memory
+             SET status = 'invalidated', invalidated_at = CURRENT_TIMESTAMP,
+                 invalidate_reason = ?, metadata = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND user_id = ? AND status = 'active'`
+        );
+        const ids = [];
+        for (const row of rows) {
+            const metadata = {
+                ...workingMemoryMetadata(row),
+                invalidation_source: "working_memory",
+                invalidation_reason: safeReason,
+                invalidation_at: new Date().toISOString(),
+            };
+            const changed = update.run(safeReason, JSON.stringify(metadata), row.id, scope.userId);
+            if (changed.changes > 0) ids.push(Number(row.id));
+        }
+        return { invalidated: ids.length, ids, reason: safeReason };
+    });
+    return tx();
+}
+
+/**
+ * Owner-scoped rows used by optional user-memory vector recall.
+ * Do not expose embeddings through the normal MemoryPanel/API serializers.
+ */
+export function getMemoryVectorRows(userId, memoryTypes = ["episodic", "semantic"]) {
+    ensureMemoryStatements();
+    const safeUserId = Number(userId);
+    const types = Array.isArray(memoryTypes) && memoryTypes.length > 0
+        ? [...new Set(memoryTypes.map((type) => String(type)))]
+        : ["episodic", "semantic"];
+    const placeholders = types.map(() => "?").join(", ");
+    return db.prepare(
+        `SELECT id, content, memory_type, importance, confidence, status,
+                updated_at, embedding, embedding_model, embedding_source_hash,
+                embedding_updated_at
+         FROM agent_memory
+         WHERE user_id = ? AND status = 'active' AND memory_type IN (${placeholders})
+         ORDER BY updated_at DESC, id DESC`
+    ).all(safeUserId, ...types);
+}
+
+/** Persist one owner-scoped memory embedding after successful inference. */
+export function updateMemoryEmbedding(userId, memoryId, embedding, model = null, sourceHash = null) {
+    ensureMemoryStatements();
+    if (!Array.isArray(embedding) || embedding.length === 0) return false;
+    const result = db.prepare(
+        `UPDATE agent_memory
+         SET embedding = ?, embedding_model = ?, embedding_source_hash = ?,
+             embedding_updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND user_id = ?`
+    ).run(JSON.stringify(embedding), model ? String(model) : null, sourceHash ? String(sourceHash) : null, Number(memoryId), Number(userId));
+    return result.changes > 0;
+}
+
+/** Return every owner-scoped memory for an explicit privacy export. */
+export function exportMemory(userId) {
+    ensureMemoryStatements();
+    const safeUserId = Number(userId);
+    const rows = db.prepare(
+        `SELECT * FROM agent_memory WHERE user_id = ? ORDER BY created_at ASC, id ASC`
+    ).all(safeUserId);
+    return rows.map((row) => serializeMemoryRow(row, safeUserId));
+}
+
+/**
+ * Evaluate and, unless dryRun is requested, soft-invalidate owner-scoped
+ * retention candidates in one transaction. No retention path hard-deletes.
+ */
+export function applyMemoryRetention(userId, policy, { dryRun = false } = {}) {
+    ensureMemoryStatements();
+    const safeUserId = Number(userId);
+    const rows = db.prepare(
+        `SELECT * FROM agent_memory
+         WHERE user_id = ? AND status IN ('pending', 'active')`
+    ).all(safeUserId);
+    const evaluation = evaluateMemoryRetention(rows, policy, Date.now());
+    const result = {
+        enabled: true,
+        dryRun: Boolean(dryRun),
+        scanned: evaluation.scanned,
+        invalidated: 0,
+        protectedSkipped: evaluation.protectedSkipped,
+        byReason: evaluation.byReason,
+        candidates: evaluation.decisions.map((item) => ({ ...item })),
+    };
+    if (dryRun || evaluation.decisions.length === 0) return result;
+
+    const tx = db.transaction(() => {
+        for (const decision of evaluation.decisions) {
+            const changed = db.prepare(
+                `UPDATE agent_memory
+                 SET status = 'invalidated', invalidated_at = CURRENT_TIMESTAMP,
+                     invalidate_reason = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ? AND user_id = ? AND status = ?`
+            ).run(decision.reason, decision.id, safeUserId, decision.status);
+            result.invalidated += changed.changes;
+        }
+    });
+    tx();
+    return result;
 }
 
 /**
  * 更新一条记忆
  * @param {number} userId
  * @param {number} memoryId
- * @param {object} updates - { content, importance, memory_type }
+ * @param {object} updates - { content, importance, memory_type, metadata, source, confidence, memory_key, pinned, category, relation_type, related_memory_id, supersedes_id }
  */
 export function updateMemory(userId, memoryId, updates = {}) {
     ensureMemoryStatements();
@@ -2198,12 +2959,132 @@ export function updateMemory(userId, memoryId, updates = {}) {
 
     updateMemoryStmt.run(
         String(updates.content ?? row.content),
-        Number(updates.importance ?? row.importance),
+        Math.max(0, Math.min(1, Number(updates.importance ?? row.importance) || 0.5)),
         String(updates.memory_type ?? row.memory_type),
+        JSON.stringify(updates.metadata ?? safeParseJSON(row.metadata)),
+        String(updates.source ?? row.source ?? "manual"),
+        clampMemoryConfidence(updates.confidence ?? row.confidence, 1),
+        updates.memory_key === undefined ? (row.memory_key || null) : (updates.memory_key ? String(updates.memory_key) : null),
+        updates.pinned === undefined ? (row.pinned ? 1 : 0) : (updates.pinned ? 1 : 0),
+        normalizeMemoryCategory(updates.category ?? row.category),
+        normalizeMemoryRelation(updates.relation_type ?? row.relation_type),
+        updates.related_memory_id === undefined
+            ? (row.related_memory_id || null)
+            : (updates.related_memory_id ? Number(updates.related_memory_id) : null),
+        updates.supersedes_id === undefined
+            ? (row.supersedes_id || null)
+            : (updates.supersedes_id ? Number(updates.supersedes_id) : null),
+        updates.expires_at === undefined
+            ? (row.expires_at || null)
+            : (updates.expires_at ? String(updates.expires_at) : null),
         memoryId,
         safeUserId
     );
     return true;
+}
+
+/**
+ * 将候选记忆推进到 active，或标记为 rejected/invalidated。
+ * approve 会在同一事务内处理 supersedes_id，保证冲突替代关系不会出现半状态。
+ */
+export function transitionMemory(userId, memoryId, status, reason = null) {
+    ensureMemoryStatements();
+    const safeUserId = Number(userId);
+    const nextStatus = normalizeMemoryStatus(status, "active");
+    const tx = db.transaction(() => {
+        const row = db.prepare("SELECT * FROM agent_memory WHERE id = ? AND user_id = ?").get(memoryId, safeUserId);
+        if (!row) return false;
+
+        let supersededTargetId = row.supersedes_id || null;
+        const replacesTopic = ["conflict", "expiration"].includes(row.relation_type);
+        if (nextStatus === "active" && replacesTopic && row.memory_key) {
+            const current = db.prepare(
+                `SELECT id FROM agent_memory
+                 WHERE user_id = ? AND memory_key = ? AND status = 'active' AND id != ?
+                 ORDER BY updated_at DESC, id DESC LIMIT 1`
+            ).get(safeUserId, row.memory_key, row.id);
+            if (current?.id) supersededTargetId = current.id;
+        }
+
+        if (nextStatus === "active" && supersededTargetId) {
+            db.prepare(
+                `UPDATE agent_memory
+                 SET status = 'superseded', superseded_by = ?,
+                     invalidated_at = CURRENT_TIMESTAMP,
+                     invalidate_reason = 'superseded_by_new_memory', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ? AND user_id = ? AND status IN ('active', 'pending')`
+            ).run(row.id, supersededTargetId, safeUserId);
+        }
+
+        db.prepare(
+            `UPDATE agent_memory
+             SET status = ?,
+                 invalidated_at = CASE WHEN ? IN ('invalidated', 'rejected') THEN CURRENT_TIMESTAMP ELSE NULL END,
+                 invalidate_reason = CASE WHEN ? IN ('invalidated', 'rejected') THEN ? ELSE NULL END,
+                 supersedes_id = CASE WHEN ? = 'active' AND ? IS NOT NULL THEN ? ELSE supersedes_id END,
+                 related_memory_id = CASE WHEN ? = 'active' AND ? IS NOT NULL THEN ? ELSE related_memory_id END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND user_id = ?`
+        ).run(
+            nextStatus,
+            nextStatus,
+            nextStatus,
+            reason ? String(reason) : nextStatus,
+            nextStatus,
+            supersededTargetId,
+            supersededTargetId,
+            nextStatus,
+            supersededTargetId,
+            supersededTargetId,
+            memoryId,
+            safeUserId,
+        );
+        return true;
+    });
+    return tx();
+}
+
+export function proposeMemory(userId, sessionId, content, memoryType = "semantic", importance = 0.5, metadata = {}, lifecycle = {}) {
+    return addMemory(userId, sessionId, content, memoryType, importance, metadata, {
+        ...lifecycle,
+        status: "pending",
+        source: lifecycle.source || metadata?.source || "llm_extract",
+    });
+}
+
+/** Return the owner-scoped topic/version chain without affecting recall metrics. */
+export function getMemoryLineage(userId, memoryId) {
+    ensureMemoryStatements();
+    const safeUserId = Number(userId);
+    const seed = db.prepare("SELECT * FROM agent_memory WHERE id = ? AND user_id = ?").get(Number(memoryId), safeUserId);
+    if (!seed) return null;
+
+    let rows;
+    if (seed.memory_key) {
+        rows = db.prepare(
+            `SELECT * FROM agent_memory
+             WHERE user_id = ? AND memory_key = ?
+             ORDER BY created_at ASC, id ASC LIMIT 100`
+        ).all(safeUserId, seed.memory_key);
+    } else {
+        rows = db.prepare(
+            `SELECT * FROM agent_memory
+             WHERE user_id = ? AND (id = ? OR supersedes_id = ? OR superseded_by = ? OR related_memory_id = ?)
+             ORDER BY created_at ASC, id ASC LIMIT 100`
+        ).all(safeUserId, seed.id, seed.id, seed.id, seed.id);
+    }
+    const chain = rows.map((row) => serializeMemoryRow(row, safeUserId));
+    const currentActive = [...rows].reverse().find((row) => row.status === "active" && row.id !== seed.id) || null;
+    const relationType = seed.relation_type || "independent";
+    const impact = ["conflict", "expiration"].includes(relationType)
+        ? {
+            action: "supersede",
+            target: currentActive ? relatedMemoryPreview(safeUserId, currentActive.id) : relatedMemoryPreview(safeUserId, seed.supersedes_id),
+        }
+        : relationType === "supplement"
+            ? { action: "keep_both", target: relatedMemoryPreview(safeUserId, seed.related_memory_id) }
+            : { action: "none", target: null };
+    return { memory: serializeMemoryRow(seed, safeUserId), chain, impact };
 }
 
 /**
@@ -2478,6 +3359,267 @@ export function getFeedbackSummary(userId, scope = null) {
         result.total += row.count;
     }
     return result;
+}
+
+/**
+ * Owner-scoped, content-free evidence for M12 cross-source impact reports.
+ * Only feedback labels and the linked Trace root span are returned; the eval
+ * layer strips the span down to cross_source_recall metadata before output.
+ */
+export function getCrossSourceFeedbackEvidence(scope, limit = 200) {
+    ensureEvalStatements();
+    const normalized = normalizeScope(scope);
+    if (!normalized) return [];
+    const safeLimit = Math.max(1, Math.min(1000, Number(limit) || 200));
+    return db.prepare(`
+        SELECT f.user_id, f.message_id, f.rating, f.created_at AS feedback_created_at,
+               et.trace_id, et.root_span
+        FROM eval_feedback f
+        LEFT JOIN eval_traces et ON et.id = (
+            SELECT latest.id
+            FROM eval_traces latest
+            WHERE latest.message_id = f.message_id
+              AND latest.user_id = f.user_id
+              AND latest.tenant_id = f.tenant_id
+            ORDER BY latest.id DESC
+            LIMIT 1
+        )
+        WHERE f.user_id = ? AND f.tenant_id = ?
+        ORDER BY f.id DESC
+        LIMIT ?
+    `).all(normalized.userId, normalized.tenantId, safeLimit);
+}
+
+/**
+ * List scopes that have feedback or experiment traces. Used only by the
+ * opt-in background sampler; the returned values contain no message content.
+ */
+export function getCrossSourceExperimentScopes(limit = 100) {
+    const safeLimit = Math.max(1, Math.min(1000, Number(limit) || 100));
+    return db.prepare(`
+        SELECT user_id AS userId, tenant_id AS tenantId
+        FROM eval_feedback
+        WHERE tenant_id IS NOT NULL
+        GROUP BY user_id, tenant_id
+        UNION
+        SELECT user_id AS userId, tenant_id AS tenantId
+        FROM eval_traces
+        WHERE tenant_id IS NOT NULL AND root_span LIKE '%cross_source_experiment%'
+        GROUP BY user_id, tenant_id
+        LIMIT ?
+    `).all(safeLimit);
+}
+
+/** Persist a sanitized aggregate experiment report for an owner scope. */
+export function saveCrossSourceExperimentReport(scope, {
+    reportKey,
+    periodStart = null,
+    periodEnd = null,
+    experimentKey = null,
+    configVersionId = null,
+    report,
+} = {}) {
+    const normalized = requireScope(scope, "cross-source experiment report");
+    if (!report || typeof report !== "object") throw new Error("experiment report is required");
+    const result = db.prepare(`
+        INSERT INTO cross_source_experiment_reports
+            (owner_user_id, tenant_id, report_key, period_start, period_end, experiment_key, config_version_id, report_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+        normalized.userId,
+        normalized.tenantId,
+        String(reportKey || "cross-source-experiment"),
+        periodStart,
+        periodEnd,
+        experimentKey == null ? null : String(experimentKey),
+        configVersionId == null ? null : Number(configVersionId) || null,
+        JSON.stringify(report),
+    );
+    return Number(result.lastInsertRowid);
+}
+
+/** Read recent aggregate reports without exposing raw trace or feedback data. */
+export function listCrossSourceExperimentReports(scope, limit = 50) {
+    const normalized = requireScope(scope, "cross-source experiment report");
+    const safeLimit = Math.max(1, Math.min(200, Number(limit) || 50));
+    return db.prepare(`
+        SELECT id, report_key, period_start, period_end, experiment_key,
+               config_version_id, report_json, created_at
+        FROM cross_source_experiment_reports
+        WHERE owner_user_id = ? AND tenant_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+    `).all(normalized.userId, normalized.tenantId, safeLimit).map((row) => {
+        let report = {};
+        try { report = JSON.parse(row.report_json || "{}"); } catch { /* corrupt report remains inspectable as metadata */ }
+        return { ...row, report_json: undefined, report };
+    });
+}
+
+export function getCrossSourceExperimentReport(scope, reportId) {
+    const normalized = requireScope(scope, "cross-source experiment report");
+    const id = Number(reportId);
+    if (!Number.isInteger(id) || id <= 0) return null;
+    const row = db.prepare(`
+        SELECT id, report_key, period_start, period_end, experiment_key,
+               config_version_id, report_json, created_at
+        FROM cross_source_experiment_reports
+        WHERE id = ? AND owner_user_id = ? AND tenant_id = ?
+    `).get(id, normalized.userId, normalized.tenantId);
+    if (!row) return null;
+    let report = {};
+    try { report = JSON.parse(row.report_json || "{}"); } catch { /* keep metadata readable */ }
+    return { ...row, report_json: undefined, report };
+}
+
+/**
+ * Claim one owner-scoped sampler job. SQLite serializes the short write
+ * transaction, while holder_token prevents a stale worker from completing a
+ * lease it no longer owns.
+ */
+export function claimCrossSourceExperimentJob(scope, {
+    jobName = "cross-source-daily-report",
+    holderToken,
+    leaseSeconds = 120,
+} = {}) {
+    const normalized = requireScope(scope, "cross-source experiment job");
+    const token = String(holderToken || "");
+    if (!token) throw new Error("job holder token is required");
+    const safeLease = Math.max(30, Math.min(3600, Number(leaseSeconds) || 120));
+    const name = String(jobName || "cross-source-daily-report");
+    const result = db.transaction(() => {
+        db.prepare(`
+            INSERT OR IGNORE INTO cross_source_experiment_jobs
+                (owner_user_id, tenant_id, job_name, next_run_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        `).run(normalized.userId, normalized.tenantId, name);
+        return db.prepare(`
+            UPDATE cross_source_experiment_jobs
+            SET status = 'running', holder_token = ?,
+                lease_expires_at = datetime('now', '+' || ? || ' seconds'),
+                attempt_count = attempt_count + 1,
+                last_error_code = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE owner_user_id = ? AND tenant_id = ? AND job_name = ?
+              AND (holder_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP)
+              AND (next_run_at IS NULL OR next_run_at <= CURRENT_TIMESTAMP)
+        `).run(token, safeLease, normalized.userId, normalized.tenantId, name).changes > 0;
+    })();
+    return Boolean(result);
+}
+
+export function completeCrossSourceExperimentJob(scope, {
+    jobName = "cross-source-daily-report",
+    holderToken,
+    reportId = null,
+    nextRunSeconds = 900,
+} = {}) {
+    const normalized = requireScope(scope, "cross-source experiment job");
+    const safeDelay = Math.max(60, Math.min(24 * 60 * 60, Number(nextRunSeconds) || 900));
+    return db.prepare(`
+        UPDATE cross_source_experiment_jobs
+        SET status = 'ready', holder_token = NULL, lease_expires_at = NULL,
+            last_run_at = CURRENT_TIMESTAMP,
+            last_report_id = ?,
+            next_run_at = datetime('now', '+' || ? || ' seconds'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE owner_user_id = ? AND tenant_id = ? AND job_name = ? AND holder_token = ?
+    `).run(
+        reportId == null ? null : Number(reportId) || null,
+        safeDelay,
+        normalized.userId,
+        normalized.tenantId,
+        String(jobName || "cross-source-daily-report"),
+        String(holderToken || ""),
+    ).changes > 0;
+}
+
+export function failCrossSourceExperimentJob(scope, {
+    jobName = "cross-source-daily-report",
+    holderToken,
+    errorCode = "REPORT_FAILED",
+    retrySeconds = 300,
+} = {}) {
+    const normalized = requireScope(scope, "cross-source experiment job");
+    const safeDelay = Math.max(60, Math.min(24 * 60 * 60, Number(retrySeconds) || 300));
+    return db.prepare(`
+        UPDATE cross_source_experiment_jobs
+        SET status = 'ready', holder_token = NULL, lease_expires_at = NULL,
+            last_error_code = ?,
+            next_run_at = datetime('now', '+' || ? || ' seconds'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE owner_user_id = ? AND tenant_id = ? AND job_name = ? AND holder_token = ?
+    `).run(
+        String(errorCode || "REPORT_FAILED").slice(0, 100),
+        safeDelay,
+        normalized.userId,
+        normalized.tenantId,
+        String(jobName || "cross-source-daily-report"),
+        String(holderToken || ""),
+    ).changes > 0;
+}
+
+export function getCrossSourceExperimentJob(scope, jobName = "cross-source-daily-report") {
+    const normalized = requireScope(scope, "cross-source experiment job");
+    return db.prepare(`
+        SELECT job_name, status, lease_expires_at, next_run_at, last_run_at,
+               last_report_id, attempt_count, last_error_code, updated_at
+        FROM cross_source_experiment_jobs
+        WHERE owner_user_id = ? AND tenant_id = ? AND job_name = ?
+    `).get(normalized.userId, normalized.tenantId, String(jobName)) || null;
+}
+
+/** Record a manual release/hold/rollback decision; this function never applies it. */
+export function saveCrossSourceExperimentApproval(scope, {
+    reportId = null,
+    action,
+    fromConfigVersionId = null,
+    targetConfigVersionId = null,
+    note = null,
+    actorUserId,
+} = {}) {
+    const normalized = requireScope(scope, "cross-source experiment approval");
+    const allowedActions = new Set(["approve_canary", "keep_control", "rollback", "review"]);
+    if (!allowedActions.has(String(action))) throw new Error("invalid experiment approval action");
+    const actor = Number(actorUserId || normalized.userId);
+    if (!Number.isInteger(actor) || actor <= 0) throw new Error("approval actor is required");
+    const normalizedReportId = reportId == null ? null : Number(reportId) || null;
+    if (normalizedReportId !== null) {
+        const report = db.prepare(`
+            SELECT id FROM cross_source_experiment_reports
+            WHERE id = ? AND owner_user_id = ? AND tenant_id = ?
+        `).get(normalizedReportId, normalized.userId, normalized.tenantId);
+        if (!report) throw new Error("experiment report not found");
+    }
+    const result = db.prepare(`
+        INSERT INTO cross_source_experiment_approvals
+            (report_id, owner_user_id, tenant_id, action, from_config_version_id,
+             target_config_version_id, note, actor_user_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+        normalizedReportId,
+        normalized.userId,
+        normalized.tenantId,
+        String(action),
+        fromConfigVersionId == null ? null : Number(fromConfigVersionId) || null,
+        targetConfigVersionId == null ? null : Number(targetConfigVersionId) || null,
+        note == null ? null : String(note).slice(0, 1000),
+        actor,
+    );
+    return Number(result.lastInsertRowid);
+}
+
+export function listCrossSourceExperimentApprovals(scope, limit = 50) {
+    const normalized = requireScope(scope, "cross-source experiment approval");
+    const safeLimit = Math.max(1, Math.min(200, Number(limit) || 50));
+    return db.prepare(`
+        SELECT id, report_id, action, from_config_version_id,
+               target_config_version_id, note, actor_user_id, created_at
+        FROM cross_source_experiment_approvals
+        WHERE owner_user_id = ? AND tenant_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+    `).all(normalized.userId, normalized.tenantId, safeLimit);
 }
 
 // ── Phase 6b G6: Metric 聚合查询 ──
@@ -3019,6 +4161,187 @@ export function updateMCPServerConfigStatus(name, scope, enabled, status = "disc
     return updateMCPConfigStatusStmt.run(enabled ? 1 : 0, String(status), row.id, normalized.userId, normalized.tenantId).changes > 0;
 }
 
+function ensureMcpEvalTables() {
+    if (!hasTable("mcp_operation_observations") || !hasTable("mcp_eval_runs") || !hasTable("mcp_eval_case_results")) initDB();
+}
+
+function parseMcpJson(value, fallback) {
+    try { return JSON.parse(value || ""); } catch { return fallback; }
+}
+
+export function saveMcpOperationObservation(record = {}) {
+    ensureMcpEvalTables();
+    const scope = requireScope({ userId: record.owner_user_id, tenantId: record.tenant_id }, "MCP observation");
+    const operationId = String(record.operation_id || crypto.randomUUID());
+    db.prepare(`INSERT OR REPLACE INTO mcp_operation_observations
+        (operation_id, owner_user_id, tenant_id, request_id, trace_id, span_id,
+         server_name, tool_name, operation, status, error_code, duration_ms,
+         attempt_count, schema_status, subtask_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))`).run(
+        operationId,
+        scope.userId,
+        scope.tenantId,
+        record.request_id ? String(record.request_id) : null,
+        record.trace_id ? String(record.trace_id) : null,
+        record.span_id ? String(record.span_id) : null,
+        String(record.server_name || "unknown"),
+        record.tool_name ? String(record.tool_name) : null,
+        String(record.operation || "call_tool"),
+        String(record.status || "transport_error"),
+        record.error_code ? String(record.error_code) : null,
+        Math.max(0, Number(record.duration_ms) || 0),
+        Math.max(0, Number(record.attempt_count) || 0),
+        String(record.schema_status || "not_checked"),
+        record.subtask_id ? String(record.subtask_id) : null,
+        record.created_at ? String(record.created_at).replace("T", " ").replace("Z", "") : null,
+    );
+    return operationId;
+}
+
+export function listMcpOperationObservations(scope = null, {
+    window = "7d", serverName = null, toolName = null, status = null,
+    traceId = null, limit = 100, offset = 0,
+} = {}) {
+    ensureMcpEvalTables();
+    const normalized = requireScope(scope, "MCP observations");
+    const safeLimit = Math.max(1, Math.min(500, Number(limit) || 100));
+    const safeOffset = Math.max(0, Number(offset) || 0);
+    const clauses = ["owner_user_id = ?", "tenant_id = ?"];
+    const params = [normalized.userId, normalized.tenantId];
+    if (window !== "all") {
+        const days = window === "30d" ? 30 : 7;
+        clauses.push("created_at >= datetime('now', ?)");
+        params.push(`-${days} days`);
+    }
+    if (serverName) { clauses.push("server_name = ?"); params.push(String(serverName)); }
+    if (toolName) { clauses.push("tool_name = ?"); params.push(String(toolName)); }
+    if (status) { clauses.push("status = ?"); params.push(String(status)); }
+    if (traceId) { clauses.push("trace_id = ?"); params.push(String(traceId)); }
+    params.push(safeLimit, safeOffset);
+    return db.prepare(`SELECT * FROM mcp_operation_observations
+        WHERE ${clauses.join(" AND ")} ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(...params);
+}
+
+export function createMcpEvalRun({ runId, datasetVersion, caseIds = [], configId = null, variant = "fixture", baselineRunId = null, scope } = {}) {
+    ensureMcpEvalTables();
+    const normalized = requireScope(scope, "MCP evaluation");
+    const id = String(runId || crypto.randomUUID());
+    db.prepare(`INSERT INTO mcp_eval_runs
+        (run_id, owner_user_id, tenant_id, dataset_version, case_ids_json, config_id, variant, status, baseline_run_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)`).run(
+        id, normalized.userId, normalized.tenantId, String(datasetVersion || "mcp-fixture-v1"),
+        JSON.stringify(caseIds.map(String)), configId ? String(configId) : null, String(variant || "fixture"),
+        baselineRunId ? String(baselineRunId) : null,
+    );
+    return id;
+}
+
+export function saveMcpEvalCaseResult(result = {}, scope = null) {
+    ensureMcpEvalTables();
+    const normalized = requireScope(scope || { userId: result.owner_user_id, tenantId: result.tenant_id }, "MCP evaluation result");
+    db.prepare(`INSERT OR REPLACE INTO mcp_eval_case_results
+        (run_id, case_id, owner_user_id, tenant_id, layer, status, checks_json,
+         failure_class, observation_ids_json, trace_ids_json, duration_ms, sample_json, evidence_summary)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        String(result.run_id), String(result.case_id), normalized.userId, normalized.tenantId,
+        String(result.layer), String(result.status), JSON.stringify(result.checks || []),
+        result.failure_class ? String(result.failure_class) : null,
+        JSON.stringify(result.observation_ids || []), JSON.stringify(result.trace_ids || []),
+        Math.max(0, Number(result.duration_ms) || 0), JSON.stringify(result.sample || {}),
+        result.evidence_summary ? String(result.evidence_summary).slice(0, 500) : null,
+    );
+}
+
+export function completeMcpEvalRun(runId, { status = "completed", summary = {} } = {}, scope = null) {
+    ensureMcpEvalTables();
+    const normalized = requireScope(scope, "MCP evaluation");
+    return db.prepare(`UPDATE mcp_eval_runs SET status = ?, summary_json = ?, completed_at = CURRENT_TIMESTAMP
+        WHERE run_id = ? AND owner_user_id = ? AND tenant_id = ?`).run(
+        String(status), JSON.stringify(summary || {}), String(runId), normalized.userId, normalized.tenantId,
+    ).changes > 0;
+}
+
+function normalizeMcpRun(row) {
+    if (!row) return null;
+    return {
+        ...row,
+        case_ids: parseMcpJson(row.case_ids_json, []),
+        summary: parseMcpJson(row.summary_json, {}),
+    };
+}
+
+function normalizeMcpCase(row) {
+    return {
+        ...row,
+        checks: parseMcpJson(row.checks_json, []),
+        observation_ids: parseMcpJson(row.observation_ids_json, []),
+        trace_ids: parseMcpJson(row.trace_ids_json, []),
+        sample: parseMcpJson(row.sample_json, {}),
+    };
+}
+
+export function listMcpEvalRuns(scope = null, limit = 50) {
+    ensureMcpEvalTables();
+    const normalized = requireScope(scope, "MCP evaluations");
+    return db.prepare(`SELECT * FROM mcp_eval_runs WHERE owner_user_id = ? AND tenant_id = ?
+        ORDER BY created_at DESC LIMIT ?`).all(normalized.userId, normalized.tenantId, Math.max(1, Math.min(100, Number(limit) || 50))).map(normalizeMcpRun);
+}
+
+export function getMcpEvalRun(runId, scope = null) {
+    ensureMcpEvalTables();
+    const normalized = requireScope(scope, "MCP evaluation");
+    const run = db.prepare("SELECT * FROM mcp_eval_runs WHERE run_id = ? AND owner_user_id = ? AND tenant_id = ?")
+        .get(String(runId), normalized.userId, normalized.tenantId);
+    if (!run) return null;
+    const cases = db.prepare("SELECT * FROM mcp_eval_case_results WHERE run_id = ? AND owner_user_id = ? AND tenant_id = ? ORDER BY case_id")
+        .all(String(runId), normalized.userId, normalized.tenantId).map(normalizeMcpCase);
+    return { ...normalizeMcpRun(run), cases };
+}
+
+export function getMcpObservabilitySummary(scope = null, { window = "7d", serverName = null, toolName = null } = {}) {
+    const rows = listMcpOperationObservations(scope, { window, serverName, toolName, limit: 500, offset: 0 });
+    const count = rows.length;
+    const successful = rows.filter((row) => row.status === "success").length;
+    const attempts = rows.filter((row) => Number(row.attempt_count) > 0);
+    const sorted = rows.map((row) => Number(row.duration_ms) || 0).sort((a, b) => a - b);
+    const percentileValue = (p) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))] : null;
+    const ratio = (numerator, denominator) => ({ numerator, denominator, value: denominator ? Math.round((numerator / denominator) * 10000) / 10000 : null });
+    const grouped = new Map();
+    for (const row of rows) {
+        const key = `${row.server_name}/${row.tool_name || row.operation}`;
+        const current = grouped.get(key) || { serverName: row.server_name, toolName: row.tool_name, sampleSize: 0, success: 0, statuses: {} };
+        current.sampleSize += 1;
+        if (row.status === "success") current.success += 1;
+        current.statuses[row.status] = (current.statuses[row.status] || 0) + 1;
+        grouped.set(key, current);
+    }
+    return {
+        window,
+        sampleSize: count,
+        successRate: ratio(successful, count),
+        retryRate: ratio(attempts.filter((row) => Number(row.attempt_count) > 1).length, attempts.length),
+        latency: { p50: percentileValue(50), p95: percentileValue(95), sampleSize: count },
+        byServerTool: [...grouped.values()].map((row) => ({ ...row, successRate: ratio(row.success, row.sampleSize) })),
+        statuses: rows.reduce((acc, row) => { acc[row.status] = (acc[row.status] || 0) + 1; return acc; }, {}),
+        incomplete: rows.some((row) => Number(row.attempt_count) < 1),
+    };
+}
+
+export function compareMcpEvalRuns(baselineId, candidateId, scope = null) {
+    const baseline = getMcpEvalRun(baselineId, scope);
+    const candidate = getMcpEvalRun(candidateId, scope);
+    if (!baseline || !candidate) return { comparable: false, reason: "run_not_found", baseline, candidate };
+    const sameDataset = baseline.dataset_version === candidate.dataset_version;
+    const sameCases = JSON.stringify([...baseline.case_ids].sort()) === JSON.stringify([...candidate.case_ids].sort());
+    if (!sameDataset || !sameCases) {
+        return { comparable: false, reason: !sameDataset ? "dataset_version_mismatch" : "case_set_mismatch", baseline, candidate };
+    }
+    const baselineById = new Map(baseline.cases.map((item) => [item.case_id, item]));
+    const candidateById = new Map(candidate.cases.map((item) => [item.case_id, item]));
+    const perCase = baseline.case_ids.map((caseId) => ({ caseId, baseline: baselineById.get(caseId) || null, candidate: candidateById.get(caseId) || null }));
+    return { comparable: true, baseline, candidate, perCase, newlyFailed: perCase.filter((item) => item.baseline?.status === "pass" && item.candidate?.status === "fail").map((item) => item.caseId) };
+}
+
 export function saveOptimizationLog({
     sourceRunId,
     targetRunId = null,
@@ -3118,7 +4441,7 @@ export function updateOptimizationLog(id, { targetRunId, scoreAfter, status } = 
 export function getMigrationAuditSummary() {
     const tableNames = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all().map((row) => row.name);
     const nullableScopes = {};
-    for (const table of ["eval_traces", "eval_feedback", "eval_test_cases", "optimization_log", "agent_config_versions"]) {
+    for (const table of ["eval_traces", "eval_feedback", "eval_test_cases", "optimization_log", "agent_config_versions", "cross_source_experiment_reports", "cross_source_experiment_approvals", "cross_source_experiment_jobs"]) {
         if (!hasTable(table)) continue;
         const columns = getTableColumns(table).map((column) => column.name);
         const ownerColumn = columns.includes("owner_user_id") ? "owner_user_id" : (columns.includes("user_id") ? "user_id" : null);

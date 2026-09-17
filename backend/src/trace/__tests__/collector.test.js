@@ -20,6 +20,21 @@ describe("TraceCollector", () => {
         tc = new TraceCollector();
     });
 
+    it("keeps same-name parallel sibling spans independently closable", () => {
+        const traceId = tc.startTrace(1, 5, "chat");
+        const first = tc.startSpan(traceId, "知识库Agent", "agent", traceId, { subTaskId: "1" });
+        const second = tc.startSpan(traceId, "知识库Agent", "agent", traceId, { subTaskId: "2" });
+
+        tc.endSpan(traceId, first);
+        const trace = tc.getTrace(traceId);
+        expect(trace.spans.get(first).endedAt).toBeTruthy();
+        expect(trace.spans.get(second).endedAt).toBeNull();
+
+        tc.endSpan(traceId, second);
+        expect(trace.spans.get(second).endedAt).toBeTruthy();
+        expect(trace.rootSpan.children).toEqual([first, second]);
+    });
+
     // ── startTrace ──
 
     describe("startTrace", () => {

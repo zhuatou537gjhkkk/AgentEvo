@@ -33,6 +33,7 @@ import {
 const PREV_ENV = {
     langgraph: process.env.USE_LANGGRAPH,
     contextBuilder: process.env.CONTEXT_BUILDER_ENABLED,
+    generalReactLoop: process.env.GRAPH_GENERAL_REACT_LOOP_ENABLED,
 };
 
 const servers = [];
@@ -61,7 +62,7 @@ function headers(user) {
     };
 }
 
-async function postChat(user, sessionId, message, { planMode = false } = {}) {
+async function postChat(user, sessionId, message, { planMode = false, repoContext = null } = {}) {
     const response = await fetch(`${base}/chat`, {
         method: "POST",
         headers: headers(user),
@@ -71,6 +72,7 @@ async function postChat(user, sessionId, message, { planMode = false } = {}) {
             enable_web_search: false,
             plan_mode: planMode,
             enable_memory: false,
+            repo_context: repoContext || undefined,
         }),
     });
     return response;
@@ -101,7 +103,7 @@ function assistantTextsOf(userId, sessionId) {
  *
  * @returns {{ makeLlm: Function, log: Array<{content:string,attempt:number}>, whenFirstFail: Function }}
  */
-function makeFakeMakeLlm({ scenarioFor }) {
+function makeFakeMakeLlm({ scenarioFor, scriptedSteps = [] }) {
     const generalJson = JSON.stringify({
         intents: ["general"],
         primarySource: null,
@@ -147,10 +149,21 @@ function makeFakeMakeLlm({ scenarioFor }) {
         }
         // generalChat 等 streaming 节点：每 makeLlm() 一个实例、独立 attempt
         const streamer = { attempt: 0 };
-        const stream = streamingOnce(streamer);
+        const fallbackStream = streamingOnce(streamer);
+        const stream = async (msgs) => {
+            const step = scriptedSteps.shift();
+            if (step) return (async function* () { for (const chunk of step) yield chunk; })();
+            return fallbackStream(msgs);
+        };
+        const invoke = async () => {
+            const step = scriptedSteps.shift() || [{ content: "" }];
+            const last = step[step.length - 1] || {};
+            return { content: last.content || "", tool_calls: last.tool_calls || [] };
+        };
         return {
             stream,
-            bindTools: () => ({ stream }),
+            invoke,
+            bindTools: () => ({ stream, invoke }),
         };
     };
 
@@ -197,6 +210,8 @@ describe("graph reliability matrix (W4-R2)", () => {
         else process.env.USE_LANGGRAPH = PREV_ENV.langgraph;
         if (PREV_ENV.contextBuilder === undefined) delete process.env.CONTEXT_BUILDER_ENABLED;
         else process.env.CONTEXT_BUILDER_ENABLED = PREV_ENV.contextBuilder;
+        if (PREV_ENV.generalReactLoop === undefined) delete process.env.GRAPH_GENERAL_REACT_LOOP_ENABLED;
+        else process.env.GRAPH_GENERAL_REACT_LOOP_ENABLED = PREV_ENV.generalReactLoop;
         while (servers.length) {
             const server = servers.pop();
             await new Promise((resolve) => server.close(resolve));
@@ -285,6 +300,41 @@ describe("graph reliability matrix (W4-R2)", () => {
 
         expect(attemptsFor(fake.log, "R2ABORT77")).toBe(1);
         expect(rolesOf(ALICE.id, sessionId)).toEqual(["user"]); // 仅 user，无假 assistant
+    });
+
+    it("whole-file attachment reaches code_agent as a scoped reader instead of a static head packet", async () => {
+        const MARKER = "R2WHOLEFILE900";
+        const fake = makeFakeMakeLlm({
+            scenarioFor: (c) => ({ mode: "ok", text: c }),
+            scriptedSteps: [
+                [{ content: "", tool_calls: [{ name: "read_attached_file", args: { path: "backend/src/services/chatGraph.js", start_line: 2401, max_lines: 1 }, id: "read_late" }] }],
+                [{ content: "" }],
+                [{ content: `读取后段成功：${MARKER}` }],
+            ],
+        });
+        base = await bootApp(fake);
+        const sessionId = newSession(ALICE.id);
+        const repoContextService = {
+            resolve: async () => ({
+                packets: [],
+                wholeFiles: [{
+                    path: "backend/src/services/chatGraph.js",
+                    commit: "abcdef1234567890",
+                    read: async ({ startLine, maxLines }) => ({
+                        data: { startLine, endLine: startLine + maxLines - 1, lines: [`${MARKER}:${startLine}`] },
+                    }),
+                }],
+            }),
+        };
+        // Reboot this scenario with the descriptor seam; no filesystem project is needed.
+        while (servers.length) await new Promise((resolve) => servers.pop().close(resolve));
+        base = await open(createApp({ dependencies: { services: { makeLlm: fake.makeLlm, repoContextService } } }));
+        const resp = await postChat(ALICE, sessionId, "读取附加文件后段", {
+            repoContext: { projectId: "proj_1", refs: [{ path: "backend/src/services/chatGraph.js", mode: "whole_file" }] },
+        });
+        const body = await resp.text();
+        expect(body).toContain(`读取后段成功：${MARKER}`);
+        expect(body).toContain('"toolName":"read_attached_file"');
     });
 
     it("4) concurrent users: A's disconnect during backoff does not cancel B's in-flight run", async () => {

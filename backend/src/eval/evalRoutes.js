@@ -14,7 +14,17 @@ import { EvalRunner } from "./runner.js";
 import { TestCaseGenerator } from "./generator.js";
 import { getTestCasesByCategory, getTestCaseCategories, testCases } from "./testCases.js";
 import { getRunSummary, getTrends, getTrendsByRun, getRunList, getFeedback, getFeedbackStats } from "./metrics.js";
-import { saveFeedback, getScoresByRun, listConfigVersions } from "../db/index.js";
+import {
+    saveFeedback,
+    getScoresByRun,
+    listConfigVersions,
+    getCrossSourceFeedbackEvidence,
+    listCrossSourceExperimentReports,
+    listCrossSourceExperimentApprovals,
+    saveCrossSourceExperimentApproval,
+    getCrossSourceExperimentReport,
+    getCrossSourceExperimentJob,
+} from "../db/index.js";
 import {
     getGeneratedTestCases,
     getGeneratedTestCaseById,
@@ -25,6 +35,12 @@ import {
 import { OptimizationPipeline } from "../services/optimize.js";
 import { scopeFromRequest, notFoundResource } from "../security/resourceScope.js";
 import { toErrorEnvelope } from "../services/resilience.js";
+import { calibrateHelpfulnessFromFeedback } from "./feedbackCalibration.js";
+import { aggregateCrossSourceFeedbackImpact } from "./crossSourceImpact.js";
+import { crossSourceExperimentEnabled, crossSourceImpactEnabled } from "../services/memoryFlags.js";
+import { evaluateCrossSourceCanary, summarizeCrossSourceExperiment } from "./crossSourceExperiment.js";
+import { compareCrossSourceExperimentReports, evaluateCrossSourceReleaseGuard } from "./crossSourceExperimentReport.js";
+import { createCrossSourceExperimentSnapshot } from "./crossSourceExperimentSampler.js";
 
 const router = express.Router();
 
@@ -40,6 +56,10 @@ function sendError(req, res, statusCode = 500, code = "REQUEST_FAILED", message 
     }), req.requestId));
 }
 
+function toRate(score) {
+    return Number.isFinite(Number(score)) ? Math.round(Number(score) / 5 * 100) / 100 : null;
+}
+
 /**
  * POST /eval/run
  * 运行评估套件
@@ -49,7 +69,7 @@ function sendError(req, res, statusCode = 500, code = "REQUEST_FAILED", message 
 router.post("/run", async (req, res) => {
     try {
         const scope = getScope(req);
-        const { testCaseIds, runId, categories, reflect = false } = req.body || {};
+        const { testCaseIds, runId, categories, reflect = false, includeScenarioFixtures = false } = req.body || {};
         if (testCaseIds !== undefined && !Array.isArray(testCaseIds)) {
             return res.status(400).json(toErrorEnvelope(Object.assign(new Error("testCaseIds 必须是数组"), { code: "INVALID_ARGUMENT", statusCode: 400 }), req.requestId));
         }
@@ -74,7 +94,7 @@ router.post("/run", async (req, res) => {
 
         const runner = new EvalRunner();
 
-        const report = await runner.run(validIds, runId, { reflect, scope });
+        const report = await runner.run(validIds, runId, { reflect, scope, includeScenarioFixtures: includeScenarioFixtures === true || categories?.includes("cross_source_recall") });
 
         res.json({ ok: true, ...report });
     } catch (err) {
@@ -131,6 +151,8 @@ router.get("/report", (req, res) => {
         const allCategories = getTestCaseCategories();
         let categories = allCategories;
         let totalTestCases = testCases.length;
+        let memoryQuality = null;
+        let crossSourceQuality = null;
 
         if (runId) {
             const rows = getScoresByRun(String(runId), scope);
@@ -146,6 +168,26 @@ router.get("/report", (req, res) => {
             }
             categories = Object.entries(categoryCount).map(([category, count]) => ({ category, count }));
             totalTestCases = runTestCaseIds.length;
+            const runSummary = getRunSummary(String(runId), scope);
+            if (Number.isFinite(Number(runSummary.avgScores?.memory_quality))) {
+                memoryQuality = {
+                    version: "memory-quality-v1",
+                    averageScore: Math.round(Number(runSummary.avgScores.memory_quality) / 5 * 100) / 100,
+                    actionCompliance: toRate(runSummary.avgScores.memory_action_compliance),
+                    responseEvidence: toRate(runSummary.avgScores.memory_response_evidence),
+                    safety: toRate(runSummary.avgScores.memory_safety),
+                };
+            }
+            if (Number.isFinite(Number(runSummary.avgScores?.cross_source_quality))) {
+                crossSourceQuality = {
+                    version: "cross-source-quality-v1",
+                    averageScore: toRate(runSummary.avgScores.cross_source_quality),
+                    isolation: toRate(runSummary.avgScores.cross_source_isolation),
+                    sourceCoverage: toRate(runSummary.avgScores.cross_source_coverage),
+                    budgetCompliance: toRate(runSummary.avgScores.cross_source_budget),
+                    helpfulness: toRate(runSummary.avgScores.cross_source_helpfulness),
+                };
+            }
         } else {
             // 无 runId 时，把已审核的生成用例也计入总数 (G7)
             const generatedReviewed = getGeneratedTestCases({ reviewed: 1, page: 1, pageSize: 1000, scope });
@@ -158,6 +200,8 @@ router.get("/report", (req, res) => {
             feedbackStats,
             totalTestCases,
             categories,
+            memoryQuality,
+            crossSourceQuality,
             runId: runId || null,
         });
     } catch (err) {
@@ -167,10 +211,211 @@ router.get("/report", (req, res) => {
 });
 
 /**
- * GET /eval/feedback/:messageId
- * 获取用户对某条消息的反馈
+ * POST /eval/cross-source/calibrate
+ * Calibrate the deterministic helpfulness proxy against bounded human labels.
+ * The endpoint accepts only metrics + thumbs_up/thumbs_down; raw answer or
+ * memory content is rejected and never persisted.
  */
-router.get("/feedback/:messageId", (req, res) => {
+router.post("/cross-source/calibrate", (req, res) => {
+    try {
+        const records = Array.isArray(req.body?.records) ? req.body.records.slice(0, 1000) : null;
+        if (!records) {
+            return sendError(req, res, 400, "INVALID_ARGUMENT", "records must be an array");
+        }
+        const rawFields = ["text", "answer", "content", "memory", "trace"];
+        if (records.some((record) => rawFields.some((field) => Object.prototype.hasOwnProperty.call(record || {}, field)))) {
+            return sendError(req, res, 400, "CALIBRATION_RAW_CONTENT_NOT_ALLOWED", "calibration accepts metrics and feedback labels only");
+        }
+        const safeRecords = records.map((record) => ({
+            rating: record?.rating,
+            metrics: record?.metrics || record?.features || {},
+        }));
+        return res.json({ ok: true, calibration: calibrateHelpfulnessFromFeedback(safeRecords) });
+    } catch (err) {
+        console.error(`[eval] POST /cross-source/calibrate failed:`, err.message);
+        return sendError(req, res, 500, "CALIBRATION_FAILED", "calibration failed");
+    }
+});
+
+/**
+ * GET /eval/cross-source/impact
+ * Read-only owner-scoped comparison of feedback for injected vs control turns.
+ */
+router.get("/cross-source/impact", (req, res) => {
+    try {
+        if (!crossSourceImpactEnabled()) {
+            return res.json({ ok: true, enabled: false, impact: null });
+        }
+        const limit = Math.max(1, Math.min(1000, Number(req.query.limit) || 200));
+        const minSamples = Math.max(1, Math.min(100, Number(req.query.min_samples || req.query.minSamples) || 5));
+        const evidence = getCrossSourceFeedbackEvidence(getScope(req), limit);
+        const impact = aggregateCrossSourceFeedbackImpact(evidence, { minSamples });
+        return res.json({ ok: true, enabled: true, impact });
+    } catch (err) {
+        console.error(`[eval] GET /cross-source/impact failed:`, err.message);
+        return sendError(req, res, 500, "IMPACT_REPORT_FAILED", "impact report failed");
+    }
+});
+
+/**
+ * GET /eval/cross-source/experiment
+ * Stratified injected/control report with a manual-canary gate.
+ */
+router.get("/cross-source/experiment", (req, res) => {
+    try {
+        if (!crossSourceExperimentEnabled()) {
+            return res.json({ ok: true, enabled: false, experiment: null, canary: null });
+        }
+        const limit = Math.max(1, Math.min(1000, Number(req.query.limit) || 200));
+        const minSamples = Math.max(1, Math.min(100, Number(req.query.min_samples || req.query.minSamples) || 5));
+        const evidence = getCrossSourceFeedbackEvidence(getScope(req), limit);
+        const experiment = summarizeCrossSourceExperiment(evidence, { minSamples });
+        const canary = evaluateCrossSourceCanary({ summary: experiment });
+        return res.json({ ok: true, enabled: true, experiment, canary });
+    } catch (err) {
+        console.error(`[eval] GET /cross-source/experiment failed:`, err.message);
+        return sendError(req, res, 500, "EXPERIMENT_REPORT_FAILED", "experiment report failed");
+    }
+});
+
+/**
+ * POST /eval/cross-source/experiment/snapshots
+ * Persist one content-free, owner-scoped report for the current time window.
+ * This is the manual/HTTP trigger for M14; the optional background sampler
+ * calls the same snapshot service when explicitly enabled.
+ */
+router.post("/cross-source/experiment/snapshots", (req, res) => {
+    try {
+        if (!crossSourceExperimentEnabled()) {
+            return res.json({ ok: true, enabled: false, snapshot: null });
+        }
+        const body = req.body || {};
+        const snapshot = createCrossSourceExperimentSnapshot(getScope(req), {
+            limit: body.limit,
+            minSamples: body.min_samples ?? body.minSamples,
+            windowHours: body.window_hours ?? body.windowHours,
+            configVersionId: body.config_version_id ?? body.configVersionId,
+            experimentKey: body.experiment_key ?? body.experimentKey,
+        });
+        return res.json({ ok: true, enabled: true, snapshot });
+    } catch (err) {
+        console.error(`[eval] POST /cross-source/experiment/snapshots failed:`, err.message);
+        return sendError(req, res, 500, "EXPERIMENT_SNAPSHOT_FAILED", "experiment snapshot failed");
+    }
+});
+
+/**
+ * GET /eval/cross-source/experiment/history
+ * Return recent persisted reports plus a sanitized before/after comparison.
+ */
+router.get("/cross-source/experiment/history", (req, res) => {
+    try {
+        if (!crossSourceExperimentEnabled()) {
+            return res.json({ ok: true, enabled: false, reports: [], comparison: null, approvals: [] });
+        }
+        const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 20));
+        const reports = listCrossSourceExperimentReports(getScope(req), limit);
+        const comparison = reports.length >= 2
+            ? compareCrossSourceExperimentReports(reports[1], reports[0])
+            : null;
+        const approvals = listCrossSourceExperimentApprovals(getScope(req), limit);
+        return res.json({ ok: true, enabled: true, reports, comparison, approvals });
+    } catch (err) {
+        console.error(`[eval] GET /cross-source/experiment/history failed:`, err.message);
+        return sendError(req, res, 500, "EXPERIMENT_HISTORY_FAILED", "experiment history failed");
+    }
+});
+
+/**
+ * GET /eval/cross-source/experiment/release-guard
+ * Compare two persisted snapshots before a human changes the config.
+ */
+router.get("/cross-source/experiment/release-guard", (req, res) => {
+    try {
+        if (!crossSourceExperimentEnabled()) {
+            return res.json({ ok: true, enabled: false, guard: null });
+        }
+        const beforeId = Number(req.query.before_id || req.query.beforeId);
+        const afterId = Number(req.query.after_id || req.query.afterId);
+        if (!Number.isInteger(beforeId) || !Number.isInteger(afterId) || beforeId <= 0 || afterId <= 0) {
+            return sendError(req, res, 400, "INVALID_ARGUMENT", "before_id and after_id are required");
+        }
+        const scope = getScope(req);
+        const before = getCrossSourceExperimentReport(scope, beforeId);
+        const after = getCrossSourceExperimentReport(scope, afterId);
+        if (!before || !after) {
+            return sendError(req, res, 404, "NOT_FOUND", "experiment report not found");
+        }
+        return res.json({
+            ok: true,
+            enabled: true,
+            comparison: compareCrossSourceExperimentReports(before, after),
+            guard: evaluateCrossSourceReleaseGuard({ before: before.report, after: after.report }),
+        });
+    } catch (err) {
+        console.error(`[eval] GET /cross-source/experiment/release-guard failed:`, err.message);
+        return sendError(req, res, 500, "EXPERIMENT_GUARD_FAILED", "experiment release guard failed");
+    }
+});
+
+/** M15: inspect the durable sampler lease without exposing its holder token. */
+router.get("/cross-source/experiment/job", (req, res) => {
+    try {
+        if (!crossSourceExperimentEnabled()) {
+            return res.json({ ok: true, enabled: false, job: null });
+        }
+        const job = getCrossSourceExperimentJob(getScope(req));
+        return res.json({ ok: true, enabled: true, job });
+    } catch (err) {
+        console.error(`[eval] GET /cross-source/experiment/job failed:`, err.message);
+        return sendError(req, res, 500, "EXPERIMENT_JOB_FAILED", "experiment job status failed");
+    }
+});
+
+/**
+ * POST /eval/cross-source/experiment/approvals
+ * Record a human decision. It intentionally does not call AgentConfigService;
+ * publishing/rollback remains an explicit separate operation.
+ */
+router.post("/cross-source/experiment/approvals", (req, res) => {
+    try {
+        if (!crossSourceExperimentEnabled()) {
+            return res.json({ ok: true, enabled: false, approval: null });
+        }
+        const body = req.body || {};
+        const action = String(body.action || "");
+        if (!["approve_canary", "keep_control", "rollback", "review"].includes(action)) {
+            return sendError(req, res, 400, "INVALID_ARGUMENT", "invalid experiment approval action");
+        }
+        if (body.note !== undefined && String(body.note).length > 1000) {
+            return sendError(req, res, 400, "INVALID_ARGUMENT", "approval note is too long");
+        }
+        const id = saveCrossSourceExperimentApproval(getScope(req), {
+            reportId: body.report_id ?? body.reportId,
+            action,
+            fromConfigVersionId: body.from_config_version_id ?? body.fromConfigVersionId,
+            targetConfigVersionId: body.target_config_version_id ?? body.targetConfigVersionId,
+            note: body.note,
+            actorUserId: req.user?.id,
+        });
+        return res.status(201).json({ ok: true, enabled: true, approval: { id, action } });
+    } catch (err) {
+        console.error(`[eval] POST /cross-source/experiment/approvals failed:`, err.message);
+        return sendError(req, res, 500, "EXPERIMENT_APPROVAL_FAILED", "experiment approval failed");
+    }
+});
+
+/**
+ * GET /eval/feedback/:messageId
+ * 获取用户对某条消息的反馈（聊天 UI 在每条 assistant 消息挂载时用于恢复 👍/👎）。
+ *
+ * 独立路由 + 独立限流 scope（eval-feedback），由 app.js 在共享的 /eval（30/min
+ * 管理面预算）之前前置挂载。聊天 UI 的反馈恢复在虚拟列表重挂载下请求量很大，
+ * 若与 EvalDashboard 的 run/report/compare 共用同桶限流，一次流式回复就能打光
+ * 预算 → 后续全部 /eval 请求 429 → 反馈恢复又触发前端 429 自动重试，形成风暴。
+ */
+export const evalFeedbackRouter = express.Router();
+evalFeedbackRouter.get("/feedback/:messageId", (req, res) => {
     try {
         const reqUserId = Number(req.user?.id || 1);
         const messageId = Number(req.params.messageId);

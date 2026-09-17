@@ -151,6 +151,21 @@ function route(method, url, opts = {}) {
         server.run = { ...server.run, worktreeStatus: "removed" };
         return { ok: true, run: server.run };
     }
+    if (p === "/coding/runs/run_1/land" && m === "POST") {
+        server.run = makeRun({ status: "completed", mode: "trusted", preset: "trusted", worktreeStatus: "ready" });
+        return { ok: true, applied: true, method: "working_tree", files: [{ path: "b.txt", status: "A" }], counts: { added: 1, modified: 0, deleted: 0, changed: 1 } };
+    }
+    // main-project read surface (used by loadTree / loadGitStatus after landing)
+    if (p === "/coding/projects/proj_1/ops" && m === "POST") {
+        const { op } = body;
+        if (op === "list_tree") {
+            return { ok: true, op, data: { entries: [{ rel: "b.txt", type: "file", size: 3 }], counts: { dirs: 0, files: 1 }, truncated: false } };
+        }
+        if (op === "git.status") {
+            return { ok: true, op, data: { isRepo: true, commit: "aa11bb22", branch: "main", clean: false, entries: [{ x: "", y: "M", path: "a.txt" }, { x: "?", y: "?", path: "b.txt" }], truncated: false } };
+        }
+        throw new Error(`unexpected project op ${op}`);
+    }
 
     // transcripts
     if (p === "/coding/runs/run_1/actions" && m === "GET") {
@@ -170,13 +185,16 @@ function route(method, url, opts = {}) {
     if (p === "/coding/runs/run_1/ops" && m === "POST") {
         const { op, args } = body;
         if (op === "git.status") {
-            return { ok: true, effect: "read", op, data: { isRepo: true, commit: "aa11bb22", branch: "coding/run-run_1", clean: false, entries: [{ x: "", y: "M", path: "a.txt" }], truncated: false } };
+            const entries = server.gitStatusEntries !== undefined ? server.gitStatusEntries : [{ x: "", y: "M", path: "a.txt" }];
+            return { ok: true, effect: "read", op, data: { isRepo: true, commit: "aa11bb22", branch: "coding/run-run_1", clean: entries.length === 0, entries, truncated: false } };
         }
         if (op === "git.diff") {
-            return { ok: true, effect: "read", op, data: { diff: "diff --git a/a.txt b/a.txt\n", filesChanged: ["a.txt"], truncated: false, byteLength: 24, commit: "aa11bb22" } };
+            const target = args && args.path ? args.path : "a.txt";
+            return { ok: true, effect: "read", op, data: { diff: `diff --git a/${target} b/${target}\n`, filesChanged: [target], truncated: false, byteLength: 24, commit: "aa11bb22" } };
         }
         if (op === "read_file") {
-            return { ok: true, effect: "read", op, data: { path: args.path, startLine: 1, endLine: 1, lineCount: 1, lines: ["hi"], truncated: false, byteLength: 2 } };
+            const lines = Array.isArray(server.readFileLines) ? server.readFileLines : ["hi"];
+            return { ok: true, effect: "read", op, data: { path: args.path, startLine: 1, endLine: lines.length, lineCount: lines.length, lines, truncated: false, byteLength: 2 } };
         }
         // write/exec
         if (server.policy === "execute" || (server.policy === "auto" && toolForOp(op) !== "run_command")) {
@@ -249,6 +267,7 @@ function resetStoreState() {
         runArtifacts: { items: [], loading: false, error: null },
         runGit: { status: null, loading: false, error: null },
         runDiff: { text: "", filesChanged: [], truncated: false, byteLength: null, loading: false, error: null },
+        runChanges: { runId: null, files: [], loading: false, error: null },
         runFileView: { path: null, lines: [], startLine: 1, lineCount: 0, truncated: false, loading: false, error: null },
         pendingRunOps: {},
         lastCommandOutputs: [],
@@ -482,5 +501,90 @@ describe("run-scoped reads", () => {
         await getState().readRunFile("run_1", "a.txt", 1);
         expect(getState().runFileView.lines).toEqual(["hi"]);
         expect(getState().runFileView.path).toBe("a.txt");
+    });
+});
+
+// ═══════════════════════════════════════════════════════════
+// 落地(land)自动刷新真实工作区 + run 改动清单（loadRunChanges）
+// ═══════════════════════════════════════════════════════════
+
+describe("land / run-changes review", () => {
+    function opsPosted(part) {
+        return fetch.mock.calls
+            .filter(([url, opts]) => String(url).includes(part) && opts && opts.body)
+            .map(([, opts]) => JSON.parse(opts.body));
+    }
+
+    it("loadRunChanges 把 git.status/diff/read 汇成可审阅改动清单（新文件=内容、修改=diff）", async () => {
+        server.gitStatusEntries = [
+            { x: "?", y: "?", path: "new.txt" },
+            { x: "", y: "M", path: "a.txt" },
+        ];
+        server.readFileLines = ["line one", "line two"];
+        await getState().loadRunChanges("run_1");
+
+        const changes = getState().runChanges;
+        expect(changes.error).toBeNull();
+        expect(changes.runId).toBe("run_1");
+        expect(changes.files).toHaveLength(2);
+        const added = changes.files.find((f) => f.path === "new.txt");
+        expect(added.status).toBe("A");
+        expect(added.isNew).toBe(true);
+        expect(added.bodyIsDiff).toBe(false);
+        expect(added.body).toBe("line one\nline two");
+        const modified = changes.files.find((f) => f.path === "a.txt");
+        expect(modified.status).toBe("M");
+        expect(modified.bodyIsDiff).toBe(true);
+        expect(modified.body).toContain("diff --git a/a.txt b/a.txt");
+        // the new file's body came from a worktree read, not a (empty) diff
+        const reads = opsPosted("run_1/ops").filter((b) => b.op === "read_file" && b.args && b.args.path === "new.txt");
+        expect(reads.length).toBeGreaterThan(0);
+    });
+
+    it("loadRunChanges 幂等：非 force 命中缓存，force 才重新拉取", async () => {
+        server.gitStatusEntries = [{ x: "", y: "M", path: "a.txt" }];
+        await getState().loadRunChanges("run_1");
+        await getState().loadRunChanges("run_1"); // cached → no new fetch
+        expect(opsPosted("run_1/ops").filter((b) => b.op === "git.status")).toHaveLength(1);
+        await getState().loadRunChanges("run_1", { force: true });
+        expect(opsPosted("run_1/ops").filter((b) => b.op === "git.status")).toHaveLength(2);
+    });
+
+    it("landToMain 只做落地动作；真实工作区刷新由 refreshAfterLand 显式完成（重置根目录树）", async () => {
+        const body = await getState().landToMain("run_1");
+        expect(body).not.toBeNull();
+        expect(body.applied).toBe(true);
+        expect(body.files).toEqual([{ path: "b.txt", status: "A" }]);
+        expect(getState().toastKind).toBe("ok");
+        const landed = fetch.mock.calls.some(
+            ([url, opts]) => String(opts?.method || "GET").toUpperCase() === "POST" && String(url).includes("/coding/runs/run_1/land"),
+        );
+        expect(landed).toBe(true);
+        // landToMain 本身不碰真实文件树/git（由组件落地后显式调 refreshAfterLand）
+        expect(opsPosted("proj_1/ops").length).toBe(0);
+
+        // 落地成功后：即使当前文件树在深层子目录/窄深度，也重置回根 depth2 再刷
+        useWorkspaceStore.setState({ treeBase: "src/deep", treeDepth: 4 });
+        await getState().refreshAfterLand();
+
+        const projOps = opsPosted("proj_1/ops");
+        expect(projOps.some((b) => b.op === "list_tree" && b.args && b.args.path === "")).toBe(true);
+        expect(projOps.some((b) => b.op === "git.status")).toBe(true);
+        expect(getState().treeBase).toBe("");
+        expect(getState().treeDepth).toBe(2);
+        // 树里能直接看到落地的新文件，无需手动刷新浏览器
+        expect(getState().treeEntries.some((e) => e.rel === "b.txt")).toBe(true);
+        // FilesSection 的"工作区改动"条数据源（真实 git 状态）也已刷新
+        expect(getState().git.status?.entries.some((e) => e.path === "b.txt")).toBe(true);
+    });
+
+    it("落地前清单有错时，landToMain 返回的 files 可作展示兜底（不改 store 状态）", async () => {
+        // runChanges 若在 run 完成前没加载成功，展示层还能用 land 返回的 files
+        server.gitStatusEntries = [];
+        const body = await getState().landToMain("run_1");
+        expect(body?.applied).toBe(true);
+        expect(Array.isArray(body.files)).toBe(true);
+        // 落地不改变 runChanges（那是 worktree 审查数据，force 重拉由组件负责）
+        expect(getState().runChanges.runId).toBeNull();
     });
 });

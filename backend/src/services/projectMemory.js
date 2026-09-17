@@ -19,6 +19,12 @@
  * flag OFF 时既有 agent_memory / MemoryService 行为逐字节不变。
  */
 import db, { initDB } from "../db/index.js";
+import { memoryContractEnabled } from "./memoryFlags.js";
+import {
+    buildProjectMemoryProvenance,
+    normalizeContextMetadata,
+    normalizeMemoryStatus,
+} from "./memoryContract.js";
 
 export const PROJECT_MEMORY_LAYERS = Object.freeze({
     WORKING: "working",
@@ -250,7 +256,7 @@ function ensure() {
 // ────────────────────────── 行映射 ──────────────────────────
 
 function memoryFromRow(row, relevanceScore = 0) {
-    return {
+    const memory = {
         id: row.id,
         projectId: row.project_id,
         layer: row.layer,
@@ -267,6 +273,32 @@ function memoryFromRow(row, relevanceScore = 0) {
         createdAt: row.created_at,
         relevanceScore: Number(relevanceScore) || 0,
     };
+    if (memoryContractEnabled()) {
+        memory.contractVersion = "memory-context-v2";
+        memory.status = normalizeMemoryStatus({ invalidated: Boolean(row.invalidated) });
+        memory.sourceType = "project_memory";
+        memory.scope = {
+            ownerUserId: Number(row.owner_user_id) || null,
+            tenantId: row.tenant_id || null,
+            projectId: row.project_id || null,
+            sessionId: null,
+        };
+        memory.provenance = buildProjectMemoryProvenance({
+            id: row.id,
+            ownerUserId: row.owner_user_id,
+            tenantId: row.tenant_id,
+            projectId: row.project_id,
+            runId: row.run_id,
+            sourceRunId: row.source_run_id,
+            files: memory.files,
+            commitRef: row.commit_ref,
+            confidence: row.confidence,
+            createdAt: row.created_at,
+            invalidatedAt: row.invalidated_at,
+            invalidationReason: row.invalidate_reason,
+        });
+    }
+    return memory;
 }
 
 // ────────────────────────── 用户级 agent_memory 计数（分离验证） ──────────────────────────
@@ -590,11 +622,8 @@ export class ProjectMemoryService {
         }
         merged.sort((a, b) => (b.relevanceScore || 0) - (a.relevanceScore || 0));
 
-        return merged.slice(0, safeLimit).map((mem) => ({
-            content: `[项目记忆] ${mem.content}`,
-            timestamp: toIso(mem.createdAt),
-            relevanceScore: Math.max(0, Math.min(1, Number(mem.relevanceScore) || 0)),
-            metadata: {
+        return merged.slice(0, safeLimit).map((mem) => {
+            const metadata = {
                 type: "memory",
                 memory_type: mem.layer,
                 projectMemory: true,
@@ -607,8 +636,29 @@ export class ProjectMemoryService {
                     confidence: mem.confidence,
                     importance: mem.importance,
                 },
-            },
-        }));
+            };
+            if (memoryContractEnabled()) {
+                metadata.status = mem.status || "active";
+                metadata.sourceType = "project_memory";
+                metadata.ownerUserId = this.ownerUserId;
+                metadata.tenantId = this.tenantId;
+                metadata.confidence = mem.confidence;
+                metadata.scope = mem.scope;
+                metadata.provenance = mem.provenance;
+                return {
+                    content: `[项目记忆] ${mem.content}`,
+                    timestamp: toIso(mem.createdAt),
+                    relevanceScore: Math.max(0, Math.min(1, Number(mem.relevanceScore) || 0)),
+                    metadata: normalizeContextMetadata(metadata),
+                };
+            }
+            return {
+            content: `[项目记忆] ${mem.content}`,
+            timestamp: toIso(mem.createdAt),
+            relevanceScore: Math.max(0, Math.min(1, Number(mem.relevanceScore) || 0)),
+            metadata,
+            };
+        });
     }
 
     /** 用户记忆计数（项目写入绝不触碰用户层；分离验证用）。 */

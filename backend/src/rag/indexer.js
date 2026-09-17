@@ -29,6 +29,8 @@ import { sha256Hex } from "./knowledgeStore.js";
 import { splitCodeByLines, extractSymbols } from "./codeChunk.js";
 import { classifyError } from "../services/resilience.js";
 import { invalidateDurableStore } from "./vectorStoreAdapter.js";
+import { getFaissVectorStore, safeFaissErrorCode } from "./faissVectorStore.js";
+import { ragFaissEnabled } from "./flags.js";
 import {
     getActiveDocumentByPath,
     listActiveDocuments,
@@ -46,6 +48,39 @@ const DEFAULT_STORE = {
     getActiveChunks,
     fillChunkEmbeddings,
 };
+
+function faissSummary(store) {
+    try {
+        const stats = typeof store?.stats === "function" ? store.stats({ ensure: false }) : {};
+        return {
+            status: "ready",
+            generation: Number.isSafeInteger(Number(stats?.generation)) ? Number(stats.generation) : null,
+            chunkCount: Math.max(0, Number(stats?.chunkCount) || 0),
+            buildLatencyMs: Math.max(0, Number(stats?.buildLatencyMs) || 0),
+        };
+    } catch {
+        return { status: "ready", generation: null, chunkCount: 0, buildLatencyMs: 0 };
+    }
+}
+
+/** FAISS is derived work: a failure is recorded safely and never fails ingest. */
+function maybeBuildFaiss({ scope, projectId, storeRef, vectorStore, summary }) {
+    if (!ragFaissEnabled() && !vectorStore) return;
+    const faissStore = vectorStore?.name === "faiss"
+        ? vectorStore
+        : getFaissVectorStore({ scope, projectId, store: storeRef });
+    if (typeof faissStore?.ensureIndex !== "function" && typeof faissStore?.buildIndex !== "function") return;
+    try {
+        if (typeof faissStore.ensureIndex === "function") faissStore.ensureIndex();
+        else faissStore.buildIndex();
+        summary.faiss = faissSummary(faissStore);
+    } catch (error) {
+        summary.faiss = {
+            status: "fallback",
+            fallbackCode: safeFaissErrorCode(error),
+        };
+    }
+}
 
 function pathBasename(filePath) {
     const parts = String(filePath ?? "").split(/[\\/]+/);
@@ -151,6 +186,7 @@ export async function indexProjectSnapshot({ scope, projectId, files, sourceRunI
         chunkCount: 0,
         embeddingErrors: 0,
         errors: [],
+        faiss: { status: "disabled" },
     };
 
     if (reportOnly) {
@@ -232,6 +268,7 @@ export async function indexProjectSnapshot({ scope, projectId, files, sourceRunI
     if (summary.indexed + summary.updated + summary.deleted > 0 || plan.toIndex.length > 0) {
         invalidateDurableStore({ scope, projectId });
     }
+    maybeBuildFaiss({ scope, projectId, storeRef, vectorStore, summary });
     return summary;
 }
 
@@ -241,7 +278,7 @@ export async function indexProjectSnapshot({ scope, projectId, files, sourceRunI
  * @returns {{requiresEmbedder:boolean, embedded:number, total:number,
  *   errors:{chunkId:number,errorCode:string,message:string}[]}}
  */
-export async function rebuildProjectIndex({ scope, projectId, store = null, embedder = null, opts = {} } = {}) {
+export async function rebuildProjectIndex({ scope, projectId, store = null, embedder = null, vectorStore = null, opts = {} } = {}) {
     const storeRef = store || DEFAULT_STORE;
     const batchSize = Math.max(1, Number(opts?.batchEmbedSize) || 25);
     const rows = storeRef.getActiveChunks(scope, projectId, { limit: 100000 }) || [];
@@ -274,7 +311,9 @@ export async function rebuildProjectIndex({ scope, projectId, store = null, embe
         embedded = storeRef.fillChunkEmbeddings(scope, rowsWithEmbedding) || 0;
         invalidateDurableStore({ scope, projectId });
     }
-    return { requiresEmbedder: false, embedded, total, errors };
+    const summary = { requiresEmbedder: false, embedded, total, errors };
+    maybeBuildFaiss({ scope, projectId, storeRef, vectorStore, summary });
+    return summary;
 }
 
 export default { planFileChanges, indexProjectSnapshot, rebuildProjectIndex };

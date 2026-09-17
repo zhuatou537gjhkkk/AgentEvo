@@ -75,14 +75,20 @@ const duckIsStructuredTool = (tool) => Boolean(
 
 /** 安全序列化 args（工具调用参数，可能是对象或 JSON 串） */
 function parseArgs(tc) {
-    if (tc?.args != null) return tc.args;
+    // Some OpenAI-compatible stream chunks surface a provisional empty `args`
+    // object alongside the real JSON in `function.arguments`. Do not let that
+    // placeholder mask the provider payload.
+    const explicitArgs = tc?.args;
+    const hasExplicitArgs = explicitArgs != null
+        && (typeof explicitArgs !== "object" || Object.keys(explicitArgs).length > 0);
+    if (hasExplicitArgs) return explicitArgs;
     const fnArgs = tc?.function?.arguments;
-    if (fnArgs == null) return {};
+    if (fnArgs == null) return explicitArgs ?? {};
     if (typeof fnArgs === "string") {
         try {
             return JSON.parse(fnArgs);
         } catch (e) {
-            return {};
+            return explicitArgs ?? {};
         }
     }
     return fnArgs;
@@ -92,7 +98,18 @@ function parseArgs(tc) {
 function normalizeToolCall(tc, index) {
     const name = tc?.name || tc?.function?.name || `tool_${index}`;
     const id = tc?.id || tc?.function?.id || tc?.name || `call_${index}`;
-    return { name, id, args: parseArgs(tc) };
+    // AIMessageChunk tool_call_chunks use `args` as an incremental JSON string.
+    // Parse it when complete; an incomplete delta stays `{}` and is ignored by
+    // drainStream until the provider emits the complete call.
+    let args = parseArgs(tc);
+    if (typeof args === "string") {
+        try {
+            args = JSON.parse(args);
+        } catch {
+            args = {};
+        }
+    }
+    return { name, id, args };
 }
 
 /** 把 LLM 返回构造成 LangChain AIMessage 可接受的 tool_calls 形状 */
@@ -135,10 +152,24 @@ async function drainStream(stream, w, usage) {
             content += txt;
             if (w.textChunk) w.textChunk(txt);
         }
-        const raw = chunk?.tool_calls || chunk?.additional_kwargs?.tool_calls || [];
+        // Providers/LangChain versions expose streamed tool calls in one of
+        // three shapes. Prefer normalized `tool_calls`, then raw provider calls,
+        // then `tool_call_chunks` (e.g. OpenAI-compatible DeepSeek streams).
+        // A chunk list can contain incremental argument fragments, so preserve
+        // the last complete-looking item per index/id instead of treating a
+        // later empty delta as authoritative.
+        const nativeCalls = chunk?.tool_calls || chunk?.additional_kwargs?.tool_calls || [];
+        const chunkCalls = nativeCalls.length > 0 ? null : (chunk?.tool_call_chunks || []);
+        const raw = nativeCalls.length > 0 ? nativeCalls : chunkCalls;
         if (raw && raw.length > 0) {
-            // 携带 tool_calls 的 chunk 视为权威（与 streamEvents 的行为一致：末块给全量）
-            toolCalls = raw.map((tc, i) => normalizeToolCall(tc, i));
+            const normalized = raw.map((tc, i) => normalizeToolCall(tc, i));
+            // A complete `tool_calls` message may legitimately take no args.
+            // Only incremental `tool_call_chunks` need a non-empty parsed object
+            // before they are safe to execute.
+            const complete = chunkCalls
+                ? normalized.filter((tc) => tc.name && tc.args && (typeof tc.args !== "object" || Object.keys(tc.args).length > 0))
+                : normalized.filter((tc) => tc.name);
+            if (complete.length > 0) toolCalls = complete;
         }
         addUsage(usage, chunk);
     }
@@ -146,9 +177,11 @@ async function drainStream(stream, w, usage) {
 }
 
 /** 预算触底后的收尾：用基础 LLM 流式产出一段正文，避免"工具执行后无文字" */
-async function streamFinalAnswer(llm, transcript, sig, w, usage) {
+async function streamFinalAnswer(llm, transcript, sig, w, usage, streamLlm) {
     let out = "";
-    const stream = await llm.stream(transcript, { signal: sig });
+    const stream = typeof streamLlm === "function"
+        ? await streamLlm(llm, transcript, sig)
+        : await llm.stream(transcript, { signal: sig });
     for await (const chunk of stream) {
         const txt = toText(chunk?.content);
         if (txt) {
@@ -177,6 +210,8 @@ async function streamFinalAnswer(llm, transcript, sig, w, usage) {
  * @param {Function} [params.capabilityGate] (systemTools) => ({allowed: string[]}) 按名过滤工具
  * @param {object} [params.budget]        预算覆盖（见 DEFAULT_BUDGET）
  * @param {Function} [params.isStructuredTool] (tool)=>boolean；默认 duck-typing schema.parse
+ * @param {Function} [params.streamLlm] (llm,messages,signal)=>AsyncIterable；可注入调用方重试
+ * @param {Function} [params.invokeTool] (tool,input,signal)=>Promise；可注入调用方重试
  * @returns {Promise<{fullText:string, rounds:number, toolCalls:number,
  *                    exceededBudget:boolean, usage:object}>}
  */
@@ -189,6 +224,8 @@ export async function runBoundedReactLoop({
     capabilityGate,
     budget,
     isStructuredTool,
+    streamLlm,
+    invokeTool,
 } = {}) {
     const b = { ...DEFAULT_BUDGET, ...(budget || {}) };
     const w = sse && typeof sse === "object" ? sse : {};
@@ -220,7 +257,9 @@ export async function runBoundedReactLoop({
     }
 
     const hasTools = tools.length > 0;
-    const tooled = hasTools && typeof llm.bindTools === "function" ? llm.bindTools(tools) : llm;
+    const tooled = hasTools && typeof llm.bindTools === "function"
+        ? llm.bindTools(tools)
+        : llm;
 
     let fullText = "";
     let round = 0;
@@ -236,7 +275,9 @@ export async function runBoundedReactLoop({
         round += 1;
 
         const response = await drainStream(
-            await tooled.stream(transcript, { signal: sig }),
+            typeof streamLlm === "function"
+                ? await streamLlm(tooled, transcript, sig)
+                : await tooled.stream(transcript, { signal: sig }),
             w,
             usage,
         );
@@ -269,7 +310,9 @@ export async function runBoundedReactLoop({
             const inputForSse = typeof input === "string" ? input : JSON.stringify(input);
             if (w.toolStart) w.toolStart(tc.id, tc.name, inputForSse);
             try {
-                const result = await invokeToolWithRetry(tool, input, sig, 1);
+                const result = typeof invokeTool === "function"
+                    ? await invokeTool(tool, input, sig)
+                    : await invokeToolWithRetry(tool, input, sig, 1);
                 const resultStr = typeof result === "string" ? result : JSON.stringify(result);
                 if (w.toolEnd) w.toolEnd(tc.id, tc.name, resultStr);
                 transcript.push(new ToolMessage({ content: resultStr, tool_call_id: tc.id, name: tc.name }));
@@ -290,7 +333,7 @@ export async function runBoundedReactLoop({
             if (!finalized) {
                 finalized = true;
                 fullText = fullText ? `${fullText}\n` : "";
-                fullText += await streamFinalAnswer(llm, transcript, sig, w, usage);
+                fullText += await streamFinalAnswer(llm, transcript, sig, w, usage, streamLlm);
             }
             break;
         }

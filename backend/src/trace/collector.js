@@ -142,6 +142,10 @@ class TraceCollector {
             console.warn(`[TraceCollector] endSpan: span "${spanId}" not found in trace "${traceId}"`);
             return;
         }
+        if (span.endedAt) {
+            Object.assign(span.metadata, metadata);
+            return;
+        }
 
         const endedAt = new Date();
         span.endedAt = endedAt.toISOString();
@@ -167,8 +171,15 @@ class TraceCollector {
             return null;
         }
 
-        // 记录 root span 结束时间
+        // Close every child left open by an exception/abort before closing root.
         const endedAt = new Date();
+        for (const span of trace.spans.values()) {
+            if (span.id !== traceId && !span.endedAt) {
+                span.endedAt = endedAt.toISOString();
+                span.durationMs = endedAt.getTime() - new Date(span.startedAt).getTime();
+                span.metadata = { ...span.metadata, interrupted: true };
+            }
+        }
         trace.rootSpan.endedAt = endedAt.toISOString();
         trace.rootSpan.durationMs = endedAt.getTime() - new Date(trace.startedAt).getTime();
 

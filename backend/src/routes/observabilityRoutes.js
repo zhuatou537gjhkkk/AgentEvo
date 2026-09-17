@@ -1,4 +1,5 @@
 import { dbFn, svcFn, sendError } from "./deps.js";
+import { mcpTelemetryEnabled } from "../mcp/flags.js";
 
 function parseJson(value, fallback) {
     try {
@@ -159,6 +160,58 @@ export function registerObservabilityRoutes(router, { requireAuth }) {
         } catch (error) {
             console.error("[observability/otel/import] POST failed:", error.message);
             return sendError(res, req.requestId, error, { code: "REQUEST_FAILED", status: 500 });
+        }
+    });
+
+    router.get("/observability/mcp/summary", requireAuth, (req, res) => {
+        try {
+            const window = ["7d", "30d", "all"].includes(req.query?.window) ? req.query.window : "7d";
+            if (!mcpTelemetryEnabled()) return res.json({ ok: true, enabled: false, window, sampleSize: 0, summary: null });
+            const summary = dbFn(req, "getMcpObservabilitySummary")({ userId: req.user.id, tenantId: req.user.tenantId }, {
+                window,
+                serverName: req.query?.server || req.query?.serverName || null,
+                toolName: req.query?.tool || req.query?.toolName || null,
+            });
+            return res.json({ ok: true, enabled: true, ...summary });
+        } catch (error) {
+            console.error("[observability/mcp/summary] GET failed:", error.message);
+            return sendError(res, req.requestId, error, { code: "MCP_OBSERVABILITY_FAILED", status: 500 });
+        }
+    });
+
+    router.get("/observability/mcp/operations", requireAuth, (req, res) => {
+        try {
+            const window = ["7d", "30d", "all"].includes(req.query?.window) ? req.query.window : "7d";
+            if (!mcpTelemetryEnabled()) return res.json({ ok: true, enabled: false, operations: [], sampleSize: 0 });
+            const scope = { userId: req.user.id, tenantId: req.user.tenantId };
+            const operations = dbFn(req, "listMcpOperationObservations")(scope, {
+                window,
+                serverName: req.query?.server || req.query?.serverName || null,
+                toolName: req.query?.tool || req.query?.toolName || null,
+                status: req.query?.status || null,
+                traceId: req.query?.traceId || null,
+                limit: req.query?.limit,
+                offset: req.query?.offset,
+            }).map((row) => ({
+                operation_id: row.operation_id,
+                request_id: row.request_id,
+                trace_id: row.trace_id,
+                span_id: row.span_id,
+                server_name: row.server_name,
+                tool_name: row.tool_name,
+                operation: row.operation,
+                status: row.status,
+                error_code: row.error_code,
+                duration_ms: row.duration_ms,
+                attempt_count: row.attempt_count,
+                schema_status: row.schema_status,
+                subtask_id: row.subtask_id,
+                created_at: row.created_at,
+            }));
+            return res.json({ ok: true, enabled: true, operations, sampleSize: operations.length });
+        } catch (error) {
+            console.error("[observability/mcp/operations] GET failed:", error.message);
+            return sendError(res, req.requestId, error, { code: "MCP_OBSERVABILITY_FAILED", status: 500 });
         }
     });
 }

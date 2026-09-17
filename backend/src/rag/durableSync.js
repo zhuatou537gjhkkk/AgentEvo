@@ -33,16 +33,39 @@
  * legacy faiss memory reader (rag/index.js) is likewise imported lazily.
  */
 import * as kstore from "./knowledgeStore.js";
-import { durableRagEnabled, durableRagReadCanary } from "./flags.js";
+import { durableRagEnabled, durableRagReadCanary, ragFaissEnabled } from "./flags.js";
 import { recordKnowledgeQuery } from "./telemetry.js";
 import { invalidateDurableStore } from "./vectorStoreAdapter.js";
+import { getFaissVectorStore, safeFaissErrorCode } from "./faissVectorStore.js";
+import { UPLOAD_DOC_PROJECT } from "./projectIds.js";
+import { retrieveUploadedKnowledge } from "./uploadRetrieval.js";
 
 /** Pseudo-project that scopes ALL durable rows for ordinary uploaded documents. */
-export const UPLOAD_DOC_PROJECT = "__uploads__";
+export { UPLOAD_DOC_PROJECT } from "./projectIds.js";
 
 const MAX_CHUNK_EMBED_BATCH = 25;
 const MAX_FILE_NAME_LENGTH = 200;
 const DOC_FILE_TYPE = "upload";
+
+function maybeBuildUploadFaiss({ scope, store, faissStore = null } = {}) {
+    if (!ragFaissEnabled() && !faissStore) return { status: "disabled" };
+    const target = faissStore?.name === "faiss"
+        ? faissStore
+        : getFaissVectorStore({ scope, projectId: UPLOAD_DOC_PROJECT, store });
+    try {
+        if (typeof target.ensureIndex === "function") target.ensureIndex();
+        else if (typeof target.buildIndex === "function") target.buildIndex();
+        else return { status: "disabled" };
+        const stats = typeof target.stats === "function" ? target.stats({ ensure: false }) : {};
+        return {
+            status: "ready",
+            generation: Number.isSafeInteger(Number(stats?.generation)) ? Number(stats.generation) : null,
+            chunkCount: Math.max(0, Number(stats?.chunkCount) || 0),
+        };
+    } catch (error) {
+        return { status: "fallback", fallbackCode: safeFaissErrorCode(error) };
+    }
+}
 
 // ────────────────────────── tiny flag-facing utils ──────────────────────────
 
@@ -252,12 +275,14 @@ export async function maybeDualWriteUpload({
     const hash = fileHash || kstore.sha256Hex(normalizedText);
     const previous = store.getActiveDocumentByPath(effectiveScope, UPLOAD_DOC_PROJECT, filePath);
     if (previous && String(previous.file_hash) === String(hash)) {
+        const faiss = maybeBuildUploadFaiss({ scope: effectiveScope, store, faissStore: deps.faissStore });
         return {
             written: false,
             reason: "unchanged",
             documentId: previous.id,
             revision: previous.revision,
             chunkCount: store.getActiveChunks(effectiveScope, UPLOAD_DOC_PROJECT, { filePath }).length,
+            faiss,
         };
     }
 
@@ -299,6 +324,7 @@ export async function maybeDualWriteUpload({
     } catch {
         // Cache invalidation is best-effort; the durable rows are already committed.
     }
+    const faiss = maybeBuildUploadFaiss({ scope: effectiveScope, store, faissStore: deps.faissStore });
     return {
         written: true,
         reason: previous ? "updated" : "indexed",
@@ -306,6 +332,7 @@ export async function maybeDualWriteUpload({
         revision: inserted.revision,
         chunkCount: inserted.chunkCount,
         embeddingErrors,
+        faiss,
     };
 }
 
@@ -350,20 +377,20 @@ async function loadRetrievalModule() {
  * Missing retrieval.js → caller sees durable `empty_store`.
  */
 async function defaultDurableReader({ scope, projectId, query, deps, opts }) {
-    const mod = await loadRetrievalModule();
-    if (!mod) return { status: "empty_store", items: [] };
     const o = opts || {};
-    const retrievalOpts = { ...o };
-    const embedder = o.embedder ?? null;
-    const vectorStore = o.vectorStore ?? null;
-    delete retrievalOpts.embedder;
-    delete retrievalOpts.vectorStore;
-    return mod.retrieveProjectCode({
+    return retrieveUploadedKnowledge({
         scope,
-        projectId,
         query,
-        deps: { store: deps?.store ?? null, embedder, vectorStore },
-        opts: retrievalOpts,
+        preferredSource: o.preferredSource ?? null,
+        deps: {
+            store: deps?.store ?? null,
+            // null means "use the configured provider when available" for the
+            // default durable path; callers can pass an explicit injected
+            // embedder through deps for tests or controlled canaries.
+            embedder: o.embedder === null ? undefined : o.embedder,
+            vectorStore: o.vectorStore,
+        },
+        opts: o,
     });
 }
 
@@ -507,13 +534,15 @@ export async function dualReadUpload({
         scope, projectId: UPLOAD_DOC_PROJECT, mode: "dual-read",
         status: telemetryStatusFor(durable.status), source: "durable",
         items: durable.itemsCount, latencyMs: durable.latencyMs, query,
+        metrics: durable.metrics,
     });
 
     const memoryHasItems = memory.itemsCount > 0;
     const durableHasItems = durable.itemsCount > 0;
-    const serveDurable = readCanary && durableHasItems;
+    const durableHealthy = ["ok", "no_match", "empty_store"].includes(durable.status);
+    const serveDurable = readCanary && durableHealthy;
     const servedBy = serveDurable ? "durable" : "memory";
-    const note = readCanary && !durableHasItems && servedBy === "memory" ? "canary-fallback" : null;
+    const note = readCanary && !durableHealthy && servedBy === "memory" ? "canary-fallback" : null;
 
     if (readCanary) {
         const servedHasItems = servedBy === "durable" ? durableHasItems : memoryHasItems;
@@ -522,6 +551,7 @@ export async function dualReadUpload({
             status: servedHasItems ? "hit" : "no_match",
             source: servedBy, items: servedBy === "durable" ? durable.itemsCount : memory.itemsCount,
             latencyMs: servedBy === "durable" ? durable.latencyMs : memory.latencyMs,
+            metrics: servedBy === "durable" ? durable.metrics : null,
             query,
         });
     }

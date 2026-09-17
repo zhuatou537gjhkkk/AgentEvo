@@ -24,6 +24,16 @@ import {
     createChatContextBuilder,
 } from './contextBuilder.js';
 
+const previousMemoryRecallFlag = process.env.MEMORY_RECALL_V2;
+const previousTypeAwareFlag = process.env.MEMORY_TYPE_AWARE_SCORING_V2;
+
+afterEach(() => {
+    if (previousMemoryRecallFlag == null) delete process.env.MEMORY_RECALL_V2;
+    else process.env.MEMORY_RECALL_V2 = previousMemoryRecallFlag;
+    if (previousTypeAwareFlag == null) delete process.env.MEMORY_TYPE_AWARE_SCORING_V2;
+    else process.env.MEMORY_TYPE_AWARE_SCORING_V2 = previousTypeAwareFlag;
+});
+
 // ═══════════════════════════════════════════════════════
 // estimateTokens()
 // ═══════════════════════════════════════════════════════
@@ -301,6 +311,50 @@ describe('ContextBuilder._select()', () => {
         );
         expect(allRelevant).toBe(true);
     });
+
+    it('should not add ContextBuilder recency to a type-aware final memory score', () => {
+        process.env.MEMORY_TYPE_AWARE_SCORING_V2 = 'true';
+        const cfg = new ContextConfig({ relevanceWeight: 0.6, recencyWeight: 0.4 });
+        const builder = new ContextBuilder(cfg);
+        const recalledMemory = new ContextPacket({
+            content: 'old but strongly recalled memory',
+            timestamp: new Date('2020-01-01T00:00:00Z'),
+            relevanceScore: 0.9,
+            metadata: { type: 'memory', memoryRecallFinal: true, scoreStage: 'memory_recall_final' },
+        });
+        const freshEvidence = new ContextPacket({
+            content: 'fresh weak evidence',
+            timestamp: new Date(),
+            relevanceScore: 0.7,
+            metadata: { type: 'rag' },
+        });
+
+        const selected = builder._select([recalledMemory, freshEvidence], 'evidence', 1000);
+
+        expect(selected[0]).toBe(recalledMemory);
+    });
+
+    it('should preserve legacy recency ranking when type-aware scoring is off', () => {
+        process.env.MEMORY_TYPE_AWARE_SCORING_V2 = 'false';
+        const cfg = new ContextConfig({ relevanceWeight: 0.6, recencyWeight: 0.4 });
+        const builder = new ContextBuilder(cfg);
+        const oldMemory = new ContextPacket({
+            content: 'old memory',
+            timestamp: new Date('2020-01-01T00:00:00Z'),
+            relevanceScore: 0.9,
+            metadata: { type: 'memory', memoryRecallFinal: true },
+        });
+        const freshEvidence = new ContextPacket({
+            content: 'fresh weak evidence',
+            timestamp: new Date(),
+            relevanceScore: 0.7,
+            metadata: { type: 'rag' },
+        });
+
+        const selected = builder._select([oldMemory, freshEvidence], 'evidence', 1000);
+
+        expect(selected[0]).toBe(freshEvidence);
+    });
 });
 
 // ═══════════════════════════════════════════════════════
@@ -486,6 +540,74 @@ describe('ContextBuilder.build() — full GSSC pipeline', () => {
         const result = await builder.build('test', conversationHistory, 'you are helpful');
         expect(result).toBeTruthy();
         expect(typeof result).toBe('string');
+    });
+
+    it('should request only episodic and semantic memory across sessions', async () => {
+        process.env.MEMORY_RECALL_V2 = 'false';
+        process.env.MEMORY_TYPE_AWARE_SCORING_V2 = 'true';
+        const calls = [];
+        const memoryService = {
+            userId: 11,
+            async recall(query, options) {
+                calls.push({ query, options });
+                return { memories: [], diagnostics: { enabled: true, selected: [], dropped: [] } };
+            },
+        };
+        const builder = new ContextBuilder(new ContextConfig(), memoryService);
+
+        await builder.build('what should I remember?', [], '');
+
+        expect(calls).toHaveLength(1);
+        expect(calls[0].options.memoryTypes).toEqual(['episodic', 'semantic']);
+        expect(calls[0].options.memoryTypes).not.toContain('working');
+    });
+
+    it('should carry the memory-stage final marker and score components into context packets', async () => {
+        process.env.MEMORY_RECALL_V2 = 'false';
+        process.env.MEMORY_TYPE_AWARE_SCORING_V2 = 'true';
+        const scoreComponents = {
+            type: 'semantic',
+            weights: { relevance: 0.5, confidence: 0.25, importance: 0.2, recency: 0.05 },
+            contributions: { relevance: 0.4, confidence: 0.24, importance: 0.18, recency: 0.04, pinnedBonus: 0 },
+        };
+        const memoryService = {
+            userId: 12,
+            async recall() {
+                return {
+                    memories: [{
+                        id: 42,
+                        content: 'semantic memory',
+                        memory_type: 'semantic',
+                        created_at: new Date().toISOString(),
+                        recallScore: 0.86,
+                        recallWeightProfile: 'semantic',
+                        recallScoreComponents: scoreComponents,
+                        recallTokens: 3,
+                    }],
+                    diagnostics: { enabled: true, selected: [42], dropped: [] },
+                };
+            },
+            recordRecall(ids) {
+                this.recordedIds = ids;
+            },
+        };
+        const builder = new ContextBuilder(new ContextConfig(), memoryService);
+        let gatheredPackets;
+        builder._select = (packets) => {
+            gatheredPackets = packets;
+            return packets;
+        };
+
+        await builder.build('semantic memory', [], '');
+
+        const memoryPacket = gatheredPackets.find((packet) => packet.metadata?.type === 'memory');
+        expect(memoryPacket.metadata).toMatchObject({
+            scoreStage: 'memory_recall_final',
+            memoryRecallFinal: true,
+            recallWeightProfile: 'semantic',
+            recallScoreComponents: scoreComponents,
+        });
+        expect(memoryService.recordedIds).toEqual([42]);
     });
 });
 

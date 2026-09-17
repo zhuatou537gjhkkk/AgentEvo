@@ -118,6 +118,7 @@ import {
     isSoloRun,
     fanoutBySubTasks,
     fanoutByIntents,
+    mergeSubTasks,
     fanoutToAgents,
     AGENT_NODE_MAP,
     // Phase 7 / R3 — DAG scheduler + helpers
@@ -125,18 +126,53 @@ import {
     subTaskOutcomeFromText,
     fanoutDag,
     agentExitRoute,
-    dagSchedulerNode,
-    dagSchedulerExit,
+    planSendDispatcherNode,
+    planSendDispatcherExit,
+    synthesizerExitRoute,
+    emitPlanProgress,
     depContextForSubTask,
     subTaskSettledStatus,
     // Phase 7 / R3 — Synthesizer 融合上下文（provenance/artifact/status）
     buildFusionContext,
+    createSSEEmitter,
+    buildTaskDepsMap,
+    validatePlanSyntax,
+    prepareTaskExecution,
 } from './chatGraph.js';
 
 import { toolRegistry } from '../mcp/registry.js';
 
 // LangGraph Send 类引用
 const { Send } = await import('@langchain/langgraph');
+
+// ============================================================
+// R7 Plan/Send state contract
+// ============================================================
+
+describe('R7 Plan/Send state contract', () => {
+    it('keeps a separate dependency table and rejects planner cycles', () => {
+        const plan = [
+            { id: 'search', type: 'agent', agent: 'search', dependsOn: [] },
+            { id: 'code', type: 'agent', agent: 'code', dependsOn: ['search'] },
+        ];
+        expect(buildTaskDepsMap(plan)).toEqual({ search: [], code: ['search'] });
+        expect(validatePlanSyntax(plan).ok).toBe(true);
+        expect(validatePlanSyntax([{ ...plan[0], dependsOn: ['code'] }, plan[1]]).ok).toBe(false);
+    });
+
+    it('yields before executing a task and never calls business code while waiting', () => {
+        const initial = { subTasks: [{ id: 'code', status: 'pending', dependsOn: ['search'] }], task_deps_map: { code: ['search'] }, task_meta: {} };
+        expect(prepareTaskExecution(initial, 'code', { now: 10 }).action).toBe('record_start');
+        const waiting = prepareTaskExecution({ ...initial, task_meta: { code: { task_start_ts: 10, wait_round: 0 } } }, 'code', { now: 11 });
+        expect(waiting.action).toBe('wait');
+        const ready = prepareTaskExecution({
+            ...initial,
+            subTasks: [{ id: 'search', status: 'completed' }, { id: 'code', status: 'pending', dependsOn: ['search'] }],
+            task_meta: { code: { task_start_ts: 10, wait_round: 1 } },
+        }, 'code', { now: 11 });
+        expect(ready.action).toBe('execute');
+    });
+});
 
 // ============================================================
 // mapIntentToNode — 动态意图→节点映射 (M1.x)
@@ -648,44 +684,138 @@ describe('AGENT_NODE_MAP — 向后兼容验证', () => {
 // State Reducers 行为验证 (S1.x)
 // ============================================================
 
-describe('State Reducers — 语义验证', () => {
-    describe('subTasks merge reducer', () => {
-        function subTasksReducer(current, update) {
-            if (!Array.isArray(update) || update.length === 0) return current;
-            if (!Array.isArray(current) || current.length === 0) return update;
-            const merged = current.map((step) => {
-                const match = update.find((u) => u.id === step.id);
-                return match ? { ...step, ...match } : step;
-            });
-            for (const u of update) {
-                if (!merged.find((m) => m.id === u.id)) merged.push(u);
-            }
-            return merged;
-        }
+describe('SSE agent lifecycle identity', () => {
+    it('preserves subTaskId when same-type spans end out of order', () => {
+        const writes = [];
+        const res = {
+            writableEnded: false,
+            write(frame) { writes.push(frame); },
+            once() {},
+        };
+        const traceCollector = {
+            getTrace: () => ({ ok: true }),
+            startSpan: vi.fn()
+                .mockReturnValueOnce('span-1')
+                .mockReturnValueOnce('span-2'),
+            endSpan: vi.fn(),
+        };
+        const sse = createSSEEmitter(res, traceCollector, 'trace-1');
+        sse.agentStart('code', '1');
+        sse.agentStart('code', '2');
+        sse.agentEnd('code', 'span-1');
+        sse.agentEnd('code', 'span-2');
+        const events = writes.map((frame) => {
+            const text = String(frame);
+            const start = text.indexOf('data: ');
+            if (start < 0) return null;
+            const end = text.indexOf('\\n', start);
+            return JSON.parse(text.slice(start + 6, end < 0 ? undefined : end));
+        }).filter(Boolean);
+        expect(events.filter((event) => event.type === 'agent_start').map((event) => event.subTaskId)).toEqual(['1', '2']);
+        expect(events.filter((event) => event.type === 'agent_end').map((event) => event.subTaskId)).toEqual(['1', '2']);
+    });
+});
 
+describe('State Reducers — 语义验证', () => {
+    describe('target-aware plan progress', () => {
+        it('marks the dispatched step instead of the first active step', () => {
+            const events = [];
+            const sse = { todoUpdated: (todos) => events.push(todos) };
+            const plan = [
+                { id: '1', content: '检索资料', status: 'in_progress' },
+                { id: '2', content: '编写代码', status: 'pending' },
+            ];
+            const result = emitPlanProgress(sse, plan, 'agent_start', '2');
+            expect(result.map((step) => step.status)).toEqual(['in_progress', 'in_progress']);
+            expect(events[0].find((step) => step.id === '2').status).toBe('in_progress');
+        });
+
+        it('completes only the identified step for a DAG branch', () => {
+            const events = [];
+            const sse = { todoUpdated: (todos) => events.push(todos) };
+            const plan = [
+                { id: '1', content: '检索资料', status: 'completed' },
+                { id: '2', content: '编写代码', status: 'in_progress' },
+            ];
+            const result = emitPlanProgress(sse, plan, 'all_done', '2');
+            expect(result.map((step) => step.status)).toEqual(['completed', 'completed']);
+        });
+
+        it('tools_done targets only the emitting parallel branch', () => {
+            const events = [];
+            const sse = { todoUpdated: (todos) => events.push(todos) };
+            const plan = [
+                { id: '1', content: '搜索新闻', status: 'in_progress' },
+                { id: '2', content: '检索知识库', status: 'in_progress' },
+                { id: '3', content: '综合结果', status: 'pending' },
+            ];
+            const result = emitPlanProgress(sse, plan, 'tools_done', '1');
+            expect(result.map((step) => step.status)).toEqual(['completed', 'in_progress', 'pending']);
+            expect(events).toHaveLength(1);
+        });
+
+        it('tools_done does not overwrite a failed or approval-waiting branch', () => {
+            const failed = emitPlanProgress(null, [
+                { id: '1', status: 'failed' },
+            ], 'tools_done', '1');
+            const waiting = emitPlanProgress(null, [
+                { id: '2', status: 'waiting_approval' },
+            ], 'tools_done', '2');
+            expect(failed[0].status).toBe('failed');
+            expect(waiting[0].status).toBe('waiting_approval');
+        });
+    });
+
+    describe('subTasks merge reducer', () => {
         it('update existing id status', () => {
             const current = [{ id: '1', status: 'pending' }];
             const update = [{ id: '1', status: 'completed' }];
-            const result = subTasksReducer(current, update);
+            const result = mergeSubTasks(current, update);
             expect(result[0].status).toBe('completed');
+        });
+
+        it('preserves terminal statuses across stale sibling snapshots', () => {
+            const base = [
+                { id: '1', status: 'pending' },
+                { id: '2', status: 'pending' },
+            ];
+            const branchA = [
+                { id: '1', status: 'completed' },
+                { id: '2', status: 'pending' },
+            ];
+            const branchB = [
+                { id: '1', status: 'pending' },
+                { id: '2', status: 'completed' },
+            ];
+
+            expect(mergeSubTasks(mergeSubTasks(base, branchA), branchB))
+                .toEqual([
+                    { id: '1', status: 'completed' },
+                    { id: '2', status: 'completed' },
+                ]);
+            expect(mergeSubTasks(mergeSubTasks(base, branchB), branchA))
+                .toEqual([
+                    { id: '1', status: 'completed' },
+                    { id: '2', status: 'completed' },
+                ]);
         });
 
         it('add new id', () => {
             const current = [{ id: '1', status: 'completed' }];
             const update = [{ id: '2', status: 'in_progress' }];
-            const result = subTasksReducer(current, update);
+            const result = mergeSubTasks(current, update);
             expect(result).toHaveLength(2);
             expect(result.map(r => r.id).sort()).toEqual(['1', '2']);
         });
 
         it('empty update does not overwrite', () => {
             const current = [{ id: '1', status: 'pending' }];
-            const result = subTasksReducer(current, []);
+            const result = mergeSubTasks(current, []);
             expect(result).toEqual(current);
         });
 
         it('empty current returns update', () => {
-            const result = subTasksReducer([], [{ id: '1', status: 'pending' }]);
+            const result = mergeSubTasks([], [{ id: '1', status: 'pending' }]);
             expect(result).toHaveLength(1);
             expect(result[0].id).toBe('1');
         });
@@ -693,7 +823,7 @@ describe('State Reducers — 语义验证', () => {
         it('preserves unmodified fields on merge', () => {
             const current = [{ id: '1', status: 'pending', toolName: 'web_search', content: 'search' }];
             const update = [{ id: '1', status: 'in_progress' }];
-            const result = subTasksReducer(current, update);
+            const result = mergeSubTasks(current, update);
             expect(result[0]).toEqual({
                 id: '1', status: 'in_progress', toolName: 'web_search', content: 'search',
             });
@@ -815,8 +945,8 @@ describe('fanoutDag / agentExitRoute — DAG 路由 (R3 #4/#5)', () => {
         delete process.env.GRAPH_DAG_SCHEDULER_ENABLED;
     });
 
-    it('fanoutDag: pending executable → dag_scheduler；全 blocked/仅 reasoning → synthesizer', () => {
-        expect(fanoutDag({ subTasks: [{ id: '1', type: 'agent', agent: 'search', status: 'pending' }] })).toBe('dag_scheduler');
+    it('fanoutDag: pending executable → plan_send_dispatcher；全 blocked/仅 reasoning → synthesizer', () => {
+        expect(fanoutDag({ subTasks: [{ id: '1', type: 'agent', agent: 'search', status: 'pending' }] })).toBe('plan_send_dispatcher');
         expect(fanoutDag({ subTasks: [
             { id: '1', type: 'agent', status: 'blocked' },
             { id: '2', type: 'reasoning', status: 'pending' },
@@ -824,13 +954,13 @@ describe('fanoutDag / agentExitRoute — DAG 路由 (R3 #4/#5)', () => {
         expect(fanoutDag({ subTasks: [{ id: '1', type: 'reasoning', status: 'pending' }] })).toBe('synthesizer');
     });
 
-    it('agentExitRoute: flag ON + subTasks → dag_scheduler；否则 synthesizer（零拓扑变化）', () => {
+    it('agentExitRoute: flag ON + subTasks → plan_send_dispatcher；否则 synthesizer（零拓扑变化）', () => {
         const withSub = { subTasks: [{ id: '1', type: 'agent', agent: 'search', status: 'pending' }] };
         // flag off → synthesizer
         expect(agentExitRoute(withSub)).toBe('synthesizer');
-        // flag on + subTasks → dag_scheduler
+        // flag on + subTasks → plan_send_dispatcher
         process.env.GRAPH_DAG_SCHEDULER_ENABLED = 'true';
-        expect(agentExitRoute(withSub)).toBe('dag_scheduler');
+        expect(agentExitRoute(withSub)).toBe('plan_send_dispatcher');
         // flag on + 无 subTasks（solo/非 plan 路径）→ synthesizer
         expect(agentExitRoute({ subTasks: [] })).toBe('synthesizer');
         expect(agentExitRoute({})).toBe('synthesizer');
@@ -877,11 +1007,15 @@ describe('subTaskSettledStatus / depContextForSubTask — R3 结果门控', () =
 });
 
 // ============================================================
-// Phase 7 / R3 — dag_schedulerNode：多波就绪 + 失败传播 + 残留 settle
+// Phase 7 / R3 — plan_send_dispatcherNode：多波就绪 + 失败传播 + 残留 settle
 // ============================================================
 
-describe('dagSchedulerNode — 依赖感知多波调度 (R3 #2/#3)', () => {
+describe('planSendDispatcherNode — 依赖感知多波调度 (R3 #2/#3)', () => {
     const agent = (id, agent, dependsOn, extra = {}) => ({ id, type: 'agent', agent, dependsOn: dependsOn || [], status: 'pending', ...extra });
+
+    afterEach(() => {
+        delete process.env.GRAPH_PLAN_SEND_STATE_ENABLED;
+    });
 
     it('wave-1 只分发依赖满足的步骤（Search→Code 两波）', async () => {
         const subTasks = [
@@ -889,18 +1023,18 @@ describe('dagSchedulerNode — 依赖感知多波调度 (R3 #2/#3)', () => {
             agent('2', 'code', ['1']),
             { id: '3', type: 'reasoning', dependsOn: ['1', '2'], status: 'pending' },
         ];
-        const first = await dagSchedulerNode({ subTasks, schedulerWaves: 0 }, {});
+        const first = await planSendDispatcherNode({ subTasks, schedulerWaves: 0 }, {});
         expect(first._sends.map((s) => s.id)).toEqual(['1']); // code 留待下一波
         expect(first.schedulerWaves).toBe(1);
 
         // 波1 完成 → 再次调度 → code 就绪
         const afterWave1 = subTasks.map((s) => (s.id === '1' ? { ...s, status: 'completed' } : s));
-        const second = await dagSchedulerNode({ subTasks: afterWave1, schedulerWaves: 1 }, {});
+        const second = await planSendDispatcherNode({ subTasks: afterWave1, schedulerWaves: 1 }, {});
         expect(second._sends.map((s) => s.id)).toEqual(['2']);
 
         // 波2 完成 → 无就绪 executable → 终止（reasoning 由 synthesizer 融合）
         const afterWave2 = afterWave1.map((s) => (s.id === '2' ? { ...s, status: 'completed' } : s));
-        const third = await dagSchedulerNode({ subTasks: afterWave2, schedulerWaves: 2 }, {});
+        const third = await planSendDispatcherNode({ subTasks: afterWave2, schedulerWaves: 2 }, {});
         expect(third._sends).toEqual([]);
     });
 
@@ -911,7 +1045,7 @@ describe('dagSchedulerNode — 依赖感知多波调度 (R3 #2/#3)', () => {
         ];
         // 上游以失败收场
         const failed = subTasks.map((s) => (s.id === '1' ? { ...s, status: 'failed' } : s));
-        const pass = await dagSchedulerNode({ subTasks: failed, schedulerWaves: 1 }, {});
+        const pass = await planSendDispatcherNode({ subTasks: failed, schedulerWaves: 1 }, {});
         const blockedTask = pass.subTasks.find((s) => s.id === '2');
         expect(blockedTask.status).toBe('blocked');
         expect(blockedTask.statusReason).toContain('前置步骤');
@@ -921,17 +1055,26 @@ describe('dagSchedulerNode — 依赖感知多波调度 (R3 #2/#3)', () => {
 
     it('并行：互不依赖的多步骤同一波就绪', async () => {
         const subTasks = [agent('1', 'search', []), agent('2', 'knowledge', []), agent('3', 'code', ['1', '2'])];
-        const pass = await dagSchedulerNode({ subTasks, schedulerWaves: 0 }, {});
+        const pass = await planSendDispatcherNode({ subTasks, schedulerWaves: 0 }, {});
         expect(pass._sends.map((s) => s.id).sort()).toEqual(['1', '2']);
     });
 
     it('残留 in_progress（节点返回未落定）→ blocked，避免永不收敛', async () => {
         const subTasks = [{ id: '1', type: 'agent', agent: 'search', status: 'in_progress', dependsOn: [] }];
-        const pass = await dagSchedulerNode({ subTasks, schedulerWaves: 1 }, {});
+        const pass = await planSendDispatcherNode({ subTasks, schedulerWaves: 1 }, {});
         const settled = pass.subTasks.find((s) => s.id === '1');
         expect(settled.status).toBe('blocked');
         expect(settled.statusReason).toContain('未落定');
         expect(pass._sends).toEqual([]);
+    });
+
+    it('R7 first-entry yield requeues once instead of R3-blocking', async () => {
+        process.env.GRAPH_PLAN_SEND_STATE_ENABLED = 'true';
+        const subTasks = [{ id: '1', type: 'agent', agent: 'search', status: 'in_progress', dependsOn: [] }];
+        const pass = await planSendDispatcherNode({ subTasks, schedulerWaves: 1 }, {});
+        expect(pass.subTasks.find((task) => task.id === '1').status).toBe('in_progress');
+        expect(pass._sends.map((task) => task.id)).toEqual(['1']);
+        delete process.env.GRAPH_PLAN_SEND_STATE_ENABLED;
     });
 
     it('死锁防御：无 ready 无 running 但仍有 stuck → blocked', async () => {
@@ -940,7 +1083,7 @@ describe('dagSchedulerNode — 依赖感知多波调度 (R3 #2/#3)', () => {
             { id: 'a', type: 'agent', agent: 'code', status: 'pending', dependsOn: ['b'] },
             { id: 'b', type: 'agent', agent: 'code', status: 'pending', dependsOn: ['a'] },
         ];
-        const pass = await dagSchedulerNode({ subTasks, schedulerWaves: 0 }, {});
+        const pass = await planSendDispatcherNode({ subTasks, schedulerWaves: 0 }, {});
         expect(pass._sends).toEqual([]);
         const statuses = pass.subTasks.map((s) => s.status);
         expect(statuses.every((st) => st === 'blocked')).toBe(true);
@@ -948,12 +1091,23 @@ describe('dagSchedulerNode — 依赖感知多波调度 (R3 #2/#3)', () => {
 });
 
 // ============================================================
-// Phase 7 / R3 — dagSchedulerExit：就绪波 → Send[] / synthesizer
+// Phase 7 / R3 — planSendDispatcherExit：就绪波 → Send[] / synthesizer
 // ============================================================
 
-describe('dagSchedulerExit — 波分发条件边 (R3 #2)', () => {
+describe('planSendDispatcherExit — 波分发条件边 (R3 #2)', () => {
+    afterEach(() => {
+        delete process.env.GRAPH_PLAN_SEND_STATE_ENABLED;
+    });
+
     it('无就绪步骤 → synthesizer', () => {
-        expect(dagSchedulerExit({ _sends: [] })).toBe('synthesizer');
+        expect(planSendDispatcherExit({ _sends: [] })).toBe('synthesizer');
+    });
+
+    it('R7 retry control leaves synthesizer through the static scheduler', () => {
+        process.env.GRAPH_PLAN_SEND_STATE_ENABLED = 'true';
+        expect(synthesizerExitRoute({ plan_control: { action: 'retry_tasks' } })).toBe('plan_send_dispatcher');
+        expect(synthesizerExitRoute({ plan_control: { action: 'replan' } })).toBe('planner');
+        expect(synthesizerExitRoute({ plan_control: null })).toBe('end');
     });
 
     it('有就绪步骤 → Send[]，各自带 in_progress 的 currentSubTask 与目标节点', () => {
@@ -964,7 +1118,7 @@ describe('dagSchedulerExit — 波分发条件边 (R3 #2)', () => {
             ],
             subTasks: [],
         };
-        const sends = dagSchedulerExit(state);
+        const sends = planSendDispatcherExit(state);
         expect(Array.isArray(sends)).toBe(true);
         expect(sends.length).toBe(2);
         const nodes = sends.map((s) => s.node).sort();
@@ -975,7 +1129,7 @@ describe('dagSchedulerExit — 波分发条件边 (R3 #2)', () => {
     });
 
     it('tool 类型 → tool_executor 目标', () => {
-        const sends = dagSchedulerExit({
+        const sends = planSendDispatcherExit({
             _sends: [{ id: '5', type: 'tool', toolName: 'read_file', status: 'pending', dependsOn: [] }],
             subTasks: [],
         });

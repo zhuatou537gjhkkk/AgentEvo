@@ -19,9 +19,15 @@ import { defaultWorkspaceRunner } from "./runner/readRunner.js";
 
 export const REPO_CONTEXT_LIMITS = Object.freeze({
     maxRefs: 8,
-    maxLinesPerRef: 200,
+    // 精确行范围的静态引用上限。整文件引用不是扩大该范围，而是授予本轮
+    // `read_attached_file` 的受限分页能力，源码不在这里预读进 prompt。
+    maxLinesPerRef: 2000,
     budgetTokens: 1500, // independent repo budget (tokens)
+    wholeFileMaxRefs: 4,
 });
+
+/** `whole_file` descriptor only — the graph turns it into a scoped read tool. */
+export const WHOLE_FILE_REF_MODE = "whole_file";
 
 function positiveInt(value) {
     const n = Number(value);
@@ -43,7 +49,7 @@ export class RepoContextService {
     /**
      * @param {{userId:number, tenantId?:string}} scope owner scope (from the auth request)
      * @param {{projectId:string, refs:Array}} repoContext request surface (never trusted)
-     * @returns {{packets: Array, omitted: number, enabled: boolean, commit: string|null}}
+     * @returns {{packets: Array, wholeFiles: Array, omitted: number, enabled: boolean, commit: string|null}}
      */
     async resolve(scope, repoContext = {}) {
         const empty = { packets: [], omitted: 0, enabled: false, commit: null };
@@ -77,13 +83,42 @@ export class RepoContextService {
         const commitShort = shortCommit(commit);
 
         const packets = [];
+        const wholeFiles = [];
         let omitted = 0;
         let usedTokens = 0;
         const budget = this.budgetTokens;
 
         for (const raw of refs.slice(0, REPO_CONTEXT_LIMITS.maxRefs)) {
-            if (usedTokens >= budget) break;
             const path = typeof raw?.path === "string" && raw.path.trim() ? raw.path.trim() : null;
+            const mode = raw?.mode == null ? "range" : String(raw.mode);
+            if (mode === WHOLE_FILE_REF_MODE) {
+                if (!path || wholeFiles.length >= REPO_CONTEXT_LIMITS.wholeFileMaxRefs) {
+                    omitted += 1;
+                    continue;
+                }
+                // The descriptor is intentionally metadata-only. The code agent
+                // receives a scoped reader later; no whole file is read here.
+                wholeFiles.push({
+                    projectId: String(projectId),
+                    path,
+                    commit,
+                    metadata: { type: "repo_capability", untrusted: true, selection: WHOLE_FILE_REF_MODE },
+                    // This closure retains the already owner/trust-gated project
+                    // and runner. Graph code never receives a root path or a
+                    // general workspace reader it could expand into other files.
+                    read: async ({ startLine, maxLines }) => runner.invoke(project, "read_file", {
+                        path,
+                        start_line: startLine,
+                        max_lines: maxLines,
+                    }),
+                });
+                continue;
+            }
+            if (mode !== "range") {
+                omitted += 1;
+                continue;
+            }
+            if (usedTokens >= budget) break;
             const startLine = positiveInt(raw?.startLine ?? raw?.start_line);
             const endLine = positiveInt(raw?.endLine ?? raw?.end_line);
             if (!path || startLine == null || endLine == null || endLine < startLine) {
@@ -92,11 +127,10 @@ export class RepoContextService {
             }
             const requested = endLine - startLine + 1;
             if (requested > REPO_CONTEXT_LIMITS.maxLinesPerRef) {
-                omitted += 1; // refuse oversized single refs
+                omitted += 1;
                 continue;
             }
 
-            // Every file read goes through the read-only runner boundary.
             let lines = [];
             try {
                 const outcome = await runner.invoke(project, "read_file", {
@@ -115,15 +149,13 @@ export class RepoContextService {
                 continue;
             }
 
-            const header = `[repo ${path}:${startLine}-${Math.min(endLine, startLine + lines.length - 1)} @ ${commitShort}]`;
+            const actualEnd = startLine + lines.length - 1;
+            const header = `[repo ${path}:${startLine}-${actualEnd} @ ${commitShort}]`;
             const headerTokens = estimateTokens(header);
-
-            // Accumulate the packet line-by-line so the independent budget is
-            // never exceeded by a single oversized reference.
             const accLines = [];
             let accTokens = headerTokens;
             for (const line of lines) {
-                const cost = estimateTokens(line) + 1; // +1 for the newline
+                const cost = estimateTokens(line) + 1;
                 if (accTokens + cost > budget - usedTokens) break;
                 accTokens += cost;
                 accLines.push(line);
@@ -132,28 +164,31 @@ export class RepoContextService {
                 omitted += 1;
                 continue;
             }
-            const body = accLines.join("\n");
-            const content = `${header}\n${body}`;
+            const selectedEnd = startLine + accLines.length - 1;
+            const content = `${header.replace(`-${actualEnd} `, `-${selectedEnd} `)}\n${accLines.join("\n")}`;
             packets.push({
                 content,
                 timestamp: new Date(),
                 tokenCount: accTokens,
-                relevanceScore: 0.9, // user explicitly attached these references
+                relevanceScore: 0.9,
                 metadata: {
                     type: "repo",
                     untrusted: true,
                     projectId: String(projectId),
                     commit,
-                    provenance: { path, startLine, endLine: startLine + accLines.length - 1, commit },
+                    truncated: selectedEnd < actualEnd,
+                    provenance: { path, startLine, endLine: selectedEnd, commit },
                 },
             });
             usedTokens += accTokens;
         }
 
-        if (omitted > 0) {
-            console.log(`[repoContext] project=${projectId} refs=${refs.length} packets=${packets.length} omitted=${omitted} usedTokens=${usedTokens}/${budget}`);
+        if (omitted > 0 || wholeFiles.length > 0) {
+            console.log(`[repoContext] project=${projectId} refs=${refs.length} packets=${packets.length} wholeFiles=${wholeFiles.length} omitted=${omitted} usedTokens=${usedTokens}/${budget}`);
         }
-        return { packets, omitted, enabled: true, commit };
+        const result = { packets, omitted, enabled: true, commit };
+        if (wholeFiles.length > 0) result.wholeFiles = wholeFiles;
+        return result;
     }
 }
 

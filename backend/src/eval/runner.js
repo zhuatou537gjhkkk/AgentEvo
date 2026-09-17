@@ -15,8 +15,11 @@ import { testCases, getTestCaseById, getTestCasesByCategory } from "./testCases.
 import { LLMJudge } from "./judge.js";
 import { CodeJudge } from "./codeJudge.js";
 import { saveEvalRunScores, getRunSummary } from "./metrics.js";
-import { saveMessage, saveMessageMetric, createSession, getGeneratedTestCaseById, createEvalRun, completeEvalRun, getUserScope } from "../db/index.js";
+import { saveMessage, saveMessageMetric, createSession, getGeneratedTestCaseById, createEvalRun, completeEvalRun, getUserScope, getTraceById } from "../db/index.js";
 import { estimateTokens } from "../services/chatUtils.js";
+import { aggregateMemoryQuality, evaluateMemoryQuality } from "./memoryQuality.js";
+import { aggregateCrossSourceQuality, evaluateCrossSourceQuality } from "./crossSourceQuality.js";
+import { crossSourceEvalEnabled } from "../services/memoryFlags.js";
 
 // Resolve which chat implementation to use based on feature flag
 // App-level logic in app.js also sets this, so we mimic the same logic
@@ -62,9 +65,16 @@ class EvalRunner {
         // 不要静默回退到全部用例 — 这会导致优化重评跑错用例。
         const allResolvedFailed = testCaseIds.length > 0 && selected.length === 0;
 
-        const targetTestCases = testCaseIds.length === 0 && selected.length === 0
+        const rawTargetTestCases = testCaseIds.length === 0 && selected.length === 0
             ? [] // All tests filtered out (no IDs specified, none found)
             : (selected.length > 0 ? selected : (allResolvedFailed ? [] : testCases));
+
+        // Cross-source scenarios need explicit fixtures and should not make a
+        // normal full-suite run depend on a developer's project memory/RAG.
+        const includeScenarioFixtures = options.includeScenarioFixtures === true || testCaseIds.length > 0;
+        const targetTestCases = rawTargetTestCases.filter((testCase) => (
+            !testCase.requiresScenarioFixture || includeScenarioFixtures
+        ));
 
         if (targetTestCases.length === 0) {
             completeEvalRun(effectiveRunId, scope, "completed");
@@ -114,6 +124,8 @@ class EvalRunner {
         const skipped = results.filter(r => r.skipped).length;
 
         const avgScores = this._computeAvgScores(results);
+        const memoryQuality = aggregateMemoryQuality(results);
+        const crossSourceQuality = aggregateCrossSourceQuality(results);
 
         completeEvalRun(effectiveRunId, scope, "completed");
         const report = {
@@ -125,6 +137,8 @@ class EvalRunner {
             avgScores,
             totalMs,
             model: this.model,
+            memoryQuality,
+            crossSourceQuality,
             results,
         };
 
@@ -177,6 +191,7 @@ class EvalRunner {
         const capturedText = captured.getText();
         const capturedToolCalls = captured.getToolCalls();
         const toolCallNames = capturedToolCalls.map(tc => tc.toolName);
+        const trace = this._loadCapturedTrace(captured.getTraceId(), scope);
 
         // Phase 6a G2: 代码判定先于 LLMJudge 执行（确定性评估，零 LLM 成本）
         let codeCheckResults = null;
@@ -197,8 +212,17 @@ class EvalRunner {
             text: capturedText,
             toolCallNames,
             toolCallsDetail,
-            trace: null,
+            trace,
         });
+
+        const memoryQuality = evaluateMemoryQuality(testCase, {
+            text: capturedText,
+            toolCalls: capturedToolCalls,
+            trace,
+        });
+        const crossSourceQuality = crossSourceEvalEnabled()
+            ? evaluateCrossSourceQuality(testCase, { text: capturedText, trace })
+            : null;
 
         // 如果代码判定器对 tool_usage 有修正建议，融合到 LLMJudge 评分中
         if (codeCheckResults && codeCheckResults.length > 0) {
@@ -210,7 +234,31 @@ class EvalRunner {
         }
 
         // 判定是否通过
-        const passed = LLMJudge.isPassing(scores, 3.0);
+        const passed = LLMJudge.isPassing(scores, 3.0)
+            && (memoryQuality ? memoryQuality.passed : true)
+            && (crossSourceQuality?.status === "evaluated" ? crossSourceQuality.passed : true);
+        const extraScores = {};
+        if (memoryQuality) {
+            extraScores.memory_quality = memoryQuality.score * 5;
+            for (const [key, value] of Object.entries({
+                memory_action_compliance: memoryQuality.metrics.actionCompliance,
+                memory_response_evidence: memoryQuality.metrics.responseEvidence,
+                memory_safety: memoryQuality.metrics.safety,
+            })) {
+                if (Number.isFinite(value)) extraScores[key] = value * 5;
+            }
+        }
+        if (crossSourceQuality?.status === "evaluated") {
+            extraScores.cross_source_quality = crossSourceQuality.score * 5;
+            for (const [key, value] of Object.entries({
+                cross_source_isolation: crossSourceQuality.metrics.isolation,
+                cross_source_coverage: crossSourceQuality.metrics.sourceCoverage,
+                cross_source_budget: crossSourceQuality.metrics.budgetCompliance,
+                cross_source_helpfulness: crossSourceQuality.metrics.helpfulness,
+            })) {
+                if (Number.isFinite(value)) extraScores[key] = value * 5;
+            }
+        }
 
         // 存储分数到数据库
         try {
@@ -218,9 +266,11 @@ class EvalRunner {
                 scores,
                 runId,
                 testCaseId: testCase.id,
+                traceId: captured.getTraceId(),
                 judgeModel: this.model,
                 scoreType: "offline",
                 scope,
+            extraScores: memoryQuality || crossSourceQuality?.status === "evaluated" ? extraScores : null,
             });
         } catch (err) {
             console.warn(`[EvalRunner] failed to save scores for ${testCase.id}:`, err.message);
@@ -238,7 +288,30 @@ class EvalRunner {
             textPreview: capturedText.slice(0, 200),
             error: null,
             codeCheckSummary,  // Phase 6a G2: 代码判定结果（null 表示无代码判定）
+            memoryQuality,
+            crossSourceQuality,
         };
+    }
+
+    _loadCapturedTrace(traceId, scope) {
+        if (!traceId) return null;
+        try {
+            const row = getTraceById(traceId, scope.userId, scope);
+            if (!row) return null;
+            let rootSpan = row.root_span;
+            if (typeof rootSpan === "string") {
+                try { rootSpan = JSON.parse(rootSpan); } catch { rootSpan = null; }
+            }
+            return {
+                traceId: row.trace_id,
+                metadata: rootSpan?.metadata || {},
+                rootSpan,
+                agentTraversalPath: row.agent_traversal_path,
+            };
+        } catch (error) {
+            console.warn(`[EvalRunner] trace lookup failed: ${error.message}`);
+            return null;
+        }
     }
 
     _generateRunId() {
@@ -302,6 +375,8 @@ class CapturedResponse {
         this._toolStarts = [];
         this._toolEnds = [];
         this._toolErrors = [];
+        this._metrics = null;
+        this._traceId = null;
         this._finished = false;
         this._closeHandler = null;
     }
@@ -336,6 +411,10 @@ class CapturedResponse {
                             toolName: parsed.toolName,
                             error: parsed.error,
                         });
+                    }
+                    if (parsed.type === "metrics") {
+                        this._metrics = parsed.metrics || null;
+                        this._traceId = this._metrics?.trace_id || this._metrics?.traceId || null;
                     }
                 } catch {
                     // skip non-JSON lines (like "[DONE]")
@@ -388,6 +467,10 @@ class CapturedResponse {
             });
         }
         return result;
+    }
+
+    getTraceId() {
+        return this._traceId;
     }
 }
 

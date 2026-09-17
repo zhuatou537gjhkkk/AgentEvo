@@ -37,6 +37,10 @@ function toSymbolSet(symbols) {
     return set;
 }
 
+function exactCompoundTerms(query) {
+    return [...new Set((String(query || "").match(/[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)+/g) || []).map((value) => value.toLowerCase()))];
+}
+
 /**
  * Pure 0..1 lexical score for one chunk given query tokens. Exported for unit
  * tests. `chunk` uses retrieval-normal fields: { content, symbols, filePath }.
@@ -71,6 +75,7 @@ export function lexicalSearch({ scope, projectId, query, store = null, tokenize 
     const tokenizer = tokenize || tokenizeQuery;
     const { terms, cjk } = tokenizer(query);
     const tokens = [...terms, ...cjk];
+    const compounds = exactCompoundTerms(query);
     if (tokens.length === 0) {
         return { status: "no_match", items: [], mode: "lexical" };
     }
@@ -81,6 +86,7 @@ export function lexicalSearch({ scope, projectId, query, store = null, tokenize 
     const matched = [];
     for (const row of rows) {
         const content = String(row.content ?? "").toLowerCase();
+        if (compounds.some((term) => !content.includes(term))) continue;
         const symbolSet = toSymbolSet(row.symbols);
         const pathTerms = new Set(extractPathTerms(row.file_path));
         let gate = false;
@@ -105,6 +111,12 @@ export function lexicalSearch({ scope, projectId, query, store = null, tokenize 
         chunkId: row.id,
         documentId: row.document_id,
         filePath: row.file_path,
+        fileName: row.file_name,
+        chunkLevel: row.chunk_level || "leaf",
+        parentChunkId: row.parent_chunk_id ?? null,
+        pageStart: row.page_start ?? null,
+        pageEnd: row.page_end ?? null,
+        headingPath: row.headingPath || [],
         startLine: row.start_line,
         endLine: row.end_line,
         content: row.content,

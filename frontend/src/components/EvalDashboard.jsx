@@ -8,6 +8,8 @@
 import { useEffect, useState } from "react";
 import { useChatStore } from "../store/chatStore";
 import EvalRunner from "./EvalRunner.jsx";
+import RagEvaluationPanel from "./RagEvaluationPanel.jsx";
+import McpEvaluationPanel from "./McpEvaluationPanel.jsx";
 
 /**
  * G8: 对比雷达图 + 维度差值表
@@ -1518,25 +1520,25 @@ export default function EvalDashboard({ embedded = false, onBack }) {
                     )}
                 </div>
 
-                {loading && evalMode !== "generator" && evalMode !== "optimizer" && (
+                {loading && evalMode !== "generator" && evalMode !== "optimizer" && evalMode !== "mcp" && (
                     <p className="py-8 text-center text-sm text-[var(--text-muted)]">加载中...</p>
                 )}
 
                 {/* Eval Runner */}
-                {showRunner && evalMode !== "generator" && evalMode !== "optimizer" && (
+                {showRunner && evalMode !== "generator" && evalMode !== "optimizer" && evalMode !== "mcp" && (
                     <div className="mb-6">
                         <EvalRunner />
                     </div>
                 )}
 
                 {/* Phase 6b G8: 对比结果 */}
-                {comparisonData && isCompareMode && evalMode !== "generator" && evalMode !== "optimizer" && (
+                {comparisonData && isCompareMode && evalMode !== "generator" && evalMode !== "optimizer" && evalMode !== "mcp" && (
                     <CompareResults data={comparisonData} />
                 )}
 
                 {/* Phase 6a: 评估模式切换 + G7 生成 + G10 优化 */}
                 <div className="mb-4 flex gap-1 rounded-lg bg-[var(--panel-soft)] p-1">
-                    {["offline", "online", "generator", "optimizer"].map((mode) => (
+                    {["offline", "online", "generator", "optimizer", "mcp"].map((mode) => (
                         <button
                             key={mode}
                             type="button"
@@ -1547,10 +1549,12 @@ export default function EvalDashboard({ embedded = false, onBack }) {
                                     : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
                             }`}
                         >
-                            {mode === "offline" ? "📋 离线评估" : mode === "online" ? "🌐 在线采样" : mode === "generator" ? "🤖 生成用例" : "🔄 优化闭环"}
+                            {mode === "offline" ? "📋 离线评估" : mode === "online" ? "🌐 在线采样" : mode === "generator" ? "🤖 生成用例" : mode === "optimizer" ? "🔄 优化闭环" : "🧪 MCP 专项"}
                         </button>
                     ))}
                 </div>
+
+                {evalMode === "mcp" && <McpEvaluationPanel visible={isVisible} />}
 
                 {/* ── G7: 生成用例面板 ── */}
                 {evalMode === "generator" && (
@@ -1563,7 +1567,7 @@ export default function EvalDashboard({ embedded = false, onBack }) {
                 )}
 
                 {/* Stat cards */}
-                {evalMode !== "generator" && evalMode !== "optimizer" && (
+                {evalMode !== "generator" && evalMode !== "optimizer" && evalMode !== "mcp" && (
                 <>
                 <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
                     <div className="surface-subtle rounded-2xl p-4">
@@ -1583,6 +1587,26 @@ export default function EvalDashboard({ embedded = false, onBack }) {
                         <p className="mt-1 text-2xl font-bold text-red-700 dark:text-red-400">{feedbackStats.thumbs_down}</p>
                     </div>
                 </div>
+
+                {evalReportData?.memoryQuality && (
+                    <div className="surface-subtle mb-6 rounded-2xl border border-[var(--panel-border)] p-4">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                                <p className="text-xs text-[var(--text-muted)]">记忆质量评测</p>
+                                <p className="mt-1 text-2xl font-bold text-[var(--text-main)]">
+                                    {(Number(evalReportData.memoryQuality.averageScore || 0) * 100).toFixed(0)}%
+                                </p>
+                            </div>
+                            <div className="text-right text-xs text-[var(--text-muted)]">
+                                <div>动作合规 {(Number(evalReportData.memoryQuality.actionCompliance || 0) * 100).toFixed(0)}%</div>
+                                <div>回答证据 {(Number(evalReportData.memoryQuality.responseEvidence || 0) * 100).toFixed(0)}%</div>
+                                <div>安全性 {(Number(evalReportData.memoryQuality.safety || 0) * 100).toFixed(0)}%</div>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                <RagEvaluationPanel visible={evalMode !== "generator" && evalMode !== "optimizer" && evalMode !== "mcp"} />
 
                 {/* Phase 6a G3: 五维雷达图 */}
                 {radarData && (

@@ -115,6 +115,37 @@ describe("RepoContextService", () => {
         expect(result.packets[0].content.split("\n").length).toBeLessThan(200);
     });
 
+    it("returns a metadata-only scoped reader for whole-file refs", async () => {
+        service = new RepoContextService(makeStubs());
+        const result = await service.resolve(SCOPE_A, {
+            projectId: "proj_1",
+            refs: [{ path: "src/chatGraph.js", mode: "whole_file" }],
+        });
+        expect(result.packets).toEqual([]);
+        expect(result.wholeFiles).toHaveLength(1);
+        expect(result.wholeFiles[0]).toMatchObject({
+            projectId: "proj_1",
+            path: "src/chatGraph.js",
+            metadata: { type: "repo_capability", selection: "whole_file" },
+        });
+        const page = await result.wholeFiles[0].read({ startLine: 401, maxLines: 2 });
+        expect(page.data.lines).toEqual([
+            "line 401 of file src/chatGraph.js",
+            "line 402 of file src/chatGraph.js",
+        ]);
+    });
+
+    it("rejects unknown attachment modes without reading", async () => {
+        service = new RepoContextService(makeStubs());
+        const result = await service.resolve(SCOPE_A, {
+            projectId: "proj_1",
+            refs: [{ path: "a.js", mode: "all_files" }],
+        });
+        expect(result.omitted).toBe(1);
+        expect(result.packets).toEqual([]);
+        expect(result.wholeFiles).toBeUndefined();
+    });
+
     it("caps the number of refs honored per request", async () => {
         service = new RepoContextService(makeStubs());
         const refs = Array.from({ length: 20 }, (_, i) => ({ path: `f${i}.js`, startLine: 1, endLine: 1 }));

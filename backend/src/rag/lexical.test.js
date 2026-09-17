@@ -164,6 +164,17 @@ describe("lexicalSearch (real store)", () => {
         expect(blank.status).toBe("no_match");
     });
 
+    it("requires an exact compound marker instead of matching only its numeric suffix", async () => {
+        const user = freshUser();
+        const project = "lex-compound";
+        await seedFile({ scope: user, projectId: project, filePath: "facts.md", content: "LARGE_RAG_FACT_347 is the exact fact." });
+
+        expect(lexicalSearch({ scope: user, projectId: project, query: "LARGE_RAG_FACT_347" }).status).toBe("ok");
+        const unrelated = lexicalSearch({ scope: user, projectId: project, query: "LARGE_RAG_FACT_999" });
+        expect(unrelated.status).toBe("no_match");
+        expect(unrelated.items).toEqual([]);
+    });
+
     it("cross-owner search is scope-filtered (ALICE rows invisible to BOB)", async () => {
         const alice = freshUser();
         const bob = freshUser();

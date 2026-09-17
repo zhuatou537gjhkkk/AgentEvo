@@ -36,6 +36,16 @@ describe('chatStore — MCP Servers', () => {
             expect(servers).toHaveLength(2);
             expect(servers.map((s) => s.name)).toEqual(['s1', 's2']);
         });
+
+        it('should upsert a server with the same name instead of creating duplicate rows', () => {
+            const store = useChatStore.getState();
+            store.addMcpServer({ name: 'filesystem', command: 'npx', connected: false });
+            store.addMcpServer({ name: 'filesystem', command: 'node', connected: true });
+
+            const servers = useChatStore.getState().mcpServers;
+            expect(servers).toHaveLength(1);
+            expect(servers[0]).toMatchObject({ name: 'filesystem', command: 'node' });
+        });
     });
 
     describe('removeMcpServer', () => {

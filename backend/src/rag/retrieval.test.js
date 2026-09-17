@@ -5,6 +5,7 @@ import { indexProjectSnapshot } from "./indexer.js";
 import { clearDurableStoreCache, createVectorStoreAdapter } from "./vectorStoreAdapter.js";
 import { hybridRetrieve, buildCitationText, retrieveProjectCode } from "./retrieval.js";
 import { getKnowledgeQuerySummary, getRecentKnowledgeQueries } from "./telemetry.js";
+import { clearRagFlags } from "./flags.js";
 
 /**
  * Phase 7 / R4 — retrieval.js hybrid retrieval + citations + shared service
@@ -55,10 +56,12 @@ function freshAdapter(scope, projectId) {
 
 beforeEach(() => {
     clearDurableStoreCache();
+    clearRagFlags();
 });
 
 afterEach(() => {
     clearDurableStoreCache();
+    clearRagFlags();
 });
 
 const FILE_A = "src/auth/loginUser.js";
@@ -170,9 +173,41 @@ describe("buildCitationText", () => {
         expect(text).toContain("…");
         expect(buildCitationText([])).toBe("");
     });
+
+    it("omits a fabricated 0-0 line range when parsed evidence has no lines", () => {
+        const text = buildCitationText([{ filePath: "report.pdf", startLine: null, endLine: null, content: "page evidence" }]);
+        expect(text.startsWith("[1] report.pdf\n")).toBe(true);
+        expect(text).not.toContain("0-0");
+    });
 });
 
 describe("retrieveProjectCode (shared service + telemetry)", () => {
+    it("applies an injected K8 reranker once after shared hybrid retrieval", async () => {
+        process.env.RAG_RERANK_ENABLED = "true";
+        const user = freshUser();
+        const project = "p-k8-rerank";
+        await indexFile({ scope: user, projectId: project, filePath: "src/retrieval.js", content: "function retrieveRelevantDocs() { return docs; }" });
+        let calls = 0;
+        const result = await retrieveProjectCode({
+            scope: user,
+            projectId: project,
+            query: "retrieveRelevantDocs",
+            deps: {
+                embedder: null,
+                vectorStore: null,
+                reranker: async ({ candidates }) => {
+                    calls += 1;
+                    return candidates.map((item) => ({ chunkId: String(item.chunkId), relevance: 0.9 }));
+                },
+            },
+        });
+
+        expect(result.status).toBe("ok");
+        expect(calls).toBe(1);
+        expect(result.metrics.rerankApplied).toBe(true);
+        expect(result.metrics.rerankCount).toBeGreaterThan(0);
+    });
+
     it("records hit and no_match telemetry rows + summary", async () => {
         const user = freshUser();
         const project = "p-tele";
@@ -219,5 +254,66 @@ describe("retrieveProjectCode (shared service + telemetry)", () => {
         expect(bobSummary.hit).toBe(0);
         expect(bobSummary.noMatch).toBeGreaterThanOrEqual(1);
         expect(bobSummary.error).toBe(0);
+    });
+
+    it("uses contextual rewrite as an additional candidate and records safe diagnostics", async () => {
+        process.env.RAG_QUERY_REWRITE_ENABLED = "true";
+        process.env.RAG_CONTEXTUAL_QUERY_REWRITE_ENABLED = "true";
+        const user = freshUser();
+        const project = "p-contextual-rewrite";
+        await indexFile({
+            scope: user,
+            projectId: project,
+            filePath: "src/rag.js",
+            content: "完成 RAG 改造的测试与上下文注入。",
+        });
+        let calls = 0;
+        const result = await retrieveProjectCode({
+            scope: user,
+            projectId: project,
+            query: "这个怎么修改",
+            deps: {
+                embedder: null,
+                vectorStore: null,
+                queryRewriter: async ({ query, context }) => {
+                    calls += 1;
+                    expect(query).toBe("这个怎么修改");
+                    expect(context.summary).toBe("正在完成 RAG 改造");
+                    return {
+                        rewrite: "RAG 改造 测试 上下文注入",
+                        keywords: ["RAG", "测试"],
+                        used_context: true,
+                        meta: { model: "fake", calls: 1 },
+                    };
+                },
+            },
+            opts: {
+                rewriteContext: {
+                    version: 1,
+                    recentTurns: [{ role: "assistant", content: "已完成设计" }],
+                    summary: "正在完成 RAG 改造",
+                    workingState: { currentGoal: "完成 RAG 改造", constraints: [], completedSteps: [], nextStep: "补测试" },
+                },
+            },
+        });
+
+        expect(calls).toBe(1);
+        expect(result.status).toBe("ok");
+        expect(result.metrics.queryCount).toBe(2);
+        expect(result.metrics.rewrite).toMatchObject({
+            applied: true,
+            contextual: true,
+            contextUsed: ["recent_turns", "summary", "working_memory"],
+            summaryPresent: true,
+            workingMemoryPresent: true,
+            calls: 1,
+        });
+
+        const recent = getRecentKnowledgeQueries(user, { limit: 5 });
+        const row = recent.find((item) => item.project_id === project);
+        expect(row.rewrite_contextual).toBe(1);
+        expect(row.rewrite_context_used).toBe('["recent_turns","summary","working_memory"]');
+        expect(row.query_preview).toBe("这个怎么修改");
+        expect(row.rewrite_context_used).not.toContain("完成 RAG 改造");
     });
 });

@@ -92,7 +92,9 @@ export async function submitFeedback(messageId, rating, comment = null) {
  * @returns {Promise<object>}
  */
 export async function fetchMessageFeedback(messageId) {
-    const res = await request(`/eval/feedback/${messageId}`, { method: "GET" });
+    // 恢复 👍/👎 属尽力而为：失败静默不影响聊天。关掉 GET 默认重试——429 重试只会
+    // 在限流窗口内火上浇油，把一次性抖动放大成请求风暴。
+    const res = await request(`/eval/feedback/${messageId}`, { method: "GET" }, { retryCount: 0 });
     return res.json();
 }
 
@@ -104,6 +106,48 @@ export async function fetchMessageFeedback(messageId) {
 export async function fetchObservability(limit = 30) {
     const res = await request(`/observability/recent?limit=${limit}`, { method: "GET" });
     return res.json();
+}
+
+// MCP 专项评测/观测：协议可用性、工具调用质量、端到端任务质量独立返回。
+export async function fetchMcpEvalCases() {
+    const res = await request("/eval/mcp/cases", { method: "GET" });
+    return res.json();
+}
+
+export async function runMcpEval({ caseIds = null, variant = "candidate", baselineRunId = null, configId = null } = {}) {
+    const res = await request("/eval/mcp/runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ caseIds, variant, baselineRunId, configId }),
+    }, { timeoutMs: 10 * 60 * 1000 });
+    return res.json();
+}
+
+export async function fetchMcpEvalRuns() {
+    const res = await request("/eval/mcp/runs", { method: "GET" });
+    return res.json();
+}
+
+export async function fetchMcpEvalRun(runId) {
+    const res = await request(`/eval/mcp/runs/${encodeURIComponent(runId)}`, { method: "GET" });
+    return res.json();
+}
+
+export async function compareMcpEvalRuns(baseline, candidate) {
+    const params = new URLSearchParams({ baseline, candidate });
+    const res = await request(`/eval/mcp/compare?${params.toString()}`, { method: "GET" });
+    return res.json();
+}
+
+export async function fetchMcpObservability({ window = "7d", server = "", tool = "" } = {}) {
+    const params = new URLSearchParams({ window });
+    if (server) params.set("server", server);
+    if (tool) params.set("tool", tool);
+    const [summary, operations] = await Promise.all([
+        request(`/observability/mcp/summary?${params.toString()}`, { method: "GET" }).then((res) => res.json()),
+        request(`/observability/mcp/operations?${params.toString()}`, { method: "GET" }).then((res) => res.json()),
+    ]);
+    return { summary, operations };
 }
 
 // ══════════════════════════════════════════════════════════

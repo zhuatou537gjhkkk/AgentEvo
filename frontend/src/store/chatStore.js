@@ -23,13 +23,23 @@ import { createToolExecutionStateMachine, ToolStatus } from '../utils/toolExecut
 // 不能放 Zustand state（非序列化对象会被 persist 中间件丢弃）
 const activeToolCleanupMap = new Map();
 let contextUsageRequestVersion = 0;
+let sessionViewGeneration = 0;
+let streamRefreshGeneration = 0;
 
 // Phase 7 / R1 — workspace attach-to-chat: a repo reference the user picked in
 // the Workspace panel. Consumed once by the next sendMessage, never persisted.
 let pendingRepoContext = null;
 
 export function setPendingRepoContext(repoContext) {
-    pendingRepoContext = repoContext;
+    pendingRepoContext = repoContext || null;
+}
+
+export function getPendingRepoContext() {
+    return pendingRepoContext;
+}
+
+export function clearPendingRepoContext() {
+    pendingRepoContext = null;
 }
 
 export function consumePendingRepoContext() {
@@ -38,9 +48,46 @@ export function consumePendingRepoContext() {
     return value;
 }
 
+// Phase 7 / R2 — workspace attach-to-chat: a coding run the user delegated to the
+// chat ("委托给对话"). The chat turn drives the run's auto-decider (trusted preset,
+// server-authorized). Consumed once by the next sendMessage, never persisted.
+let pendingCodingRunId = null;
+
+export function setPendingCodingRunId(codingRunId) {
+    pendingCodingRunId = codingRunId == null ? null : String(codingRunId);
+}
+
+export function consumePendingCodingRunId() {
+    const value = pendingCodingRunId;
+    pendingCodingRunId = null;
+    return value;
+}
+
 function invalidateContextUsage() {
     contextUsageRequestVersion += 1;
     return { contextUsage: null };
+}
+
+function invalidateActiveStream(get, set) {
+    streamRefreshGeneration += 1;
+    const controller = get?.().activeAbortController;
+    if (controller) {
+        try {
+            controller.abort();
+        } catch {
+            // Abort is best-effort during navigation/auth changes.
+        }
+    }
+    for (const [token, cleanup] of activeToolCleanupMap.entries()) {
+        try {
+            cleanup.fsm.cancelAll();
+            cleanup.syncToolLogs();
+        } catch {
+            // Stream teardown must remain best-effort during navigation/auth changes.
+        }
+        activeToolCleanupMap.delete(token);
+    }
+    set?.({ activeAbortController: null, activeStreamToken: null, isTyping: false });
 }
 
 const initialMessage = {
@@ -357,6 +404,7 @@ export const useChatStore = create(persist((set, get) => ({
     memories: [],
     memoryStats: null,
     isMemoryLoading: false,
+    memoryError: '',
     isExporting: false,
     // Phase 5: 评估系统
     isEvalDashboardOpen: false,
@@ -692,9 +740,14 @@ export const useChatStore = create(persist((set, get) => ({
     },
     // ── Phase 3: MCP Server 管理 ──
     addMcpServer: (server) => {
-        set((state) => ({
-            mcpServers: [...state.mcpServers, { ...server, connected: false }],
-        }));
+        set((state) => {
+            const incoming = { ...server, connected: false };
+            const index = state.mcpServers.findIndex((item) => item.name === incoming.name);
+            if (index < 0) return { mcpServers: [...state.mcpServers, incoming] };
+            const next = [...state.mcpServers];
+            next[index] = { ...next[index], ...incoming };
+            return { mcpServers: next };
+        });
     },
     removeMcpServer: (name) => {
         set((state) => ({
@@ -856,15 +909,17 @@ export const useChatStore = create(persist((set, get) => ({
         }
     },
     // ── Phase 4: 记忆系统管理 ──
-    fetchMemories: async (query = '', memoryType = '', limit = 50) => {
-        set({ isMemoryLoading: true });
+    fetchMemories: async (query = '', memoryType = '', limit = 50, status = 'all') => {
+        set({ isMemoryLoading: true, memoryError: '' });
         try {
             const { fetchMemories } = await import('../api/chat.js');
-            const data = await fetchMemories(query, memoryType, limit);
-            set({ memories: data.memories || [], isMemoryLoading: false });
+            const data = await fetchMemories(query, memoryType, limit, status);
+            set({ memories: data.memories || [], isMemoryLoading: false, memoryError: '' });
+            return data;
         } catch (err) {
             console.error('[store] fetchMemories failed:', err);
-            set({ isMemoryLoading: false });
+            set({ isMemoryLoading: false, memoryError: err?.message || '记忆加载失败，请重试。' });
+            return null;
         }
     },
     fetchMemoryStats: async () => {
@@ -885,6 +940,75 @@ export const useChatStore = create(persist((set, get) => ({
             }));
         } catch (err) {
             console.error('[store] deleteMemory failed:', err);
+        }
+    },
+    fetchMemoryRetention: async () => {
+        try {
+            const { fetchMemoryRetention } = await import('../api/chat.js');
+            return await fetchMemoryRetention();
+        } catch (err) {
+            console.error('[store] fetchMemoryRetention failed:', err);
+            return null;
+        }
+    },
+    runMemoryRetention: async (dryRun = false) => {
+        try {
+            const { runMemoryRetention } = await import('../api/chat.js');
+            return await runMemoryRetention(dryRun);
+        } catch (err) {
+            console.error('[store] runMemoryRetention failed:', err);
+            return null;
+        }
+    },
+    exportMemories: async () => {
+        try {
+            const { exportMemories } = await import('../api/chat.js');
+            return await exportMemories();
+        } catch (err) {
+            console.error('[store] exportMemories failed:', err);
+            return null;
+        }
+    },
+    cleanupMemories: async (ids = [], confirm = false) => {
+        try {
+            const { cleanupMemories } = await import('../api/chat.js');
+            return await cleanupMemories(ids, confirm);
+        } catch (err) {
+            console.error('[store] cleanupMemories failed:', err);
+            return { ok: false, message: err.message };
+        }
+    },
+    fetchMemoryLineage: async (memoryId) => {
+        try {
+            const { fetchMemoryLineage } = await import('../api/chat.js');
+            return await fetchMemoryLineage(memoryId);
+        } catch (err) {
+            console.error('[store] fetchMemoryLineage failed:', err);
+            return null;
+        }
+    },
+    batchUpdateMemories: async (ids = [], action = 'approve', reason = '') => {
+        try {
+            const { batchUpdateMemories } = await import('../api/chat.js');
+            return await batchUpdateMemories(ids, action, reason);
+        } catch (err) {
+            console.error('[store] batchUpdateMemories failed:', err);
+            return { ok: false, results: [], message: err.message };
+        }
+    },
+    updateMemory: async (memoryId, updates = {}) => {
+        try {
+            const { updateMemory } = await import('../api/chat.js');
+            const result = await updateMemory(memoryId, updates);
+            if (result?.ok) {
+                set((state) => ({
+                    memories: state.memories.map((item) => item.id === memoryId ? { ...item, ...updates } : item),
+                }));
+            }
+            return result;
+        } catch (err) {
+            console.error('[store] updateMemory failed:', err);
+            return null;
         }
     },
     clearMemories: async () => {
@@ -951,6 +1075,8 @@ export const useChatStore = create(persist((set, get) => ({
         }
     },
     register: async (username, password) => {
+        invalidateActiveStream(get, set);
+        clearPendingRepoContext();
         const safeUsername = String(username || '').trim();
         const safePassword = String(password || '');
 
@@ -988,6 +1114,8 @@ export const useChatStore = create(persist((set, get) => ({
         }
     },
     login: async (username, password) => {
+        invalidateActiveStream(get, set);
+        clearPendingRepoContext();
         const safeUsername = String(username || '').trim();
         const safePassword = String(password || '');
 
@@ -1025,6 +1153,8 @@ export const useChatStore = create(persist((set, get) => ({
         }
     },
     logout: () => {
+        invalidateActiveStream(get, set);
+        clearPendingRepoContext();
         setAuthToken('');
 
         set((state) => ({
@@ -1203,7 +1333,9 @@ export const useChatStore = create(persist((set, get) => ({
         }
     },
     switchSession: async (id) => {
-        const requestId = `${id}-${Date.now()}`;
+        invalidateActiveStream(get, set);
+        clearPendingRepoContext();
+        const requestId = `${id}-${Date.now()}-${++sessionViewGeneration}`;
 
         set((state) => ({
             ...invalidateContextUsage(),
@@ -1211,6 +1343,9 @@ export const useChatStore = create(persist((set, get) => ({
             activeSessionRequestId: requestId,
             isSessionLoading: true,
             isTyping: false,
+            activeAbortController: null,
+            activeStreamToken: null,
+            messages: [],
             messageSearchKeyword: '',
             sessionError: '',
         }));
@@ -1274,6 +1409,7 @@ export const useChatStore = create(persist((set, get) => ({
         }
     },
     addNewSession: async () => {
+        clearPendingRepoContext();
         if (get().isCreatingSession) {
             return;
         }
@@ -1374,6 +1510,7 @@ export const useChatStore = create(persist((set, get) => ({
         }
     },
     deleteSession: async (id) => {
+        clearPendingRepoContext();
         try {
             const stateBeforeDelete = get();
 
@@ -1501,9 +1638,11 @@ export const useChatStore = create(persist((set, get) => ({
             temperature: failedRequest.temperature,
             imageId: failedRequest.imageId || null,
             idempotencyKey: failedRequest.idempotencyKey || null,
+            repoContext: failedRequest.repoContext || null,
         });
     },
     retryMessageById: async (messageId) => {
+        clearPendingRepoContext();
         if (get().isTyping) {
             return;
         }
@@ -1532,6 +1671,7 @@ export const useChatStore = create(persist((set, get) => ({
         }
     },
     retryToolCall: async (toolCallId) => {
+        clearPendingRepoContext();
         if (get().isTyping) {
             return;
         }
@@ -1628,6 +1768,7 @@ export const useChatStore = create(persist((set, get) => ({
         }
     },
     createBranchFromMessage: async (messageId) => {
+        clearPendingRepoContext();
         if (get().isTyping) {
             return;
         }
@@ -1682,6 +1823,7 @@ export const useChatStore = create(persist((set, get) => ({
         }
     },
     editUserMessageAndResend: async (messageId, editedContent) => {
+        clearPendingRepoContext();
         if (get().isTyping) {
             return;
         }
@@ -1745,7 +1887,17 @@ export const useChatStore = create(persist((set, get) => ({
         const selectedImage = state.selectedImage;
         const selectedImageId = options.imageId ?? selectedImage?.imageId ?? null;
         const idempotencyKey = options.idempotencyKey || createIdempotencyKey();
-        const repoContext = options.repoContext ?? consumePendingRepoContext();
+        const pendingContext = consumePendingRepoContext();
+        const repoContext = options.repoContext ?? pendingContext;
+        if (repoContext) {
+            console.log('[diag:attach] sendMessage 携带 repo_context:', JSON.stringify(repoContext).slice(0, 200));
+        } else {
+            console.log('[diag:attach] sendMessage 无 repo_context (pending 已空)');
+        }
+        const codingRunId = options.codingRunId ?? consumePendingCodingRunId();
+        if (codingRunId) {
+            console.log('[diag:attach] sendMessage 携带 coding_run_id:', codingRunId);
+        }
 
         const sessionSpecificSettings = sessionId
             ? state.sessionAgentSettings[sessionId]
@@ -1756,6 +1908,7 @@ export const useChatStore = create(persist((set, get) => ({
         );
 
         if (!sessionId) {
+            clearPendingRepoContext();
             return;
         }
 
@@ -1777,7 +1930,7 @@ export const useChatStore = create(persist((set, get) => ({
             enableWebSearch: Boolean(enableWebSearch),
         };
 
-        const streamToken = `${sessionId}-${Date.now()}`;
+        const streamToken = `${sessionId}-${Date.now()}-${++streamRefreshGeneration}`;
 
         set((state) => ({
             messages: [...state.messages, userMessage, assistantMessage],
@@ -1917,6 +2070,33 @@ export const useChatStore = create(persist((set, get) => ({
             return progress.findIndex((t) => t.status === 'pending' || t.status === 'in_progress');
         };
 
+        /** 按 subTaskId 更新 tail message 上的单条 task，避免并行步骤按位置串线 */
+        const updateTaskStatusById = (subTaskId, newStatus, activeForm) => {
+            if (subTaskId == null) return;
+            set((state) => ({
+                messages: (() => {
+                    const nextMessages = [...state.messages];
+                    const tailIndex = nextMessages.length - 1;
+                    const tail = nextMessages[tailIndex];
+                    if (!tail || tail.role !== 'assistant') return state.messages;
+                    const progress = [...(tail.taskProgress || [])];
+                    const idx = progress.findIndex((task) => String(task.id) === String(subTaskId));
+                    if (idx < 0) return state.messages;
+                    const terminalStatuses = ['completed', 'failed', 'error', 'blocked', 'skipped', 'cancelled', 'interrupted'];
+                    const currentIsTerminal = terminalStatuses.includes(progress[idx].status);
+                    const nextIsTerminal = terminalStatuses.includes(newStatus);
+                    progress[idx] = {
+                        ...progress[idx],
+                        status: currentIsTerminal && !nextIsTerminal ? progress[idx].status : newStatus,
+                        ...(activeForm ? { activeForm } : {}),
+                        ...(activeForm && nextIsTerminal ? { statusReason: activeForm } : {}),
+                    };
+                    nextMessages[tailIndex] = { ...tail, taskProgress: progress };
+                    return nextMessages;
+                })(),
+            }));
+        };
+
         /** 更新 tail message 上单条 task 的状态 */
         const updateTaskStatus = (toolName, newStatus, activeForm) => {
             set((state) => ({
@@ -1957,15 +2137,26 @@ export const useChatStore = create(persist((set, get) => ({
                         merged = existing;
                     } else {
                         // 更新已有步骤的状态（按 id 匹配），保留 incoming 中不存在的步骤
+                        const terminalStatuses = ['completed', 'failed', 'error', 'blocked', 'skipped', 'cancelled', 'interrupted'];
+                        const rank = (status) => status === 'completed' ? 4
+                            : ['failed', 'error', 'blocked', 'skipped', 'cancelled', 'interrupted'].includes(status) ? 3
+                                : status === 'waiting_approval' ? 2 : status === 'in_progress' ? 1 : 0;
                         merged = existing.map((existingStep) => {
-                            const match = incoming.find((s) => s.id === existingStep.id);
-                            return match
-                                ? { ...existingStep, status: match.status || existingStep.status }
-                                : existingStep;
+                            const match = incoming.find((s) => String(s.id) === String(existingStep.id));
+                            if (!match) return existingStep;
+                            const preserve = rank(existingStep.status) > rank(match.status)
+                                || (terminalStatuses.includes(existingStep.status) && !terminalStatuses.includes(match.status));
+                            return {
+                                ...existingStep,
+                                ...match,
+                                status: preserve ? existingStep.status : (match.status || existingStep.status),
+                                ...(preserve && existingStep.statusReason && !match.statusReason
+                                    ? { statusReason: existingStep.statusReason } : {}),
+                            };
                         });
                         // 追加 incoming 中有但 existing 中没有的新步骤
                         for (const step of incoming) {
-                            if (!existing.some((e) => e.id === step.id)) {
+                            if (!existing.some((e) => String(e.id) === String(step.id))) {
                                 merged.push(step);
                             }
                         }
@@ -2022,6 +2213,76 @@ export const useChatStore = create(persist((set, get) => ({
             selectedImage: null,
         });
 
+        // ── 流看门狗: 保证 isTyping 永不被锁死 ─────────────────────────
+        // isTyping 的复位只由 fetchChatStream 的 onDone/onError 回调完成; 若某条
+        // 路径没触发回调(后端发了内容但没关响应、reader 永久挂起、或 fetch 启动
+        // 前抛错), 界面会永久卡 "AI 正在思考"。这里按"距上次 SSE 事件"的空闲时长
+        // 兜底: 中途安静预算宽松(慢模型长思考), 一旦进入收尾阶段(收到 metrics 或
+        // 结束类 thought)预算收紧到 10s, [DONE]/EOF 丢失时 ~10s 内自愈并打日志。
+        let lastSseActivityAt = Date.now();
+        let streamIdleBudgetMs = 120000;
+        let watchdogTimer = null;
+
+        const kickSseWatchdog = (event = null) => {
+            lastSseActivityAt = Date.now();
+            const eventType = event?.type;
+            const isFinalPhase = eventType === 'metrics'
+                || (eventType === 'thought' && /回答生成完成|生成过程发生错误/.test(event?.text || ''));
+            if (isFinalPhase) {
+                streamIdleBudgetMs = 10000;
+            }
+        };
+
+        const stopSseWatchdog = () => {
+            if (watchdogTimer !== null) {
+                clearInterval(watchdogTimer);
+                watchdogTimer = null;
+            }
+        };
+
+        const armSseWatchdog = () => {
+            stopSseWatchdog();
+            watchdogTimer = setInterval(() => {
+                const current = get();
+                const active = current.currentSessionId === sessionId
+                    && current.activeStreamToken === streamToken
+                    && current.isTyping;
+                if (!active) {
+                    stopSseWatchdog();
+                    return;
+                }
+
+                const idleMs = Date.now() - lastSseActivityAt;
+                if (idleMs <= streamIdleBudgetMs) {
+                    return;
+                }
+
+                // 看门狗触发: 该流长时间无任何 SSE 事件, 判定为挂死。
+                stopSseWatchdog();
+                console.warn(
+                    `[chatStore] stream watchdog fired: idle=${idleMs}ms budget=${streamIdleBudgetMs}ms ` +
+                    `session=${sessionId} token=${streamToken} — isTyping 兜底复位`
+                );
+                try { controller.abort(); } catch { /* noop */ }
+                // 与 onError/stopMessageStream 一致的收尾, 不留悬挂工具卡片/任务进度
+                toolStateMachine.cancelAll();
+                syncToolLogs();
+                activeToolCleanupMap.delete(streamToken);
+                toolStateMachine.destroy();
+                cancelChunkFrame();
+                flushPendingAssistantChunk();
+                set({
+                    isTyping: false,
+                    activeAbortController: null,
+                    activeStreamToken: null,
+                    lastFailedUserMessage: '',
+                    lastFailedRequest: null,
+                });
+            }, 5000);
+        };
+
+        armSseWatchdog();
+
         await fetchChatStream(
             sessionId,
             content,
@@ -2035,6 +2296,7 @@ export const useChatStore = create(persist((set, get) => ({
                     return;
                 }
 
+                kickSseWatchdog(null);
                 pendingAssistantChunk += chunk;
                 scheduleChunkFlush();
             },
@@ -2044,6 +2306,7 @@ export const useChatStore = create(persist((set, get) => ({
                     return;
                 }
 
+                kickSseWatchdog(toolData);
                 cancelChunkFrame();
                 flushPendingAssistantChunk();
 
@@ -2180,8 +2443,10 @@ export const useChatStore = create(persist((set, get) => ({
                         const progress = todos.map((t) => ({
                             id: t.id || `task-${Math.random().toString(36).slice(2, 8)}`,
                             content: t.content || '',
-                            activeForm: '',
+                            activeForm: t.activeForm || '',
                             status: t.status || 'pending',
+                            ...(t.statusReason ? { statusReason: t.statusReason } : {}),
+                            ...(Array.isArray(t.dependsOn) ? { dependsOn: t.dependsOn } : {}),
                         }));
                         syncTaskProgress(progress);
                     }
@@ -2237,7 +2502,39 @@ export const useChatStore = create(persist((set, get) => ({
                             return nextMessages;
                         })(),
                     }));
+                } else if (toolData?.type === 'memory_candidate') {
+                    const count = Number(toolData.count) || 0;
+                    if (count > 0) {
+                        set((state) => ({
+                            messages: (() => {
+                                const nextMessages = [...state.messages];
+                                const tailIndex = nextMessages.length - 1;
+                                const tail = nextMessages[tailIndex];
+                                if (!tail || tail.role !== 'assistant') return state.messages;
+                                nextMessages[tailIndex] = {
+                                    ...tail,
+                                    memoryCandidateNotice: {
+                                        count,
+                                        candidateIds: Array.isArray(toolData.candidateIds) ? toolData.candidateIds : [],
+                                        mode: toolData.mode || 'candidate',
+                                    },
+                                };
+                                return nextMessages;
+                            })(),
+                        }));
+                    }
                 } else if (toolData?.type === 'agent_start' || toolData?.type === 'agent_end' || toolData?.type === 'agent_handoff') {
+                    // 有 subTaskId 时按精确任务更新；旧服务端事件仍只写日志，避免猜错步骤。
+                    if ((toolData.type === 'agent_start' || toolData.type === 'agent_end') && toolData.subTaskId != null) {
+                        const lifecycleStatus = toolData.type === 'agent_start'
+                            ? 'in_progress'
+                            : (toolData.status || toolData.outcome || 'completed');
+                        updateTaskStatusById(
+                            toolData.subTaskId,
+                            lifecycleStatus,
+                            toolData.statusReason || ''
+                        );
+                    }
                     // Phase 2: 多 Agent 生命周期事件 → 写入 thoughtLogs
                     const agentText = toolData?.type === 'agent_start'
                         ? `Agent ${toolData.agentName || toolData.agentType || ''} 开始工作`
@@ -2273,6 +2570,7 @@ export const useChatStore = create(persist((set, get) => ({
                 }
             },
             () => {
+                stopSseWatchdog();
                 const latest = get();
                 if (latest.currentSessionId !== sessionId || latest.activeStreamToken !== streamToken) {
                     cancelChunkFrame();
@@ -2291,20 +2589,6 @@ export const useChatStore = create(persist((set, get) => ({
 
                 cancelChunkFrame();
                 flushPendingAssistantChunk();
-
-                // 流结束时将剩余 pending 的任务全部标记为 completed
-                const doneMsgs = get().messages;
-                for (let i = doneMsgs.length - 1; i >= 0; i -= 1) {
-                    if (doneMsgs[i].role === 'assistant') {
-                        const tp = doneMsgs[i].taskProgress || [];
-                        if (tp.length > 0 && tp.some((t) => t.status === 'pending')) {
-                            syncTaskProgress(tp.map((t) =>
-                                t.status === 'pending' ? { ...t, status: 'completed' } : t
-                            ));
-                        }
-                        break;
-                    }
-                }
 
                 const finalAssistantContent = (() => {
                     for (let i = latest.messages.length - 1; i >= 0; i -= 1) {
@@ -2343,10 +2627,13 @@ export const useChatStore = create(persist((set, get) => ({
                     lastFailedRequest: null,
                 });
 
+                const refreshGeneration = ++streamRefreshGeneration;
                 fetchMessagesBySession(sessionId)
                     .then((history) => {
                         const current = get();
-                        if (current.currentSessionId !== sessionId || current.isTyping) {
+                        if (current.currentSessionId !== sessionId
+                            || current.isTyping
+                            || refreshGeneration !== streamRefreshGeneration) {
                             return;
                         }
 
@@ -2376,6 +2663,7 @@ export const useChatStore = create(persist((set, get) => ({
                     });
             },
             (error) => {
+                stopSseWatchdog();
                 const isAbort = error?.name === 'AbortError';
 
                 const latest = get();
@@ -2431,6 +2719,7 @@ export const useChatStore = create(persist((set, get) => ({
                             temperature,
                             imageId: selectedImageId,
                             idempotencyKey,
+                            repoContext,
                         },
                 }));
 
@@ -2447,6 +2736,7 @@ export const useChatStore = create(persist((set, get) => ({
                 imageId: selectedImageId,
                 idempotencyKey,
                 repoContext,
+                codingRunId,
             }
         );
     },

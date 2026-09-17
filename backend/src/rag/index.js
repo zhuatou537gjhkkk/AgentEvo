@@ -5,6 +5,7 @@ import { OpenAIEmbeddings } from "@langchain/openai";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { FaissStore } from "@langchain/community/vectorstores/faiss";
 import { withRetry } from "../services/resilience.js";
+import { durableRagEnabled } from "./flags.js";
 
 const tenantStores = new Map();
 
@@ -100,23 +101,24 @@ async function processAndStoreText(text, fileName, userId, sizeBytes) {
     const normalizedText = String(text || "").trim();
     if (!normalizedText) throw new Error("empty document");
 
-    store.latestUploadedSource = fileName;
     const documentSize = Number.isInteger(sizeBytes) ? sizeBytes : Buffer.byteLength(normalizedText, "utf8");
 
     if (documentSize > LARGE_FILE_THRESHOLD_BYTES) {
-        store.indexedFiles.add(fileName);
-        store.activeLargeFile = {
+        const largeFile = {
             fileName,
             content: normalizedText,
             sizeBytes: documentSize,
             updatedAt: new Date().toISOString()
         };
-        activeLargeFile = store.activeLargeFile;
+        // Commit source/file state only after validation has completed. This keeps a
+        // failed upload from making a phantom large document visible to retrieval.
+        store.latestUploadedSource = fileName;
+        store.indexedFiles.add(fileName);
+        store.activeLargeFile = largeFile;
+        activeLargeFile = largeFile;
         return { fileName, mode: "long_context", sizeBytes: documentSize, totalFiles: store.indexedFiles.size };
     }
 
-    store.activeLargeFile = null;
-    activeLargeFile = null;
     const splitter = new RecursiveCharacterTextSplitter({ chunkSize: 500, chunkOverlap: 50 });
     const chunks = await splitter.splitText(normalizedText);
     if (chunks.length === 0) throw new Error("document cannot be split into valid chunks");
@@ -126,9 +128,6 @@ async function processAndStoreText(text, fileName, userId, sizeBytes) {
         uploadedAt: new Date().toISOString(),
         cwdExists: fs.existsSync(process.cwd())
     }));
-    store.knowledgeChunks.push(...chunks);
-    store.knowledgeMetadatas.push(...metadata);
-    store.indexedFiles.add(fileName);
     const documents = chunks.map((chunk, index) => ({ pageContent: chunk, metadata: metadata[index] }));
     // W4-R5 (T1)：索引期 embedding 推理是网络调用，包 withRetry（预算层唯一，见上方
     // embeddings maxRetries:0）。耗尽后异常上抛 → 上传路径按失败处理（清理临时文件并
@@ -144,6 +143,12 @@ async function processAndStoreText(text, fileName, userId, sizeBytes) {
             { retries: 2 }
         );
     }
+    // Commit legacy metadata only after vector indexing succeeds. An embedding
+    // failure must not leave lexical chunks or source markers behind.
+    store.latestUploadedSource = fileName;
+    store.knowledgeChunks.push(...chunks);
+    store.knowledgeMetadatas.push(...metadata);
+    store.indexedFiles.add(fileName);
     return { fileName, mode: "vector", chunkCount: chunks.length, totalChunks: store.knowledgeChunks.length, totalFiles: store.indexedFiles.size };
 }
 
@@ -173,6 +178,27 @@ export async function processAndStoreDocumentFile(filePath, fileName, userId, { 
 
 export async function queryKnowledgeBase(query, userId = null) {
     if (userId == null) throw new Error("knowledge base requires an authenticated user");
+
+    // K5 durable read is opt-in and keeps the existing memory reader as the
+    // canary/rollback side. The tool contract remains the same JSON/string
+    // response, so the Graph and MCP topology do not change.
+    if (durableRagEnabled()) {
+        const { dualReadUpload } = await import("./durableSync.js");
+        const result = await dualReadUpload({ scope: userId, query });
+        if (result.items?.length > 0) {
+            return JSON.stringify({
+                status: "ok",
+                source: result.servedBy,
+                items: result.items,
+                ...(result.text ? { text: result.text } : {}),
+            });
+        }
+        if (result.memory?.emptyStore && result.durable?.emptyStore) {
+            return "当前知识库为空";
+        }
+        return "未检索到相关知识片段";
+    }
+
     const evidence = await retrieveKnowledgeEvidence(query, { userId });
 
     if (evidence.status === "empty") {

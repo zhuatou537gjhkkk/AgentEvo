@@ -13,6 +13,7 @@
  *   - creative (5): 创意任务
  *   - tool_selection (5): 工具选择正确性
  *   - edge_case (5): 边界场景
+ *   - cross_source_recall (5): 混合可信记忆与跨源召回（显式夹具）
  */
 
 /** @type {EvalTestCase[]} */
@@ -303,6 +304,11 @@ const testCases = [
         input: "我喜欢Python，记住这个偏好。",
         expectedBehavior: "调用memory工具存储偏好，确认已记录",
         expectedTools: ["memory"],
+        memoryChecks: {
+            requiredActions: [{ action: "add", minCount: 1 }],
+            toolInputContains: ["Python"],
+            outputAny: ["Python", "记录", "记住"],
+        },
     },
     {
         id: "tc_memory_002",
@@ -312,6 +318,11 @@ const testCases = [
         input: "我之前说过我喜欢什么编程语言？",
         expectedBehavior: "调用memory工具搜索之前的记录，返回Python",
         expectedTools: ["memory"],
+        memoryChecks: {
+            requiredActions: ["search"],
+            outputAll: ["Python"],
+            requiresRecallEvidence: true,
+        },
     },
     {
         id: "tc_memory_003",
@@ -321,6 +332,11 @@ const testCases = [
         input: "记住以下信息：我叫小明，住在北京，喜欢打篮球。然后告诉我关于我的所有信息",
         expectedBehavior: "分别存储多条→检索所有已存储信息→汇总返回",
         expectedTools: ["memory"],
+        memoryChecks: {
+            requiredActions: [{ action: "add", minCount: 3 }, "search"],
+            toolInputContains: ["小明", "北京", "打篮球"],
+            outputAll: ["小明", "北京", "篮球"],
+        },
     },
     {
         id: "tc_memory_004",
@@ -330,6 +346,11 @@ const testCases = [
         input: "我之前说过我的电话号码吗？",
         expectedBehavior: "调用memory搜索，如果没有则诚实回答未找到",
         expectedTools: ["memory"],
+        memoryChecks: {
+            requiredActions: ["search"],
+            outputAny: ["未找到", "没有", "不记得", "不知道"],
+            outputNone: ["13800138000", "电话号码是"],
+        },
     },
     {
         id: "tc_memory_005",
@@ -339,6 +360,89 @@ const testCases = [
         input: "我经常问关于Python学习的问题，帮我整理并巩固关于Python的记忆",
         expectedBehavior: "搜索Python相关记忆→调用consolidate提升重要性",
         expectedTools: ["memory"],
+        memoryChecks: {
+            requiredActions: ["search", "consolidate"],
+            actionOrder: ["search", "consolidate"],
+            outputAny: ["巩固", "Python", "整理"],
+        },
+    },
+
+    // ══════════════════════════════════════════
+    // 混合可信记忆召回 (5，需显式场景夹具)
+    // ══════════════════════════════════════════
+    {
+        id: "tc_cross_source_001",
+        category: "cross_source_recall",
+        difficulty: "medium",
+        description: "用户偏好、项目记忆与 RAG 的联合召回",
+        input: "结合我的偏好、当前项目约定和文档片段，给出实现建议。",
+        expectedBehavior: "在 owner/project 范围内公平选择多种来源，并用证据回答",
+        expectedTools: [],
+        requiresScenarioFixture: true,
+        crossSourceChecks: {
+            requiredSourceTypes: ["user_memory", "project_memory", "rag"],
+            outputAny: ["建议", "实现", "依据"],
+            maxSelectedPerSource: { user_memory: 4, project_memory: 4, rag: 4 },
+        },
+    },
+    {
+        id: "tc_cross_source_002",
+        category: "cross_source_recall",
+        difficulty: "hard",
+        description: "跨用户项目记忆隔离",
+        input: "只使用我的资料回答当前项目问题，不要引用其他用户的偏好。",
+        expectedBehavior: "拒绝跨 owner 记忆，回答中不泄漏其他用户内容",
+        expectedTools: [],
+        requiresScenarioFixture: true,
+        crossSourceChecks: {
+            forbiddenIds: ["foreign-user-memory"],
+            forbiddenSourceTypes: ["foreign_user_memory"],
+            outputNone: ["其他用户的秘密", "foreign-user-memory"],
+        },
+    },
+    {
+        id: "tc_cross_source_003",
+        category: "cross_source_recall",
+        difficulty: "hard",
+        description: "失效记忆与过期 RAG 版本不应召回",
+        input: "根据当前有效资料回答，不要使用已失效的偏好或旧版本文档。",
+        expectedBehavior: "只选择 active/当前 revision 的证据",
+        expectedTools: [],
+        requiresScenarioFixture: true,
+        crossSourceChecks: {
+            forbiddenIds: ["invalidated-memory", "stale-rag-revision"],
+            outputNone: ["旧版本结论", "invalidated-memory"],
+        },
+    },
+    {
+        id: "tc_cross_source_004",
+        category: "cross_source_recall",
+        difficulty: "medium",
+        description: "长期衰减下的新旧偏好排序",
+        input: "按照我最近的偏好给出方案，并说明依据。",
+        expectedBehavior: "在相关性相近时近期事实优先于长期未更新事实",
+        expectedTools: [],
+        requiresScenarioFixture: true,
+        crossSourceChecks: {
+            requiredIds: ["recent-preference"],
+            forbiddenIds: ["superseded-preference"],
+            outputAny: ["最近", "当前", "偏好"],
+        },
+    },
+    {
+        id: "tc_cross_source_005",
+        category: "cross_source_recall",
+        difficulty: "hard",
+        description: "单一来源故障不阻断其余来源",
+        input: "即使项目记忆暂时不可用，也请基于可用信息回答。",
+        expectedBehavior: "隔离 project_memory 错误，仍使用 user_memory 或 RAG",
+        expectedTools: [],
+        requiresScenarioFixture: true,
+        crossSourceChecks: {
+            requiredSourceTypes: ["user_memory"],
+            forbiddenIds: ["foreign-project-memory"],
+            outputAny: ["可用", "根据", "建议"],
+        },
     },
 
     // ══════════════════════════════════════════
@@ -636,7 +740,7 @@ export default testCases;
 /**
  * @typedef {object} EvalTestCase
  * @property {string} id
- * @property {string} category — knowledge_qa | web_search | multi_step | memory_recall | code_generation | creative | tool_selection | edge_case
+ * @property {string} category — knowledge_qa | web_search | multi_step | memory_recall | cross_source_recall | code_generation | creative | tool_selection | edge_case
  * @property {string} difficulty — easy | medium | hard
  * @property {string} description — 人类可读描述
  * @property {string} input — 发送给 Agent 的用户消息
@@ -644,4 +748,6 @@ export default testCases;
  * @property {string[]} expectedTools — 期望调用的工具名列表
  * @property {boolean} [enableWebSearch]
  * @property {string} [systemPrompt]
+ * @property {boolean} [requiresScenarioFixture]
+ * @property {object} [crossSourceChecks]
  */

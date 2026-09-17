@@ -9,6 +9,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { useChatStore } from "../store/chatStore";
+import { fetchMcpObservability } from "../api/eval.js";
 
 // ═══════════════════════════════════════════════════════════════
 // 可测试常量 (Phase 6b G9)
@@ -115,7 +116,7 @@ export default function ObservabilityPanel({ embedded = false, onBack }) {
     const fetchObservabilityTraceDetail = useChatStore((s) => s.fetchObservabilityTraceDetail);
     const fetchObservabilityMetrics = useChatStore((s) => s.fetchObservabilityMetrics);
 
-    const [activeTab, setActiveTab] = useState("traces"); // "traces" | "overview" | "otel-import"
+    const [activeTab, setActiveTab] = useState("traces"); // "traces" | "overview" | "mcp" | "otel-import"
     const [metricsWindow, setMetricsWindow] = useState("7d");
     const [expandedTrace, setExpandedTrace] = useState(null);
 
@@ -129,6 +130,11 @@ export default function ObservabilityPanel({ embedded = false, onBack }) {
     // OTel export state (per-trace)
     const [otelExporting, setOtelExporting] = useState(null); // traceId being exported
     const [exportResult, setExportResult] = useState(null); // { traceId, message, error }
+    const [mcpWindow, setMcpWindow] = useState("7d");
+    const [mcpServer, setMcpServer] = useState("");
+    const [mcpTool, setMcpTool] = useState("");
+    const [mcpData, setMcpData] = useState(null);
+    const [mcpLoading, setMcpLoading] = useState(false);
 
     // 初始加载
     useEffect(() => {
@@ -142,6 +148,15 @@ export default function ObservabilityPanel({ embedded = false, onBack }) {
         if (!isVisible) return;
         fetchObservabilityMetrics(metricsWindow);
     }, [isVisible, metricsWindow]);
+
+    useEffect(() => {
+        if (!isVisible || activeTab !== "mcp") return;
+        setMcpLoading(true);
+        fetchMcpObservability({ window: mcpWindow, server: mcpServer, tool: mcpTool })
+            .then(setMcpData)
+            .catch(() => setMcpData(null))
+            .finally(() => setMcpLoading(false));
+    }, [isVisible, activeTab, mcpWindow, mcpServer, mcpTool]);
 
     // ESC dismiss
     useEffect(() => {
@@ -267,7 +282,7 @@ export default function ObservabilityPanel({ embedded = false, onBack }) {
                     <div className="flex-1" />
                     {/* Tabs */}
                     <div className="flex gap-1 rounded-lg bg-[var(--panel-soft)] p-1">
-                        {["traces", "overview", "otel-import"].map((tab) => (
+                        {["traces", "overview", "mcp", "otel-import"].map((tab) => (
                             <button
                                 key={tab}
                                 type="button"
@@ -278,7 +293,7 @@ export default function ObservabilityPanel({ embedded = false, onBack }) {
                                         : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
                                 }`}
                             >
-                                {tab === "traces" ? "📋 Trace 列表" : tab === "overview" ? "📊 统计概览" : "📥 OTel 导入"}
+                                {tab === "traces" ? "📋 Trace 列表" : tab === "overview" ? "📊 统计概览" : tab === "mcp" ? "🧩 MCP 观测" : "📥 OTel 导入"}
                             </button>
                         ))}
                     </div>
@@ -501,6 +516,27 @@ export default function ObservabilityPanel({ embedded = false, onBack }) {
                                 </div>
                             )}
                         </div>
+                    </div>
+                )}
+
+                {activeTab === "mcp" && (
+                    <div className="space-y-4">
+                        <div className="flex flex-wrap items-center gap-2">
+                            {["7d", "30d", "all"].map((window) => <button key={window} type="button" onClick={() => setMcpWindow(window)} className={`rounded-lg px-2.5 py-1 text-xs ${mcpWindow === window ? "bg-[var(--brand-start)] text-white" : "border border-[var(--panel-border)] text-[var(--text-muted)]"}`}>{window === "all" ? "全部" : window}</button>)}
+                            <input value={mcpServer} onChange={(event) => setMcpServer(event.target.value)} placeholder="Server" className="w-28 rounded-lg border border-[var(--panel-border)] bg-[var(--panel-soft)] px-2 py-1 text-xs text-[var(--text-main)]" />
+                            <input value={mcpTool} onChange={(event) => setMcpTool(event.target.value)} placeholder="工具" className="w-28 rounded-lg border border-[var(--panel-border)] bg-[var(--panel-soft)] px-2 py-1 text-xs text-[var(--text-main)]" />
+                        </div>
+                        {mcpLoading ? <p className="py-6 text-center text-xs text-[var(--text-muted)]">加载 MCP 观测...</p> : !mcpData?.summary?.enabled ? <div className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-xs text-amber-700">MCP 观测未启用；此处不会把 Agent Trace 的成功率当作工具/任务正确率。</div> : (
+                            <>
+                                <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                                    <div className="surface-subtle rounded-xl p-3"><p className="text-[10px] text-[var(--text-muted)]">调用成功率</p><p className="text-lg font-semibold text-[var(--text-main)]">{mcpData.summary.successRate?.value == null ? "无样本" : `${(mcpData.summary.successRate.value * 100).toFixed(1)}%`}</p><p className="text-[10px] text-[var(--text-muted)]">{mcpData.summary.successRate?.numerator || 0}/{mcpData.summary.successRate?.denominator || 0}</p></div>
+                                    <div className="surface-subtle rounded-xl p-3"><p className="text-[10px] text-[var(--text-muted)]">P50 / P95</p><p className="text-lg font-semibold text-[var(--text-main)]">{mcpData.summary.latency?.p50 ?? "-"}ms</p><p className="text-[10px] text-[var(--text-muted)]">P95 {mcpData.summary.latency?.p95 ?? "-"}ms · n={mcpData.summary.latency?.sampleSize || 0}</p></div>
+                                    <div className="surface-subtle rounded-xl p-3"><p className="text-[10px] text-[var(--text-muted)]">重试比例</p><p className="text-lg font-semibold text-[var(--text-main)]">{mcpData.summary.retryRate?.value == null ? "无样本" : `${(mcpData.summary.retryRate.value * 100).toFixed(1)}%`}</p><p className="text-[10px] text-[var(--text-muted)]">实际 attempts &gt; 1</p></div>
+                                    <div className="surface-subtle rounded-xl p-3"><p className="text-[10px] text-[var(--text-muted)]">观测样本</p><p className="text-lg font-semibold text-[var(--text-main)]">{mcpData.summary.sampleSize || 0}</p><p className="text-[10px] text-[var(--text-muted)]">协议/调用，不等于任务正确率</p></div>
+                                </div>
+                                <div className="overflow-auto rounded-xl border border-[var(--panel-border)]"><table className="w-full text-xs"><thead><tr className="border-b border-[var(--panel-border)] text-left text-[var(--text-muted)]"><th className="px-3 py-2">时间</th><th className="px-3 py-2">Server/工具</th><th className="px-3 py-2">状态</th><th className="px-3 py-2">耗时</th><th className="px-3 py-2">attempts</th><th className="px-3 py-2">Trace</th></tr></thead><tbody>{(mcpData.operations?.operations || []).map((operation) => <tr key={operation.operation_id} className="border-b border-[var(--panel-border)]"><td className="px-3 py-2 text-[var(--text-muted)]">{operation.created_at ? new Date(operation.created_at).toLocaleString("zh-CN") : "-"}</td><td className="px-3 py-2 font-mono">{operation.server_name}/{operation.tool_name || operation.operation}</td><td className={`px-3 py-2 font-semibold ${operation.status === "success" ? "text-emerald-600" : "text-red-600"}`}>{operation.status}</td><td className="px-3 py-2">{operation.duration_ms}ms</td><td className="px-3 py-2">{operation.attempt_count}</td><td className="px-3 py-2">{operation.trace_id ? <span className="font-mono">{operation.trace_id.slice(0, 12)}...</span> : "独立协议评测"}</td></tr>)}</tbody></table></div>
+                            </>
+                        )}
                     </div>
                 )}
 

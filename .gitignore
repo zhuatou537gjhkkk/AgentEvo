@@ -17,7 +17,6 @@ pnpm-debug.log*
 # Env
 .env
 .env.*
-!.env.example
 
 # Claude Code
 .claude/
@@ -28,6 +27,7 @@ CLAUDE.md
 **/dist/
 **/build/
 **/coverage/
+output/
 
 # LeetCode progress (personal tracking, not for repo)
 leetcode-progress.json
@@ -41,15 +41,28 @@ leetcode-progress.json
 *.db-journal
 
 # 本地文件
-# 本地文件
-# docs 下的所有个人资料均不纳入版本控制，但保留开发日志
-docs/*
-!docs/dev-logs/
-!docs/dev-logs/**
+# docs 下的所有文件均不纳入版本控制
+docs/
 test
 
 # Memory / Session artifacts
 memory/
+tmp/
 skills-lock.json
 tmp_obs.json
 *.bak.*
+
+# Private RAG evaluation manifests and reports; sanitized examples stay in source.
+docs/dev-logs/rag-private/
+backend/tmp/rag-eval/
+backend/tmp/knowledge-ingest/faiss-indexes/
+tmp/knowledge-ingest/faiss-indexes/
+**/manifest.private*.json
+**/rag-eval-report*.json
+**/rag-eval-report*.md
+
+# Private RAG evaluation manifests and reports; sanitized examples stay in source.
+docs/dev-logs/rag-private/
+backend/tmp/rag-eval/
+**/rag-eval-report*.json
+**/rag-eval-report*.md

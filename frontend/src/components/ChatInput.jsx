@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useChatStore } from '../store/chatStore';
-import { uploadFile, uploadImage } from '../api/chat';
+import { pollKnowledgeIngestJob, retryKnowledgeIngestJob, uploadFile, uploadImage } from '../api/chat';
 import ContextIndicator from './ContextIndicator';
 
 const MAX_IMAGE_UPLOAD_BYTES = 8 * 1024 * 1024;
@@ -59,11 +59,13 @@ export default function ChatInput({ suggestedPrompt = '', onSuggestedPromptConsu
     const [value, setValue] = useState('');
     const [uploadStatus, setUploadStatus] = useState('');
     const [uploadProgress, setUploadProgress] = useState(null);
+    const [failedIngestJob, setFailedIngestJob] = useState(null);
     const [isListening, setIsListening] = useState(false);
     const textareaRef = useRef(null);
     const docFileInputRef = useRef(null);
     const imageFileInputRef = useRef(null);
     const recognitionRef = useRef(null);
+    const docUploadAbortRef = useRef(null);
     const previewUrlRef = useRef(null);
     const draftTimerRef = useRef(null);
     const sendMessage = useChatStore((state) => state.sendMessage);
@@ -133,20 +135,6 @@ export default function ChatInput({ suggestedPrompt = '', onSuggestedPromptConsu
     }, [value]);
 
     useEffect(() => {
-        if (!uploadStatus) {
-            return undefined;
-        }
-
-        const timer = setTimeout(() => {
-            setUploadStatus('');
-        }, 2400);
-
-        return () => {
-            clearTimeout(timer);
-        };
-    }, [uploadStatus]);
-
-    useEffect(() => {
         const currentPreviewUrl = selectedImage?.previewUrl || null;
 
         if (previewUrlRef.current && previewUrlRef.current !== currentPreviewUrl) {
@@ -160,6 +148,8 @@ export default function ChatInput({ suggestedPrompt = '', onSuggestedPromptConsu
         if (recognitionRef.current) {
             recognitionRef.current.stop();
         }
+
+        docUploadAbortRef.current?.abort();
 
         if (draftTimerRef.current) {
             clearTimeout(draftTimerRef.current);
@@ -208,13 +198,62 @@ export default function ChatInput({ suggestedPrompt = '', onSuggestedPromptConsu
         }
 
         try {
-            setUploadStatus('上传中...');
-            await uploadFile(file);
-            setUploadStatus(`上传成功: ${file.name}`);
+            docUploadAbortRef.current?.abort();
+            const controller = new AbortController();
+            docUploadAbortRef.current = controller;
+            setUploadStatus('计算哈希...');
+            setUploadProgress(0);
+            setFailedIngestJob(null);
+            await uploadFile(file, {
+                signal: controller.signal,
+                onProgress: (progress) => {
+                    if (progress?.phase) setUploadStatus(`${progress.phase}...`);
+                    if (Number.isFinite(progress?.percentage)) setUploadProgress(progress.percentage);
+                },
+            });
+            setUploadStatus(`知识库已就绪: ${file.name}`);
+            setUploadProgress(null);
+            setFailedIngestJob(null);
         } catch (error) {
-            setUploadStatus(`上传失败: ${error.message || '请重试'}`);
+            if (error?.name !== 'AbortError') {
+                setUploadStatus(`上传失败: ${error.message || '请重试'}`);
+                setFailedIngestJob(error?.ingestJob || null);
+            }
+            setUploadProgress(null);
         } finally {
+            docUploadAbortRef.current = null;
             event.target.value = '';
+        }
+    };
+
+    const handleRetryIngest = async () => {
+        if (!failedIngestJob?.id) return;
+        const controller = new AbortController();
+        docUploadAbortRef.current?.abort();
+        docUploadAbortRef.current = controller;
+        try {
+            setUploadStatus('重新排队中...');
+            const accepted = await retryKnowledgeIngestJob(failedIngestJob.id, { signal: controller.signal });
+            const job = accepted?.job;
+            if (!job?.pollUrl) throw new Error('重试任务状态无效');
+            await pollKnowledgeIngestJob(job.pollUrl, {
+                signal: controller.signal,
+                initialJob: job,
+                onProgress: (progress) => {
+                    setUploadStatus(`${progress.phase}...`);
+                    if (Number.isFinite(progress.percentage)) setUploadProgress(progress.percentage);
+                },
+            });
+            setUploadStatus(`知识库已就绪: ${failedIngestJob.fileName || '文档'}`);
+            setFailedIngestJob(null);
+            setUploadProgress(null);
+        } catch (error) {
+            if (error?.name !== 'AbortError') {
+                setUploadStatus(`重试失败: ${error.message || '请重试'}`);
+                setFailedIngestJob(error?.ingestJob || failedIngestJob);
+            }
+        } finally {
+            docUploadAbortRef.current = null;
         }
     };
 
@@ -368,6 +407,9 @@ export default function ChatInput({ suggestedPrompt = '', onSuggestedPromptConsu
                 {uploadStatus && (
                     <div className="mb-2 inline-flex max-w-full rounded-full border border-[var(--panel-border)] bg-[var(--panel-bg)] px-3 py-1 text-xs text-[var(--text-muted)]">
                         <span className="truncate">{uploadStatus}{typeof uploadProgress === 'number' ? ` ${uploadProgress}%` : ''}</span>
+                        {failedIngestJob && (
+                            <button type="button" onClick={handleRetryIngest} className="ml-2 font-medium text-[var(--brand-start)]">重试</button>
+                        )}
                     </div>
                 )}
 
@@ -395,7 +437,7 @@ export default function ChatInput({ suggestedPrompt = '', onSuggestedPromptConsu
                             type="button"
                             onClick={handleUploadClick}
                             className="composer-icon-button"
-                            title="上传 txt 或 md 文档"
+                            title="作为知识库解析 txt、md、PDF 或图片"
                         >
                             <svg viewBox="0 0 24 24" className="mx-auto h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
                                 <path d="M3 7.5a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7.5Z" />
@@ -405,7 +447,7 @@ export default function ChatInput({ suggestedPrompt = '', onSuggestedPromptConsu
                         <input
                             ref={docFileInputRef}
                             type="file"
-                            accept=".txt,.md"
+                            accept=".txt,.md,.pdf,.png,.jpg,.jpeg,.webp"
                             className="hidden"
                             onChange={handleFileChange}
                         />

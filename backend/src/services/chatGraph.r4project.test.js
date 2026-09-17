@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { runKnowledgeProjectRagBranch, knowledgeAgentNode } from "./chatGraph.js";
 import { runWithAuthenticatedContext } from "./requestContext.js";
 import { clearRagFlags } from "../rag/flags.js";
+import { UPLOAD_DOC_PROJECT } from "../rag/projectIds.js";
 import { clearGraphFlags } from "./graphFlags.js";
 
 /**
@@ -146,6 +147,36 @@ describe("runKnowledgeProjectRagBranch (R4 #7)", () => {
         expect(result.planResults).toBeUndefined();
         expect(result.agentResults).toBeUndefined();
     });
+
+    it("K12 cross-source result keeps separate code/document provenance", async () => {
+        const retrievalService = async () => ({
+            status: "ok",
+            mode: "cross_source",
+            text: "[项目代码: src/auth.js:1-2]\ncode\n[知识库文档: guide.pdf p.3]\ndoc",
+            items: [
+                { sourceType: "rag", sourceId: "code-1", content: "code", provenance: { file: "src/auth.js", startLine: 1, endLine: 2, commit: "c1" } },
+                { sourceType: "knowledge", sourceId: "doc-1", content: "doc", provenance: { fileName: "guide.pdf", pageStart: 3, pageEnd: 3, documentId: "doc-1" } },
+            ],
+            metrics: { sources: { project_code: { status: "ok" }, knowledge: { status: "ok" } } },
+        });
+        const result = await runKnowledgeProjectRagBranch(
+            subTaskState(),
+            { configurable: { retrievalService } },
+            null,
+            [],
+            AGENT,
+            7,
+        );
+
+        expect(result.agentResults.st1.artifact.retrieval.sources).toEqual({
+            project_code: { status: "ok" },
+            knowledge: { status: "ok" },
+        });
+        expect(result.agentResults.st1.artifact.retrieval.items).toEqual([
+            expect.objectContaining({ sourceType: "rag", file: "src/auth.js", startLine: 1, endLine: 2, commit: "c1" }),
+            expect.objectContaining({ sourceType: "knowledge", fileName: "guide.pdf", pageStart: 3, pageEnd: 3, documentId: "doc-1" }),
+        ]);
+    });
 });
 
 describe("knowledgeAgentNode gating (branch fires only when all preconditions hold)", () => {
@@ -172,6 +203,25 @@ describe("knowledgeAgentNode gating (branch fires only when all preconditions ho
                 knowledgeAgentNode(state, { configurable: { retrievalService, makeLlm: FALLTHROUGH_MAKE_LLM } })),
         ).rejects.toThrow(LLM_REACHED);
         expect(retrievalCalls).toBe(0);
+    });
+
+    it("durable knowledge RAG + knowledge intent + no explicit projectId → uses the upload project", async () => {
+        process.env.PROJECT_RAG_ENABLED = "1";
+        process.env.RAG_DURABLE_ENABLED = "1";
+        const calls = [];
+        const retrievalService = async (args) => {
+            calls.push(args);
+            return okRetrieval();
+        };
+        const state = baseState();
+        const result = await runWithAuthenticatedContext(ctx, () =>
+            knowledgeAgentNode(state, { configurable: { retrievalService, makeLlm: FALLTHROUGH_MAKE_LLM } }));
+
+        expect(result.currentAgent).toBe(AGENT);
+        expect(result.knowledgeResults).toContain("src/auth/loginUser.js");
+        expect(calls).toHaveLength(1);
+        expect(calls[0].projectId).toBe(UPLOAD_DOC_PROJECT);
+        expect(calls[0].scope).toEqual({ userId: 7, tenantId: "user:7" });
     });
 
     it("flag ON + projectId + no retrievalService → falls through, legacy path runs", async () => {

@@ -1,3 +1,5 @@
+import { hashFileIncrementally } from '../utils/incrementalSha256.js';
+
 const BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000').trim();
 const DEFAULT_TIMEOUT_MS = Number(import.meta.env.VITE_API_TIMEOUT_MS) || 30000;
 const DEFAULT_RETRY_COUNT = 1;
@@ -333,7 +335,10 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
         image = null,
         imageId = null,
         repoContext = null,
+        codingRunId = null, // Phase 7 / R2 — chat-attached coding run id
     } = options;
+
+    let abortHandler = null;
 
     try {
         const response = await request(
@@ -357,6 +362,9 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
                     // Phase 7 / R1 — optional attached repo references (only sent
                     // when the user explicitly attached a file/range in the panel).
                     repo_context: repoContext || undefined,
+                    // Phase 7 / R2 — server-authorized coding run this chat turn
+                    // should drive (auto-decider; see backend resolveCodingRunTask).
+                    coding_run_id: codingRunId || undefined,
                 }),
             },
             {
@@ -376,7 +384,7 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
         let buffer = '';
 
         // 监听外部 abort signal，取消 reader → 断开 HTTP 连接 → 后端检测到断连
-        let abortHandler;
+        // abortHandler 声明在 try 外（见函数头），finally 里统一移除监听，避免 ReferenceError
         let streamTerminal = false;
         let streamDone = false;
         if (signal) {
@@ -435,7 +443,7 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
                     return;
                 }
 
-                if (eventType === 'tool_start' || eventType === 'tool_end' || eventType === 'tool_error' || eventType === 'thought' || eventType === 'metrics' || eventType === 'ask_user_question' || eventType === 'todo_updated' || eventType === 'agent_start' || eventType === 'agent_end' || eventType === 'agent_handoff') {
+                if (eventType === 'tool_start' || eventType === 'tool_end' || eventType === 'tool_error' || eventType === 'thought' || eventType === 'metrics' || eventType === 'ask_user_question' || eventType === 'todo_updated' || eventType === 'agent_start' || eventType === 'agent_end' || eventType === 'agent_handoff' || eventType === 'memory_candidate') {
                     onToolEvent(parsed);
                     return;
                 }
@@ -482,15 +490,18 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
 
             if (done) {
                 consumeBuffer(true);
-                if (!streamTerminal) {
+                // [DONE] 到达时 handlePayload 已将 streamTerminal 置 true, 所以不能再用
+                // "!streamTerminal" 判完成——那会让 onDone 永不触发、isTyping 永不复位。
+                // 正确语义: [DONE]+EOF → onDone; 此前 error/unknown 已定局 → 跳过;
+                // EOF 无 [DONE] 且无定局事件 → 截断错误。
+                if (streamDone) {
+                    onDone();
+                } else if (!streamTerminal) {
                     streamTerminal = true;
-                    if (streamDone) onDone();
-                    else {
-                        const truncated = new Error('stream ended before [DONE]');
-                        truncated.errorCode = 'INCOMPLETE_SSE_STREAM';
-                        truncated.retryable = true;
-                        onError(truncated);
-                    }
+                    const truncated = new Error('stream ended before [DONE]');
+                    truncated.errorCode = 'INCOMPLETE_SSE_STREAM';
+                    truncated.retryable = true;
+                    onError(truncated);
                 }
                 break;
             }
@@ -513,7 +524,7 @@ export async function fetchChatStream(sessionId, message, onChunk, onToolEvent, 
 }
 
 export async function uploadFile(file, options = {}) {
-    const { onProgress } = options;
+    const { onProgress, signal } = options;
     const CHUNK_SIZE = 4 * 1024 * 1024;
     const LARGE_FILE_THRESHOLD = 500 * 1024;
     const DOC_UPLOAD_RETRY_COUNT = 2;
@@ -565,30 +576,10 @@ export async function uploadFile(file, options = {}) {
         window.localStorage.removeItem(resumeKey);
     };
 
-    const toHex = (arrayBuffer) => {
-        const bytes = new Uint8Array(arrayBuffer);
-        return Array.from(bytes)
-            .map((byte) => byte.toString(16).padStart(2, '0'))
-            .join('');
-    };
-
-    const computeFileHash = async (targetFile) => {
-        const buffer = await targetFile.arrayBuffer();
-
-        if (globalThis.crypto?.subtle) {
-            const digest = await globalThis.crypto.subtle.digest('SHA-256', buffer);
-            return toHex(digest);
-        }
-
-        // Do not fabricate a SHA-256-looking value: the server verifies the
-        // file hash at merge time. Older browsers without SubtleCrypto use a
-        // deterministic non-cryptographic key only for resume, while the
-        // server must reject it before indexing rather than accepting it as
-        // integrity evidence.
-        throw Object.assign(new Error('SHA-256 is unavailable in this browser'), {
-            errorCode: 'UPLOAD_HASH_UNAVAILABLE',
-        });
-    };
+    const computeFileHash = async (targetFile) => hashFileIncrementally(targetFile, {
+        signal,
+        onProgress: (progress) => onProgress?.({ ...progress, phase: 'hashing' }),
+    });
 
     const uploadSingleChunk = async (hash, chunkIndex, chunkBlob, totalChunks) => {
         const formData = new FormData();
@@ -603,6 +594,7 @@ export async function uploadFile(file, options = {}) {
             body: formData,
         }, {
             retryCount: 0,
+            externalSignal: signal,
         });
 
         return response.json();
@@ -635,10 +627,10 @@ export async function uploadFile(file, options = {}) {
         const response = await request('/upload', {
             method: 'POST',
             body: formData,
-        });
+        }, { externalSignal: signal });
 
         emitProgress(file.size, file.size);
-        return response.json();
+        return finalizeKnowledgeUpload(await response.json(), options);
     }
 
     const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
@@ -662,8 +654,14 @@ export async function uploadFile(file, options = {}) {
         body: JSON.stringify(checkPayload),
     }, {
         retryCount: 0,
+        externalSignal: signal,
     });
     const checkData = await checkResponse.json();
+
+    if (checkData?.data?.job?.pollUrl) {
+        clearResumeState(resumeKey);
+        return pollKnowledgeIngestJob(checkData.data.job.pollUrl, { ...options, initialJob: checkData.data.job });
+    }
 
     if (checkData?.data?.uploaded === true) {
         clearResumeState(resumeKey);
@@ -733,12 +731,13 @@ export async function uploadFile(file, options = {}) {
     }, {
         retryCount: 0,
         timeoutMs: Math.max(DEFAULT_TIMEOUT_MS, 3 * 60 * 1000),
+        externalSignal: signal,
     });
 
     clearResumeState(resumeKey);
     emitProgress(file.size, file.size);
 
-    return completeResponse.json();
+    return finalizeKnowledgeUpload(await completeResponse.json(), options);
 }
 
 export async function uploadImage(file, options = {}) {
@@ -887,13 +886,78 @@ export async function disconnectMcpServer(name) {
 // 记忆系统管理 API (Phase 4)
 // ═══════════════════════════════════════════════════════
 
-export async function fetchMemories(query = '', memoryType = '', limit = 50) {
+export async function fetchMemories(query = '', memoryType = '', limit = 50, status = 'all') {
     const params = new URLSearchParams();
     if (query) params.set('query', query);
     if (memoryType) params.set('memory_type', memoryType);
+    if (status) params.set('status', status);
     params.set('limit', String(limit));
     const res = await request(`/memory?${params.toString()}`);
     return res.json();
+}
+
+function createAbortError() {
+    return Object.assign(new Error('操作已取消'), { name: 'AbortError' });
+}
+
+function sleepWithSignal(ms, signal) {
+    return new Promise((resolve, reject) => {
+        let timer = null;
+        const cleanup = () => signal?.removeEventListener('abort', abort);
+        const finish = () => { cleanup(); resolve(); };
+        const abort = () => { if (timer) clearTimeout(timer); cleanup(); reject(createAbortError()); };
+        if (signal?.aborted) { abort(); return; }
+        timer = setTimeout(finish, ms);
+        signal?.addEventListener('abort', abort, { once: true });
+    });
+}
+
+function ingestPhaseLabel(job) {
+    if (!job) return '处理中';
+    if (job.status === 'queued' || job.status === 'submitting') return '排队中';
+    if (job.status.startsWith('provider_')) return '解析中';
+    if (job.status === 'downloading') return '下载解析结果';
+    if (job.status === 'parsing') return '解析文档';
+    if (job.status === 'indexing') return '建立索引';
+    if (job.status === 'ready') return '可用';
+    return job.status;
+}
+
+export async function pollKnowledgeIngestJob(pollUrl, { signal, initialJob = null, onProgress, initialDelayMs = 300, maxDelayMs = 5000 } = {}) {
+    let job = initialJob;
+    let delay = Math.max(0, Number(initialDelayMs) || 0);
+    while (true) {
+        if (job) onProgress?.({ phase: ingestPhaseLabel(job), status: job.status, current: job.progress?.current || 0, total: job.progress?.total || 0, percentage: job.progress?.total > 0 ? Math.round((job.progress.current / job.progress.total) * 100) : null });
+        if (job?.status === 'ready') return { ok: true, message: 'document ready', data: { ...job, mode: 'async' } };
+        if (job?.status === 'failed' || job?.status === 'cancelled') {
+            const error = new HttpRequestError(job.status === 'cancelled' ? '文档处理已取消' : '文档处理失败，请重试', { status: 409, errorCode: job.errorCode || 'INGEST_FAILED', retryable: Boolean(job.retryable) });
+            error.ingestJob = job;
+            throw error;
+        }
+        if (delay > 0) await sleepWithSignal(delay, signal);
+        const response = await request(pollUrl, {}, { externalSignal: signal, retryCount: 0, timeoutMs: 10000 });
+        const payload = await response.json();
+        job = payload?.job || payload?.data?.job || null;
+        if (!job) throw new HttpRequestError('文档任务状态无效', { status: 502, errorCode: 'INGEST_STATUS_INVALID', retryable: true });
+        delay = Math.min(maxDelayMs, Math.max(0, delay * 2 || 500));
+    }
+}
+
+async function finalizeKnowledgeUpload(payload, options = {}) {
+    const data = payload?.data || {};
+    const job = data?.pollUrl ? data : data?.job;
+    if (!job?.pollUrl) return payload;
+    return pollKnowledgeIngestJob(job.pollUrl, { ...options, initialJob: job });
+}
+
+export async function retryKnowledgeIngestJob(jobId, { signal } = {}) {
+    const response = await request(`/rag/ingest/${encodeURIComponent(jobId)}/retry`, { method: 'POST' }, { externalSignal: signal, retryCount: 0 });
+    return response.json();
+}
+
+export async function cancelKnowledgeIngestJob(jobId, { signal } = {}) {
+    const response = await request(`/rag/ingest/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' }, { externalSignal: signal, retryCount: 0 });
+    return response.json();
 }
 
 export async function fetchMemoryStats() {
@@ -901,9 +965,60 @@ export async function fetchMemoryStats() {
     return res.json();
 }
 
+export async function fetchMemoryRetention() {
+    const res = await request('/memory/retention');
+    return res.json();
+}
+
+export async function runMemoryRetention(dryRun = false) {
+    const res = await request('/memory/retention/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dry_run: dryRun }),
+    });
+    return res.json();
+}
+
+export async function exportMemories() {
+    const res = await request('/memory/export');
+    return res.json();
+}
+
+export async function cleanupMemories(ids = [], confirm = false) {
+    const res = await request('/memory/cleanup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids, confirm }),
+    });
+    return res.json();
+}
+
 export async function deleteMemory(memoryId) {
     const res = await request(`/memory/${encodeURIComponent(memoryId)}`, {
         method: 'DELETE',
+    });
+    return res.json();
+}
+
+export async function fetchMemoryLineage(memoryId) {
+    const res = await request(`/memory/${encodeURIComponent(memoryId)}/lineage`);
+    return res.json();
+}
+
+export async function batchUpdateMemories(ids = [], action = 'approve', reason = '') {
+    const res = await request('/memory/batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids, action, reason }),
+    });
+    return res.json();
+}
+
+export async function updateMemory(memoryId, updates = {}) {
+    const res = await request(`/memory/${encodeURIComponent(memoryId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates),
     });
     return res.json();
 }

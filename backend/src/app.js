@@ -43,6 +43,12 @@ import {
     getChatIdempotency as defaultGetChatIdempotency,
     getMessageById as defaultGetMessageById,
     setChatIdempotencyUserMessage as defaultSetChatIdempotencyUserMessage,
+    saveMcpOperationObservation as defaultSaveMcpOperationObservation,
+    listMcpOperationObservations as defaultListMcpOperationObservations,
+    getMcpObservabilitySummary as defaultGetMcpObservabilitySummary,
+    listMcpEvalRuns as defaultListMcpEvalRuns,
+    getMcpEvalRun as defaultGetMcpEvalRun,
+    compareMcpEvalRuns as defaultCompareMcpEvalRuns,
 } from "./db/index.js";
 import { chatWithStream, estimateTokens, resolveModelName } from "./services/chat.js";
 import { calculateContextUsage } from "./services/contextUsage.js";
@@ -56,10 +62,17 @@ import {
     getLatestUploadedSource,
     getActiveLargeFile
 } from "./rag/index.js";
-import { durableRagEnabled } from "./rag/flags.js";
+import { durableRagEnabled, durableRagReadCanary, knowledgeIngestV2Enabled, knowledgeIngestWorkerMode } from "./rag/flags.js";
+import { startKnowledgeIngestWorker } from "./rag/ingestWorker.js";
+import { createOpenAiEmbedder } from "./rag/embedder.js";
+import { createKnowledgeIngestJob } from "./rag/ingestService.js";
+import { findDuplicateIngestJob } from "./rag/ingestStore.js";
+import { UPLOAD_DOC_PROJECT } from "./rag/projectIds.js";
 import { saveUploadedImage, getUploadedImageDataUrl } from "./images/store.js";
 import { MemoryService } from "./services/memory.js";
-import evalRoutes from "./eval/evalRoutes.js";
+import { parseCompactionResult } from "./services/workingMemory.js";
+import { workingMemoryEnabled } from "./services/memoryFlags.js";
+import evalRoutes, { evalFeedbackRouter } from "./eval/evalRoutes.js";
 import {
     hashPassword,
     verifyPassword,
@@ -99,6 +112,9 @@ import { defaultArtifactService } from "./coding/artifacts.js";
 import { defaultActionExecutor } from "./coding/actionExecutor.js";
 import { defaultRunWorkspaceRunner } from "./coding/runWorkspaceRunner.js";
 import { defaultRepoContextService } from "./coding/repoContext.js";
+import { startCrossSourceExperimentSampler } from "./eval/crossSourceExperimentSampler.js";
+import { mcpEvalRunner } from "./eval/mcp/runner.js";
+import { mcpEvalRouter } from "./eval/mcp/routes.js";
 
 // Default service bindings; createApp can override the request-visible bag.
 const initDB = defaultInitDB;
@@ -174,6 +190,12 @@ const defaultDependencies = {
         failChatIdempotency,
         getChatIdempotency,
         setChatIdempotencyUserMessage,
+        saveMcpOperationObservation: defaultSaveMcpOperationObservation,
+        listMcpOperationObservations: defaultListMcpOperationObservations,
+        getMcpObservabilitySummary: defaultGetMcpObservabilitySummary,
+        listMcpEvalRuns: defaultListMcpEvalRuns,
+        getMcpEvalRun: defaultGetMcpEvalRun,
+        compareMcpEvalRuns: defaultCompareMcpEvalRuns,
         listMCPServerConfigs,
         insertMCPServerConfig,
         getMCPServerConfig,
@@ -215,6 +237,7 @@ const defaultDependencies = {
         actionExecutor: defaultActionExecutor,
         codingRunRunner: defaultRunWorkspaceRunner,
         repoContextService: defaultRepoContextService,
+        mcpEvalRunner,
     },
 };
 
@@ -433,8 +456,13 @@ function registerAllRoutes(instance, { buildCompactionSummary = defaultBuildComp
     registerSkillRoutes(appRouter, { requireAuth });
     registerA2ARoutes(appRouter, { requireAuth });
     registerAnpRoutes(appRouter, { requireAuth });
+    appRouter.use("/eval/mcp", requireAuth, createRateLimit({ scope: "mcp-eval", windowMs: 60_000, max: 10 }), requireAdmin, mcpEvalRouter);
     // Phase 5: 评估系统 — admin + rate-limited。evalRoutes 内部 DB 访问仍走
     // 模块单例(残余项),待 eval 路由自身 bag 化后再注入。
+    // 聊天 UI 的反馈恢复(/eval/feedback/:messageId)先于共享管理面挂载并走独立
+    // scope eval-feedback：虚拟列表重挂载会产生大量一次性 GET,若与 run/report/
+    // compare 同桶会被 30/min 限流放大成 429 风暴（见 evalRoutes.js 说明）。
+    appRouter.use("/eval", requireAuth, createRateLimit({ scope: "eval-feedback", windowMs: 60_000, max: 600 }), requireAdmin, evalFeedbackRouter);
     appRouter.use("/eval", requireAuth, createRateLimit({ scope: "eval", windowMs: 60_000, max: 30 }), requireAdmin, evalRoutes);
     instance.use(appRouter);
 }
@@ -452,12 +480,15 @@ async function defaultBuildCompactionSummary(conversationText) {
     // buildChatOpenAIConfig 默认 maxRetries:0 → 这里补 withRetry 作为唯一重试层
     const result = await withRetry(
         (_, retrySignal) => llm.invoke([
-            new SystemMessage("你是一个对话摘要助手。请用中文将以下对话历史压缩为一段简洁摘要，保留关键问题、回答要点和结论，控制在 150-300 字以内。"),
+            new SystemMessage(workingMemoryEnabled()
+                ? "你是一个对话摘要助手。请只调用一次模型，并严格返回 JSON：{\"summary\":\"150-300字中文摘要\",\"task_state\":{\"current_goal\":\"当前目标\",\"constraints\":[],\"completed_steps\":[],\"next_step\":\"下一步\"}}。summary 保留关键问题、回答要点和结论；task_state 只提取当前任务状态，不要输出密钥、令牌、密码、个人敏感信息或堆栈噪声。无法确定的字段使用空数组或空字符串。"
+                : "你是一个对话摘要助手。请用中文将以下对话历史压缩为一段简洁摘要，保留关键问题、回答要点和结论，控制在 150-300 字以内。"),
             new HumanMessage(`对话历史：\n\n${conversationText.slice(0, 12000)}\n\n请生成摘要：`),
         ], { signal: retrySignal }),
         { retries: 2 }
     );
-    return String(result?.content || "").trim();
+    const raw = String(result?.content || "").trim();
+    return workingMemoryEnabled() ? parseCompactionResult(raw) : raw;
 }
 
 function isDbCountIntent(input) {
@@ -483,6 +514,41 @@ function refersToLatestUpload(input) {
 
 function sanitizeUploadFileName(fileName) {
     return path.basename(String(fileName || "")).replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 160);
+}
+
+function ingestMimeType(fileName, fallback = "application/octet-stream") {
+    const extension = path.extname(String(fileName || "")).toLowerCase();
+    return {
+        ".txt": "text/plain",
+        ".md": "text/markdown",
+        ".pdf": "application/pdf",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+    }[extension] || fallback;
+}
+
+function ingestParserForFile(fileName) {
+    return /\.(txt|md)$/i.test(String(fileName || "")) ? "native" : "mineru";
+}
+
+function publicIngestUpload(job, req) {
+    return {
+        jobId: job.id,
+        fileName: job.file_name,
+        parser: job.parser,
+        status: job.status,
+        progress: {
+            current: Number(job.progress_current) || 0,
+            total: Number(job.progress_total) || 0,
+            unit: job.progress_unit || "stage",
+        },
+        retryable: Boolean(job.retryable),
+        errorCode: job.error_code || null,
+        pollUrl: `/rag/ingest/${encodeURIComponent(job.id)}`,
+        requestId: req.requestId || null,
+    };
 }
 
 function normalizeUploadHash(hash) {
@@ -770,6 +836,30 @@ function writeSseError(res, error, requestId) {
     return getSSEWriter(res, { requestId }).writeError(error);
 }
 
+function canonicalRepoContext(repoContext) {
+    if (!repoContext || typeof repoContext !== "object") return null;
+    const refs = Array.isArray(repoContext.refs) ? repoContext.refs.map((ref) => {
+        const rawMode = String(ref?.mode || "").trim().toLowerCase();
+        const mode = ["whole-file", "wholefile", "file"].includes(rawMode) ? "whole_file"
+            : rawMode === "range" ? "range" : null;
+        const rawStart = ref?.startLine ?? ref?.start_line;
+        const rawEnd = ref?.endLine ?? ref?.end_line;
+        const startLine = rawStart == null || rawStart === "" ? null : Number(rawStart);
+        const endLine = rawEnd == null || rawEnd === "" ? null : Number(rawEnd);
+        const pathValue = String(ref?.path ?? "").trim().replaceAll("\\\\", "/").replace(/^\.\//, "");
+        return {
+            path: pathValue,
+            mode: mode || (startLine != null || endLine != null ? "range" : "whole_file"),
+            startLine: Number.isInteger(startLine) && startLine > 0 ? startLine : null,
+            endLine: Number.isInteger(endLine) && endLine > 0 ? endLine : null,
+        };
+    }).filter((ref) => ref.path).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))) : [];
+    return {
+        projectId: repoContext.projectId == null ? null : String(repoContext.projectId).trim() || null,
+        refs,
+    };
+}
+
 function canonicalChatRequest(body, resolvedImage) {
     return JSON.stringify({
         session_id: Number(body?.session_id),
@@ -781,6 +871,8 @@ function canonicalChatRequest(body, resolvedImage) {
         enable_memory: body?.enable_memory !== false,
         systemPrompt: String(body?.systemPrompt || ""),
         temperature: body?.temperature == null ? null : Number(body.temperature),
+        coding_run_id: body?.coding_run_id == null ? null : String(body.coding_run_id),
+        repo_context: canonicalRepoContext(body?.repo_context),
     });
 }
 
@@ -981,32 +1073,38 @@ app.post("/legacy-sessions/:id/compact", requireAuth, async (req, res) => {
             tokensBefore += msg.metrics?.total_tokens || estimateTokens(String(msg.content || ""));
         }
 
-        // 调 LLM 生成摘要
-        const { ChatOpenAI } = await import("@langchain/openai");
-        const { SystemMessage, HumanMessage } = await import("@langchain/core/messages");
-        const chatUtils = await import("./services/chatUtils.js");
-        const config = chatUtils.buildChatOpenAIConfig(false);
-        const llm = new ChatOpenAI({
-            modelName: chatUtils.resolveModelName(false),
-            temperature: 0.3,
-            ...config,
-        });
-
-        const systemMsg = new SystemMessage(
-            "你是一个对话摘要助手。请用中文将以下对话历史压缩为一段简洁的摘要，" +
-            "保留关键信息：用户的主要问题、你的回答要点、重要决策或结论。" +
-            "摘要控制在 150-300 字以内。"
-        );
-        const userMsg = new HumanMessage(
-            `对话历史：\n\n${conversationText.slice(0, 12000)}\n\n请生成摘要：`
-        );
-
-        // buildChatOpenAIConfig 默认 maxRetries:0 → 这里补 withRetry 作为唯一重试层
-        const result = await withRetry(
-            (_, retrySignal) => llm.invoke([systemMsg, userMsg], { signal: retrySignal }),
-            { retries: 2 }
-        );
-        const summaryContent = String(result?.content || "").trim();
+        // Working-memory mode uses the same single LLM call but asks for a
+        // structured summary plus task_state. The default-off branch remains
+        // the legacy prompt/output path for rollback compatibility.
+        let compactionResult;
+        if (workingMemoryEnabled()) {
+            compactionResult = await defaultBuildCompactionSummary(conversationText);
+        } else {
+            const { ChatOpenAI } = await import("@langchain/openai");
+            const { SystemMessage, HumanMessage } = await import("@langchain/core/messages");
+            const chatUtils = await import("./services/chatUtils.js");
+            const config = chatUtils.buildChatOpenAIConfig(false);
+            const llm = new ChatOpenAI({
+                modelName: chatUtils.resolveModelName(false),
+                temperature: 0.3,
+                ...config,
+            });
+            const systemMsg = new SystemMessage(
+                "你是一个对话摘要助手。请用中文将以下对话历史压缩为一段简洁的摘要，" +
+                "保留关键信息：用户的主要问题、你的回答要点、重要决策或结论。" +
+                "摘要控制在 150-300 字以内。"
+            );
+            const userMsg = new HumanMessage(
+                `对话历史：\n\n${conversationText.slice(0, 12000)}\n\n请生成摘要：`
+            );
+            const result = await withRetry(
+                (_, retrySignal) => llm.invoke([systemMsg, userMsg], { signal: retrySignal }),
+                { retries: 2 }
+            );
+            compactionResult = String(result?.content || "").trim();
+        }
+        const compaction = parseCompactionResult(compactionResult);
+        const summaryContent = compaction.summary;
 
         if (!summaryContent) {
             return res.status(500).json(toErrorEnvelope(Object.assign(new Error("LLM 摘要生成失败"), { code: "LLM_FAILED", statusCode: 500 }), req.requestId));
@@ -1025,6 +1123,19 @@ app.post("/legacy-sessions/:id/compact", requireAuth, async (req, res) => {
             "system",
             `[上下文压缩摘要 — ${new Date().toLocaleString("zh-CN")}]\n${summaryContent}`
         );
+        if (workingMemoryEnabled() && compaction.taskState) {
+            try {
+                const createMemoryService = req.locals?.dependencies?.services?.createMemoryService
+                    || ((userId) => new MemoryService(userId));
+                const memory = createMemoryService(req.user.id);
+                await memory.upsertSessionWorkingState(sessionId, compaction.taskState, {
+                    source: "compression",
+                    taskStatus: "active",
+                });
+            } catch (error) {
+                console.warn(`[memory][working] legacy compaction state write failed code=${error?.code || "WORKING_MEMORY_COMPACTION_FAILED"}`);
+            }
+        }
 
         return res.json({
             ok: true,
@@ -1266,6 +1377,8 @@ app.post("/observability/otel/import", requireAuth, (req, res) => {
 });
 
 // ── Phase 5: 评估系统路由 ──
+// 反馈恢复路由(独立 scope)先挂,避免与共享 30/min 管理面预算抢配额。
+app.use("/eval", requireAuth, createRateLimit({ scope: "eval-feedback", windowMs: 60_000, max: 600 }), requireAdmin, evalFeedbackRouter);
 app.use("/eval", requireAuth, createRateLimit({ scope: "eval", windowMs: 60_000, max: 30 }), requireAdmin, evalRoutes);
 
 // Phase 5: 用户反馈（支持切换取消）
@@ -1526,6 +1639,29 @@ app.post("/upload", requireAuth, createRateLimit({ scope: "upload", windowMs: 60
         uploadKey = crypto.createHash("sha256").update(req.file.buffer).digest("hex");
         const result = await withUploadLock(req.user.id, uploadKey, async () => {
             reserveUploadChunk(req.user.id, uploadKey, 0, req.file.buffer.length);
+            if (knowledgeIngestV2Enabled()) {
+                const uploadRoot = getUserUploadRoot(req.user.id, MERGED_UPLOAD_ROOT);
+                const temporaryPath = path.join(uploadRoot, `.${crypto.randomUUID()}.ingest.tmp`);
+                await fse.ensureDir(uploadRoot);
+                try {
+                    await fse.writeFile(temporaryPath, req.file.buffer, { flag: "wx" });
+                    const accepted = await createKnowledgeIngestJob({
+                        scope: { userId: req.user.id, tenantId: req.user.tenantId },
+                        sourcePath: temporaryPath,
+                        fileName: req.file.originalname,
+                        mimeType: req.file.mimetype || ingestMimeType(req.file.originalname),
+                        fileHash: uploadKey,
+                        projectId: UPLOAD_DOC_PROJECT,
+                        sizeBytes: req.file.buffer.length,
+                    });
+                    if (settleUploadReservation(req.user.id, uploadKey, req.file.buffer.length) === false) {
+                        throw Object.assign(new Error("upload reservation unavailable"), { code: "UPLOAD_RESERVATION_LOST", statusCode: 409 });
+                    }
+                    return { async: true, job: accepted.job };
+                } finally {
+                    await fse.remove(temporaryPath).catch(() => {});
+                }
+            }
             const indexed = await processAndStoreDocument(
                 req.file.buffer,
                 req.file.originalname,
@@ -1538,10 +1674,15 @@ app.post("/upload", requireAuth, createRateLimit({ scope: "upload", windowMs: 60
         // legacy in-memory index. RAG_DURABLE_ENABLED-off → no-op. Any durable
         // error is swallowed inside dualWriteDurableUpload — the upload response
         // and quota lock are already decided here.
-        await dualWriteDurableUpload(req, {
-            text: req.file.buffer.toString("utf8"),
-            fileName: req.file.originalname,
-        });
+        if (!result?.async) {
+            await dualWriteDurableUpload(req, {
+                text: req.file.buffer.toString("utf8"),
+                fileName: req.file.originalname,
+            });
+        }
+        if (result?.async) {
+            return res.status(202).json({ ok: true, message: "document accepted", data: publicIngestUpload(result.job, req) });
+        }
         return res.json({
             ok: true,
             message: "document indexed",
@@ -1569,6 +1710,16 @@ app.post("/upload/check", requireAuth, createRateLimit({ scope: "upload-check", 
         await fse.ensureDir(getUserUploadRoot(req.user.id, CHUNK_UPLOAD_ROOT));
         await fse.ensureDir(getUserUploadRoot(req.user.id, MERGED_UPLOAD_ROOT));
 
+        if (knowledgeIngestV2Enabled()) {
+            const duplicate = findDuplicateIngestJob(
+                { userId: req.user.id, tenantId: req.user.tenantId },
+                { projectId: UPLOAD_DOC_PROJECT, fileHash: normalizedHash, parser: ingestParserForFile(fileName) },
+            );
+            if (duplicate) {
+                return res.json({ ok: true, data: { hash: normalizedHash, fileName: sanitizeUploadFileName(fileName), uploaded: true, job: publicIngestUpload(duplicate, req) } });
+            }
+        }
+
         const mergedFilePath = buildMergedFilePath(normalizedHash, fileName, req.user.id);
         const mergedExists = await fse.pathExists(mergedFilePath);
 
@@ -1592,7 +1743,8 @@ app.post("/upload/check", requireAuth, createRateLimit({ scope: "upload-check", 
 
         const data = {
             hash: normalizedHash,
-            uploaded: mergedExists,
+            uploaded: mergedExists && !knowledgeIngestV2Enabled(),
+            merged: mergedExists,
             uploadedChunks: mergedExists ? allChunkIndexes : uploadedChunks,
         };
 
@@ -1720,7 +1872,9 @@ app.post("/upload/merge", requireAuth, createRateLimit({ scope: "upload-merge", 
             let mergedFilePath = "";
             let mergeCommitted = false;
             try {
-                const maxUploadBytes = Math.max(1, Number(process.env.UPLOAD_MAX_FILE_BYTES) || 8 * 1024 * 1024);
+                const maxUploadBytes = knowledgeIngestV2Enabled()
+                    ? Math.max(1, Number(process.env.KNOWLEDGE_MAX_FILE_BYTES) || 50 * 1024 * 1024)
+                    : Math.max(1, Number(process.env.UPLOAD_MAX_FILE_BYTES) || 8 * 1024 * 1024);
                 const reservation = getUploadReservation(req.user.id, normalizedHash);
                 if (!reservation) {
                     return res.status(409).json(toErrorEnvelope(Object.assign(new Error("upload reservation not found"), {
@@ -1772,6 +1926,26 @@ app.post("/upload/merge", requireAuth, createRateLimit({ scope: "upload-merge", 
                 const verified = await streamAndVerifyFile(mergedFilePath, {
                     maxBytes: maxUploadBytes, expectedHash: normalizedHash,
                 });
+                if (knowledgeIngestV2Enabled()) {
+                    const accepted = await createKnowledgeIngestJob({
+                        scope: { userId: req.user.id, tenantId: req.user.tenantId },
+                        sourcePath: mergedFilePath,
+                        fileName: normalizedFileName,
+                        mimeType: ingestMimeType(normalizedFileName),
+                        fileHash: verified.hash,
+                        projectId: UPLOAD_DOC_PROJECT,
+                        sizeBytes: verified.bytes,
+                    });
+                    if (settleUploadReservation(req.user.id, normalizedHash, verified.bytes) === false) {
+                        throw Object.assign(new Error("upload reservation unavailable"), {
+                            code: "UPLOAD_RESERVATION_LOST", statusCode: 409,
+                        });
+                    }
+                    mergeCommitted = true;
+                    await fse.remove(hashDir);
+                    await fse.remove(mergedFilePath);
+                    return res.status(202).json({ ok: true, message: "document accepted", data: publicIngestUpload(accepted.job, req) });
+                }
                 const ragResult = await processAndStoreDocumentFile(mergedFilePath, normalizedFileName, req.user.id, {
                     sizeBytes: verified.bytes,
                 });
@@ -1883,12 +2057,16 @@ app.post("/chat", requireAuth, createRateLimit({ scope: "chat", windowMs: 60_000
         plan_mode,
         enable_memory,
         systemPrompt,
-        temperature
+        temperature,
+        coding_run_id,
     } = req.body || {};
     const sessionId = Number(session_id);
     const enableWebSearch = enable_web_search === true;
     const planMode = plan_mode === true;
     const enableMemory = enable_memory !== false; // 默认 true，向后兼容
+    const codingRunId = coding_run_id == null || String(coding_run_id).trim() === ""
+        ? null
+        : String(coding_run_id).trim(); // Phase 7 / R2 — chat-attached coding run
     const resolvedImage = image || getUploadedImageDataUrl(image_id, req.user.id);
     const idempotencyKey = String(req.headers["x-idempotency-key"] || "").trim();
     const idempotencyEnabled = process.env.CHAT_IDEMPOTENCY_ENABLED !== "false";
@@ -1907,6 +2085,34 @@ app.post("/chat", requireAuth, createRateLimit({ scope: "chat", windowMs: 60_000
 
     if (!getSessionById(req.user.id, sessionId)) {
         return res.status(404).json({ ...toErrorEnvelope(Object.assign(new Error("session not found"), { code: "NOT_FOUND", statusCode: 404 }), req.requestId) });
+    }
+
+    // Phase 7 / R2 — /chat coding-run gate. When the caller attached an explicit
+    // coding run (coding_run_id), re-authorize it SERVER-SIDE before any SSE frame /
+    // idempotency reservation so bad requests get a clean JSON 4xx. Only a trusted
+    // preset run may execute in one chat turn (its writes auto-approve to the run's
+    // disposable worktree). resolveCodingRunTask is the single authorizer; a run is
+    // never auto-created here. The graph re-resolves to build its run descriptor.
+    if (codingRunId) {
+        if (process.env.USE_LANGGRAPH !== "true") {
+            return res.status(400).json({ ...toErrorEnvelope(Object.assign(new Error("coding run requires the LangGraph agent pipeline (USE_LANGGRAPH=true)"), { code: "CODING_REQUIRES_LANGGRAPH", statusCode: 400 }), req.requestId) });
+        }
+        if (resolvedImage) {
+            return res.status(400).json({ ...toErrorEnvelope(Object.assign(new Error("coding run does not accept image input"), { code: "CODING_IMAGE_NOT_SUPPORTED", statusCode: 400 }), req.requestId) });
+        }
+        const codingGoalText = String(message || "").trim();
+        if (!codingGoalText) {
+            return res.status(400).json({ ...toErrorEnvelope(Object.assign(new Error("coding run requires a text goal message"), { code: "INVALID_ARGUMENT", statusCode: 400 }), req.requestId) });
+        }
+        const { resolveCodingRunTask } = await import("./coding/codingAgent.js");
+        const resolved = await resolveCodingRunTask({}, scope, { runId: codingRunId, goal: codingGoalText });
+        if (!resolved.active) {
+            return res.status(400).json({ ...toErrorEnvelope(Object.assign(new Error(`coding run unavailable: ${resolved.reason || "rejected"}`), { code: "CODING_TASK_REJECTED", statusCode: 400 }), req.requestId) });
+        }
+        if (resolved.preset !== "trusted") {
+            return res.status(422).json({ ...toErrorEnvelope(Object.assign(new Error("edit preset needs the approval UI; create a trusted run for chat-driven coding"), { code: "EDIT_RUN_NEEDS_APPROVAL_UI", statusCode: 422 }), req.requestId) });
+        }
+        console.log(`[chat][coding] coding_run_id=${codingRunId} authorized (preset=${resolved.preset}) for chat goal`);
     }
 
     if (idempotencyEnabled && idempotencyKey) {
@@ -1936,7 +2142,7 @@ app.post("/chat", requireAuth, createRateLimit({ scope: "chat", windowMs: 60_000
         markChatIdempotencyStarted(scope, idempotencyKey, idempotencyAttemptToken);
     }
 
-    if (isDbCountIntent(message)) {
+    if (isDbCountIntent(message) && !codingRunId) {
         const existing = idempotencyEnabled && idempotencyKey ? getChatIdempotency(scope, idempotencyKey) : null;
         let userMessageId = existing?.user_message_id ? Number(existing.user_message_id) : null;
         if (!userMessageId) {
@@ -1993,7 +2199,7 @@ app.post("/chat", requireAuth, createRateLimit({ scope: "chat", windowMs: 60_000
         }
     };
 
-    if (isKnowledgeIntent(message) && !resolvedImage) {
+    if (isKnowledgeIntent(message) && !resolvedImage && !codingRunId) {
         const userLargeFile = getActiveLargeFile(req.user.id);
         const shouldUseLargeContext = mentionsActiveLargeFile(message, userLargeFile);
 
@@ -2044,6 +2250,13 @@ app.post("/chat", requireAuth, createRateLimit({ scope: "chat", windowMs: 60_000
                 skipUserMessageSave: true,
                 planMode,
                 enableMemory,
+                // Phase 7 / R1 — 透传附加的 repo refs。此分支(isKnowledgeIntent 命中)
+                // 若缺这条,仓库引用会在路由期被静默丢弃(graph 收 options.repoContext=undefined,
+                // 无任何 repo 日志);与通用聊天路径保持一致。
+                repoContext: req.body?.repo_context ?? undefined,
+                ...(durableRagEnabled() && durableRagReadCanary() && !req.body?.repo_context
+                    ? { projectId: UPLOAD_DOC_PROJECT }
+                    : {}),
                 onComplete: (metrics, result = {}) => {
                     if (metrics?.messageId) {
                         saveMessageMetric(metrics.messageId, metrics);
@@ -2143,6 +2356,10 @@ app.post("/chat", requireAuth, createRateLimit({ scope: "chat", windowMs: 60_000
         // capability is enabled AND the referenced project is owned+trusted;
         // otherwise the repo-context service resolves empty (never a failure).
         repoContext: req.body?.repo_context ?? undefined,
+        // Phase 7 / R2 — chat-attached coding run (server-authorized above). The
+        // graph re-resolves it and runs the bounded code-agent loop on the trusted
+        // run's disposable worktree; absent for every normal chat request.
+        codingRunId,
         onComplete: (metrics, result = {}) => {
             if (metrics?.messageId) {
                 saveMessageMetric(metrics.messageId, metrics);
@@ -2252,7 +2469,33 @@ app.get("/mcp/servers", requireAuth, requireAdmin, (req, res) => {
         description: s.description || "",
     }));
 
-    return res.json({ servers: [...configWithStatus, ...userServers, ...dynamicServers] });
+    // The same MCP name can appear in the read-only system manifest, a
+    // user-scoped persisted config, and the live registry. Returning all three
+    // creates duplicate React keys in SettingsModal and can cause the browser
+    // to spend every render reconciling the same server rows. Keep one visible
+    // row per name, preferring user scope and then the connected/live status.
+    const mergedServers = new Map();
+    for (const server of [...configWithStatus, ...userServers, ...dynamicServers]) {
+        const name = String(server?.name || "").trim();
+        if (!name) continue;
+        const existing = mergedServers.get(name);
+        if (!existing) {
+            mergedServers.set(name, server);
+            continue;
+        }
+        const preferCandidate = server.scope === "user"
+            || (server.connected && !existing.connected);
+        if (preferCandidate) {
+            mergedServers.set(name, {
+                ...existing,
+                ...server,
+                command: server.command || existing.command,
+                args: server.args || existing.args,
+            });
+        }
+    }
+
+    return res.json({ servers: [...mergedServers.values()] });
 });
 
 // 添加/连接 MCP Server
@@ -2482,21 +2725,27 @@ app.use((err, req, res, next) => {
     );
 });
 
-export { app };
+export { app, canonicalRepoContext, canonicalChatRequest };
 
 // W3.2 残余（T5）：把"重启即丢失"的易失运行态在真实启动路径上显式告警，防止
 // in-memory 存储被误当作持久层（用户在文档里问的"重启丢什么"要能在日志里自证）。
 // - 上传配额：DURABLE_UPLOAD_QUOTA!=="true" 时 reservation/usage 只在内存 → 分片上传
 //   预留与当日字节记账重启即清零；设 DURABLE_UPLOAD_QUOTA=true 走 SQLite 账本。
-// - 知识库向量：rag tenantStores 是进程内 Map（vectorStore/indexedFiles/activeLargeFile），
-//   无落盘重载 → 重启后检索索引清空，需重新上传文档（durable RAG 在 roadmap W6）。
+// - 知识库向量：legacy tenantStores 仍是进程内 Map；启用 durable RAG 后改由
+//   SQLite chunks + index generation 支持重启重载和单机多进程缓存自检。
 // - 图片上传：images/store.js 内存 Map（TTL 30min）→ 重启清空已上传图片字节。
 function warnVolatileRuntimeState() {
     if (process.env.DURABLE_UPLOAD_QUOTA !== "true") {
         console.warn("[startup] 上传配额为内存模式（DURABLE_UPLOAD_QUOTA 未设为 true）：分片上传预留与当日字节记账重启即清零。设为 DURABLE_UPLOAD_QUOTA=true 启用 SQLite 持久记账。");
     }
-    // 当前无 durable RAG 开关，索引恒为进程内存态 —— 如实标注而非假装可持久。
-    console.warn("[startup] 知识库向量索引为进程内内存态（无落盘重载）：服务重启后各用户检索索引清空，需重新上传文档。持久化 RAG 见 roadmap W6。");
+    if (durableRagEnabled()) {
+        console.log(`[startup] 知识库向量索引使用 SQLite durable store（generation coherence enabled）；读取模式=${durableRagReadCanary() ? "durable-canary" : "legacy-dual-read"}。`);
+    } else {
+        console.warn("[startup] 知识库向量索引为进程内内存态（RAG_DURABLE_ENABLED 未设为 true）：服务重启后旧 legacy 索引需重新上传；可启用 durable RAG 走 SQLite 持久化重载。");
+    }
+    if (knowledgeIngestV2Enabled()) {
+        console.log(`[startup] 知识库异步 ingest 已启用，worker mode=${knowledgeIngestWorkerMode()}（SQLite lease 仅支持单机多进程候选）。`);
+    }
     console.warn("[startup] 图片上传存储为进程内内存态（TTL 30min）：服务重启后尚未随消息持久化的已上传图片字节清空。");
 }
 
@@ -2505,9 +2754,21 @@ export async function startServer({ port = PORT, autoConnectMCP = true } = {}) {
     assertProductionSecurityConfig();
     initDB();
     warnVolatileRuntimeState();
+    const ingestWorkerMode = knowledgeIngestWorkerMode();
+    const knowledgeIngestWorker = knowledgeIngestV2Enabled() && ingestWorkerMode === "inline"
+        ? startKnowledgeIngestWorker({
+            // K4 embedding stays lazy and is only attached when durable RAG is
+            // explicitly enabled. Missing/upstream embedding errors remain a
+            // lexical-only ingest, never a failed document.
+            embedder: durableRagEnabled() ? createOpenAiEmbedder() : null,
+        })
+        : null;
     const stopUploadQuotaCleanup = startUploadQuotaCleanup({
         onExpire: (released) => console.log(`[upload-quota] released ${released} expired reservation(s)`),
     });
+    // M14 is explicitly opt-in. The sampler writes only aggregate reports and
+    // never mutates AgentConfig; disabled by default for local/test startup.
+    const stopCrossSourceExperimentSampler = startCrossSourceExperimentSampler();
     if (autoConnectMCP) {
         let persistedServers = [];
         try {
@@ -2538,6 +2799,8 @@ export async function startServer({ port = PORT, autoConnectMCP = true } = {}) {
             const close = server.close.bind(server);
             server.close = (callback) => {
                 stopUploadQuotaCleanup();
+                stopCrossSourceExperimentSampler();
+                void knowledgeIngestWorker?.stop?.();
                 return close(callback);
             };
             resolve(server);

@@ -213,11 +213,50 @@ describe("A3 HTTP 双用户隔离矩阵（真实 DB + 原生 HTTP）", () => {
         expect(bobStats.status).toBe(200);
         expect(bobStats.body.total).toBe(0);
 
+        const aliceLineage = await request("GET", `/memory/${aliceMemoryId}/lineage`, user(ALICE.id), null);
+        expect(aliceLineage.status).toBe(200);
+        expect(aliceLineage.body.memory.id).toBe(aliceMemoryId);
+        expect(aliceLineage.text).toContain(ALICE_MEM);
+
+        const bobLineage = await request("GET", `/memory/${aliceMemoryId}/lineage`, user(BOB.id), null);
+        expect(bobLineage.status).toBe(404);
+        expect(bobLineage.text).not.toContain(ALICE_MEM);
+
         const bobDelete = await request("DELETE", `/memory/${aliceMemoryId}`, user(BOB.id), null);
         expect(bobDelete.status).toBe(404);
 
         const stillThere = await request("GET", "/memory", user(ALICE.id), null);
         expect(stillThere.text).toContain(ALICE_MEM);
+    });
+
+    it("memory M5 retention/export/restore 保持 owner scope", async () => {
+        const alicePolicy = await request("GET", "/memory/retention", user(ALICE.id), null);
+        expect(alicePolicy.status).toBe(200);
+        expect(alicePolicy.body.policy).toHaveProperty("pendingTtlDays");
+
+        const aliceExport = await request("GET", "/memory/export", user(ALICE.id), null);
+        expect(aliceExport.status).toBe(200);
+        expect(aliceExport.body.schemaVersion).toBe("memory-export-v1");
+        expect(aliceExport.text).toContain(ALICE_MEM);
+
+        const bobExport = await request("GET", "/memory/export", user(BOB.id), null);
+        expect(bobExport.status).toBe(200);
+        expect(bobExport.body.memories).toEqual([]);
+        expect(bobExport.text).not.toContain(ALICE_MEM);
+
+        const bobPreview = await request("POST", "/memory/retention/run", user(BOB.id), { dry_run: true });
+        expect(bobPreview.status).toBe(200);
+        expect(bobPreview.body.scanned).toBe(0);
+
+        const bobRestore = await request("PATCH", `/memory/${aliceMemoryId}`, user(BOB.id), { action: "restore" });
+        expect(bobRestore.status).toBe(404);
+
+        const invalidate = await request("PATCH", `/memory/${aliceMemoryId}`, user(ALICE.id), {
+            action: "invalidate", reason: "m5_http_fixture",
+        });
+        expect(invalidate.status).toBe(200);
+        const restore = await request("PATCH", `/memory/${aliceMemoryId}`, user(ALICE.id), { action: "restore" });
+        expect(restore.status).toBe(200);
     });
 
     it("feedback 跨 owner 返回 200 但 DB 不落库；owner 本人正常落库", async () => {

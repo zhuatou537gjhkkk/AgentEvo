@@ -27,7 +27,9 @@ class ContextPacket {
         this.timestamp = timestamp instanceof Date ? timestamp : new Date(timestamp || Date.now());
         this.tokenCount = Math.max(0, Number(tokenCount) || estimateTokens(this.content));
         this.relevanceScore = Math.max(0, Math.min(1, Number(relevanceScore) || 0.5));
-        this.metadata = metadata || {};
+        this.metadata = memoryContractEnabled()
+            ? normalizeContextMetadata(metadata || {})
+            : (metadata || {});
     }
 }
 
@@ -43,6 +45,11 @@ class ContextConfig {
         relevanceWeight = 0.7,
         recencyWeight = 0.3,
         maxHistoryTurns = 10,
+        memoryCandidateLimit = 20,
+        memoryMaxItems = 5,
+        memoryBudgetTokens = 1200,
+        workingMemoryMaxItems = Number(process.env.MEMORY_WORKING_CONTEXT_MAX_ITEMS) || 4,
+        workingMemoryBudgetTokens = Number(process.env.MEMORY_WORKING_CONTEXT_BUDGET_TOKENS) || 450,
     } = {}) {
         this.maxTokens = Math.max(500, Number(maxTokens) || 8000);
         this.reserveRatio = Math.max(0, Math.min(0.5, Number(reserveRatio) || 0.2));
@@ -57,6 +64,11 @@ class ContextConfig {
             this.recencyWeight /= total;
         }
         this.maxHistoryTurns = Math.max(1, Number(maxHistoryTurns) || 10);
+        this.memoryCandidateLimit = Math.max(1, Math.min(100, Number(memoryCandidateLimit) || 20));
+        this.memoryMaxItems = Math.max(1, Math.min(20, Number(memoryMaxItems) || 5));
+        this.memoryBudgetTokens = Math.max(100, Math.min(10000, Number(memoryBudgetTokens) || 1200));
+        this.workingMemoryMaxItems = Math.max(1, Math.min(4, Number(workingMemoryMaxItems) || 4));
+        this.workingMemoryBudgetTokens = Math.max(100, Math.min(5000, Number(workingMemoryBudgetTokens) || 450));
     }
 }
 
@@ -66,6 +78,9 @@ class ContextConfig {
  */
 import { estimateTokens } from "./chatUtils.js";
 import { createHash } from "node:crypto";
+import { crossSourceRecallEnabled, memoryContractEnabled, memoryRecallEnabled, memoryTypeAwareScoringEnabled, workingMemoryEnabled } from "./memoryFlags.js";
+import { normalizeContextMetadata } from "./memoryContract.js";
+import { crossSourceConfig, selectCrossSourceCandidates, sourceTypeForPacket } from "./crossSourceRecall.js";
 
 export { estimateTokens };
 
@@ -112,6 +127,10 @@ export class ContextBuilder {
     constructor(config = new ContextConfig(), memoryService = null) {
         this.config = config;
         this.memoryService = memoryService;
+        this.lastMemoryIds = [];
+        this.lastMemoryRecall = null;
+        this.lastWorkingMemoryRecall = null;
+        this.lastCrossSourceRecall = null;
     }
 
     /**
@@ -126,16 +145,66 @@ export class ContextBuilder {
      * @returns {Promise<string>} 结构化的上下文字符串
      */
     async build(userQuery, conversationHistory = [], systemInstructions = "", options = {}) {
+        this.lastMemoryRecall = null;
+        this.lastWorkingMemoryRecall = null;
+        this.lastCrossSourceRecall = null;
         // 1. Gather — 收集候选信息。Repo packets arrive pre-budgeted from the
         // repo-context service (independent budget) and join the same pool.
         const extraPackets = [
             ...(options.customPackets || []),
             ...(options.repoPackets || []),
+            ...(options.projectPackets || []),
+            ...(options.ragPackets || []),
         ];
         let packets = this._gather(userQuery, conversationHistory, systemInstructions, extraPackets);
 
         // 如果有 MemoryService，从记忆系统检索相关记忆
-        if (this.memoryService) {
+        if (this.memoryService && (memoryRecallEnabled() || memoryTypeAwareScoringEnabled()) && typeof this.memoryService.recall === "function") {
+            try {
+                const recall = typeof this.memoryService.recallHybrid === "function"
+                    ? this.memoryService.recallHybrid.bind(this.memoryService)
+                    : this.memoryService.recall.bind(this.memoryService);
+                const result = await recall(userQuery, {
+                    memoryTypes: ["episodic", "semantic"],
+                    candidateLimit: this.config.memoryCandidateLimit,
+                    maxItems: this.config.memoryMaxItems,
+                    maxTokens: this.config.memoryBudgetTokens,
+                    minImportance: 0.3,
+                });
+                this.lastMemoryRecall = result.diagnostics || null;
+                for (const mem of result.memories || []) {
+                    packets.push(new ContextPacket({
+                        content: `[记忆] ${mem.content}`,
+                        timestamp: new Date(mem.created_at),
+                        tokenCount: mem.recallTokens || estimateTokens(mem.content),
+                        relevanceScore: Math.min(1, mem.recallScore ?? mem.relevanceScore ?? 0.5),
+                        metadata: {
+                            type: "memory",
+                            source: "memory",
+                            memory_type: mem.memory_type,
+                            memory_id: mem.id,
+                            ownerUserId: this.memoryService?.userId,
+                            session_id: mem.session_id,
+                            status: mem.status,
+                            confidence: mem.confidence,
+                            created_at: mem.created_at,
+                            invalidated_at: mem.invalidated_at,
+                            invalidate_reason: mem.invalidate_reason,
+                            provenance: mem.provenance,
+                            recall_reasons: mem.recallReasons || [],
+                            ...(memoryTypeAwareScoringEnabled() ? {
+                                scoreStage: "memory_recall_final",
+                                memoryRecallFinal: true,
+                                recallWeightProfile: mem.recallWeightProfile,
+                                recallScoreComponents: mem.recallScoreComponents,
+                            } : {}),
+                        },
+                    }));
+                }
+            } catch (e) {
+                // 记忆检索失败不影响整体
+            }
+        } else if (this.memoryService) {
             try {
                 const memories = this.memoryService.search(userQuery, ["episodic", "semantic"], 5, 0.3);
                 for (const mem of memories) {
@@ -144,7 +213,19 @@ export class ContextBuilder {
                         timestamp: new Date(mem.created_at),
                         tokenCount: estimateTokens(mem.content),
                         relevanceScore: Math.min(1, mem.relevanceScore || 0.5),
-                        metadata: { type: "memory", memory_type: mem.memory_type },
+                        metadata: {
+                            type: "memory",
+                            memory_type: mem.memory_type,
+                            memory_id: mem.id,
+                            ownerUserId: this.memoryService?.userId,
+                            session_id: mem.session_id,
+                            status: mem.status,
+                            confidence: mem.confidence,
+                            created_at: mem.created_at,
+                            invalidated_at: mem.invalidated_at,
+                            invalidate_reason: mem.invalidate_reason,
+                            provenance: mem.provenance,
+                        },
                     }));
                 }
             } catch (e) {
@@ -152,9 +233,20 @@ export class ContextBuilder {
             }
         }
 
+        await this._appendWorkingMemoryPackets(packets, options.sessionId, options.workingMemorySnapshot);
+
+        const crossSource = this._applyCrossSourceRecall(packets, options);
+        packets = crossSource.packets;
+        this.lastCrossSourceRecall = crossSource.diagnostics;
+
         // 2. Select — 评分 + 贪婪选择
         const availableTokens = Math.floor(this.config.maxTokens * (1 - this.config.reserveRatio));
         const selected = this._select(packets, userQuery, availableTokens);
+        this.lastMemoryIds = selected
+            .filter((packet) => packet.metadata?.type === "memory" && packet.metadata?.memory_id != null)
+            .map((packet) => Number(packet.metadata.memory_id))
+            .filter(Number.isInteger);
+        this._finalizeMemoryRecall(selected);
 
         // 3. Structure — 结构化组织
         let context = this._structure(selected, userQuery);
@@ -174,6 +266,101 @@ export class ContextBuilder {
     // 与 legacy `build` 分离：build 保持逐字节不变；buildProvenance 额外做
     //   hash/range 去重 → loop observation 压缩 → per-source budget → 选择 → 结构 → digest。
     // 返回 { context, digest, sources[], deduped, loopCompressed, gathered, selectedCount }。
+
+    _finalizeMemoryRecall(selectedPackets) {
+        if (!this.lastMemoryRecall?.enabled) return;
+        const contextSelected = selectedPackets
+            .filter((packet) => packet.metadata?.type === "memory" && packet.metadata?.memory_id != null)
+            .map((packet) => Number(packet.metadata.memory_id))
+            .filter(Number.isInteger);
+        const rankedSelected = new Set(this.lastMemoryRecall.selected || []);
+        const contextSelectedSet = new Set(contextSelected);
+        const budgetDropped = [...rankedSelected]
+            .filter((id) => !contextSelectedSet.has(Number(id)))
+            .map((id) => ({ id, reason: "context_budget", score: null }));
+        this.lastMemoryRecall = {
+            ...this.lastMemoryRecall,
+            contextSelected,
+            dropped: [...(this.lastMemoryRecall.dropped || []), ...budgetDropped],
+        };
+        if (typeof this.memoryService?.recordRecall === "function") {
+            this.memoryService.recordRecall(contextSelected);
+        }
+    }
+
+    _applyCrossSourceRecall(packets, options = {}) {
+        if (!crossSourceRecallEnabled()) return { packets, diagnostics: null };
+        const candidates = (packets || []).filter((packet) => sourceTypeForPacket(packet));
+        const protectedPackets = (packets || []).filter((packet) => !sourceTypeForPacket(packet));
+        const experiment = options.crossSourceExperiment || null;
+        const config = crossSourceConfig({
+            maxItems: options.crossSourceMaxItems,
+            maxTokens: options.crossSourceMaxTokens,
+            minScore: options.crossSourceMinScore,
+            sourceCaps: options.crossSourceCaps,
+            scoreWeights: options.crossSourceScoreWeights,
+        });
+        if (experiment?.group === "control") {
+            const dropped = candidates.map((packet, index) => ({
+                id: packet.metadata?.memory_id
+                    ?? packet.metadata?.memoryId
+                    ?? packet.metadata?.provenance?.sourceId
+                    ?? packet.metadata?.provenance?.chunkId
+                    ?? `candidate-${index}`,
+                sourceType: sourceTypeForPacket(packet),
+                reason: "experiment_control",
+            }));
+            return {
+                packets: protectedPackets,
+                diagnostics: {
+                    enabled: true,
+                    selected: [],
+                    dropped,
+                    selectedTokens: 0,
+                    scanned: candidates.length,
+                    rejected: candidates.length,
+                    config,
+                    bySource: config.sourceCaps ? Object.fromEntries(Object.keys(config.sourceCaps).map((source) => [source, { candidates: candidates.filter((packet) => sourceTypeForPacket(packet) === source).length, selected: 0, tokens: 0, cap: config.sourceCaps[source] }])) : {},
+                    protectedPackets: protectedPackets.length,
+                    errors: {},
+                    experimentGroup: "control",
+                },
+            };
+        }
+        const selection = selectCrossSourceCandidates(candidates, {
+            maxItems: options.crossSourceMaxItems,
+            maxTokens: options.crossSourceMaxTokens,
+            minScore: options.crossSourceMinScore,
+            sourceCaps: options.crossSourceCaps,
+            scoreWeights: options.crossSourceScoreWeights,
+        });
+        const selectedRefs = selection.selected.map((packet, index) => ({
+            id: packet.metadata?.memory_id
+                ?? packet.metadata?.memoryId
+                ?? packet.metadata?.provenance?.sourceId
+                ?? packet.metadata?.provenance?.chunkId
+                ?? `candidate-${index}`,
+            sourceType: sourceTypeForPacket(packet),
+            score: packet.crossSourceScore ?? null,
+            reasons: packet.crossSourceReasons || [],
+        }));
+        return {
+            packets: [...protectedPackets, ...selection.selected],
+            diagnostics: {
+                enabled: true,
+                selected: selectedRefs,
+                dropped: selection.dropped,
+                selectedTokens: selection.selectedTokens,
+                scanned: selection.scanned,
+                rejected: selection.rejected,
+                config: selection.config,
+                bySource: selection.bySource,
+                protectedPackets: protectedPackets.length,
+                errors: {},
+                experimentGroup: experiment?.group || null,
+            },
+        };
+    }
 
     _sha256(text) {
         return createHash("sha256").update(String(text ?? "")).digest("hex");
@@ -254,7 +441,7 @@ export class ContextBuilder {
         const sources = new Set();
         for (const p of packets || []) {
             const t = p.metadata?.type;
-            if (t === "system_instruction" || t === "repo") continue;
+            if (t === "system_instruction" || t === "repo" || t === "working_memory") continue;
             sources.add(p.metadata?.source || p.metadata?.type || "default");
         }
         const caps = new Map();
@@ -276,7 +463,8 @@ export class ContextBuilder {
     _selectProvenance(packets, userQuery, availableTokens, caps) {
         const systemPackets = packets.filter((p) => p.metadata.type === "system_instruction");
         const repoPackets = packets.filter((p) => p.metadata.type === "repo");
-        const otherPackets = packets.filter((p) => p.metadata.type !== "system_instruction" && p.metadata.type !== "repo");
+        const workingPackets = packets.filter((p) => p.metadata.type === "working_memory");
+        const otherPackets = packets.filter((p) => p.metadata.type !== "system_instruction" && p.metadata.type !== "repo" && p.metadata.type !== "working_memory");
 
         const selected = [...systemPackets, ...repoPackets];
         let currentTokens = selected.reduce((s, p) => s + p.tokenCount, 0);
@@ -285,11 +473,18 @@ export class ContextBuilder {
         const remaining = availableTokens - currentTokens;
         if (remaining <= 0) return { selected, sourceUsed };
 
+        const working = this._selectWorkingPackets(workingPackets, availableTokens - currentTokens);
+        selected.push(...working.selected);
+        currentTokens += working.tokens;
+
         const scored = [];
         for (const packet of otherPackets) {
-            if (packet.relevanceScore === 0.5) packet.relevanceScore = calculateRelevance(packet.content, userQuery);
-            const recency = calculateRecency(packet.timestamp);
-            const combinedScore = this.config.relevanceWeight * packet.relevanceScore + this.config.recencyWeight * recency;
+            const memoryRecallFinal = memoryTypeAwareScoringEnabled() && packet.metadata?.memoryRecallFinal === true;
+            if (!memoryRecallFinal && packet.relevanceScore === 0.5) packet.relevanceScore = calculateRelevance(packet.content, userQuery);
+            const recency = memoryRecallFinal ? 0 : calculateRecency(packet.timestamp);
+            const combinedScore = memoryRecallFinal
+                ? packet.relevanceScore
+                : this.config.relevanceWeight * packet.relevanceScore + this.config.recencyWeight * recency;
             if (packet.relevanceScore >= this.config.minRelevance) scored.push({ score: combinedScore, packet });
         }
         scored.sort((a, b) => b.score - a.score);
@@ -336,10 +531,63 @@ export class ContextBuilder {
      *                   deduped: number, loopCompressed: number, gathered: number, selectedCount: number}>}
      */
     async buildProvenance(userQuery, conversationHistory = [], systemInstructions = "", options = {}) {
-        const extraPackets = [...(options.customPackets || []), ...(options.repoPackets || [])];
+        this.lastMemoryRecall = null;
+        this.lastWorkingMemoryRecall = null;
+        this.lastCrossSourceRecall = null;
+        const extraPackets = [
+            ...(options.customPackets || []),
+            ...(options.repoPackets || []),
+            ...(options.projectPackets || []),
+            ...(options.ragPackets || []),
+        ];
         let packets = this._gather(userQuery, conversationHistory, systemInstructions, extraPackets);
 
-        if (this.memoryService) {
+        if (this.memoryService && (memoryRecallEnabled() || memoryTypeAwareScoringEnabled()) && typeof this.memoryService.recall === "function") {
+            try {
+                const recall = typeof this.memoryService.recallHybrid === "function"
+                    ? this.memoryService.recallHybrid.bind(this.memoryService)
+                    : this.memoryService.recall.bind(this.memoryService);
+                const result = await recall(userQuery, {
+                    memoryTypes: ["episodic", "semantic"],
+                    candidateLimit: this.config.memoryCandidateLimit,
+                    maxItems: this.config.memoryMaxItems,
+                    maxTokens: this.config.memoryBudgetTokens,
+                    minImportance: 0.3,
+                });
+                this.lastMemoryRecall = result.diagnostics || null;
+                for (const mem of result.memories || []) {
+                    packets.push(new ContextPacket({
+                        content: `[记忆] ${mem.content}`,
+                        timestamp: new Date(mem.created_at),
+                        tokenCount: mem.recallTokens || estimateTokens(mem.content),
+                        relevanceScore: Math.min(1, mem.recallScore ?? mem.relevanceScore ?? 0.5),
+                        metadata: {
+                            type: "memory",
+                            source: "memory",
+                            memory_type: mem.memory_type,
+                            memory_id: mem.id,
+                            ownerUserId: this.memoryService?.userId,
+                            session_id: mem.session_id,
+                            status: mem.status,
+                            confidence: mem.confidence,
+                            created_at: mem.created_at,
+                            invalidated_at: mem.invalidated_at,
+                            invalidate_reason: mem.invalidate_reason,
+                            provenance: mem.provenance,
+                            ...(memoryTypeAwareScoringEnabled() ? {
+                                scoreStage: "memory_recall_final",
+                                memoryRecallFinal: true,
+                                recallWeightProfile: mem.recallWeightProfile,
+                                recallScoreComponents: mem.recallScoreComponents,
+                            } : {}),
+                            recall_reasons: mem.recallReasons || [],
+                        },
+                    }));
+                }
+            } catch (e) {
+                // 记忆检索失败不影响整体
+            }
+        } else if (this.memoryService) {
             try {
                 const memories = this.memoryService.search(userQuery, ["episodic", "semantic"], 5, 0.3);
                 for (const mem of memories) {
@@ -348,13 +596,32 @@ export class ContextBuilder {
                         timestamp: new Date(mem.created_at),
                         tokenCount: estimateTokens(mem.content),
                         relevanceScore: Math.min(1, mem.relevanceScore || 0.5),
-                        metadata: { type: "memory", source: "memory", memory_type: mem.memory_type },
+                        metadata: {
+                            type: "memory",
+                            source: "memory",
+                            memory_type: mem.memory_type,
+                            memory_id: mem.id,
+                            ownerUserId: this.memoryService?.userId,
+                            session_id: mem.session_id,
+                            status: mem.status,
+                            confidence: mem.confidence,
+                            created_at: mem.created_at,
+                            invalidated_at: mem.invalidated_at,
+                            invalidate_reason: mem.invalidate_reason,
+                            provenance: mem.provenance,
+                        },
                     }));
                 }
             } catch (e) {
                 // 记忆检索失败不影响整体
             }
         }
+
+        await this._appendWorkingMemoryPackets(packets, options.sessionId, options.workingMemorySnapshot);
+
+        const crossSource = this._applyCrossSourceRecall(packets, options);
+        packets = crossSource.packets;
+        this.lastCrossSourceRecall = crossSource.diagnostics;
 
         // 1) hash/range 去重
         const dedupe = this.dedupePackets(packets);
@@ -367,6 +634,11 @@ export class ContextBuilder {
         const { caps } = this._sourceCaps(pool, availableTokens, options.sourceBudgets || null);
         // 4) select（全局 + 来源预算）
         const sel = this._selectProvenance(pool, userQuery, availableTokens, caps);
+        this.lastMemoryIds = sel.selected
+            .filter((packet) => packet.metadata?.type === "memory" && packet.metadata?.memory_id != null)
+            .map((packet) => Number(packet.metadata.memory_id))
+            .filter(Number.isInteger);
+        this._finalizeMemoryRecall(sel.selected);
 
         // 5) structure + compress（与 legacy build 同一套）
         let context = this._structure(sel.selected, userQuery);
@@ -400,6 +672,59 @@ export class ContextBuilder {
         };
     }
 
+    async _appendWorkingMemoryPackets(packets, sessionId, snapshot) {
+        if (!workingMemoryEnabled() || !this.memoryService || typeof this.memoryService.getSessionWorkingState !== "function") return;
+        const safeSessionId = Number(sessionId);
+        if (!Number.isInteger(safeSessionId) || safeSessionId <= 0) return;
+        try {
+            // A graph turn may prefetch the same owner/session snapshot for a
+            // contextual RAG rewrite. Reuse it so one turn performs one
+            // working-memory read while preserving the old lazy path when no
+            // snapshot was supplied.
+            const result = snapshot === undefined
+                ? await this.memoryService.getSessionWorkingState(safeSessionId)
+                : snapshot;
+            const records = Array.isArray(result?.records) ? result.records : [];
+            let budget = this.config.workingMemoryBudgetTokens;
+            const selected = [];
+            for (const record of records.slice(0, this.config.workingMemoryMaxItems)) {
+                const content = String(record.content || "");
+                const tokenCount = estimateTokens(content);
+                if (!content || tokenCount > budget) continue;
+                selected.push(new ContextPacket({
+                    content: content.startsWith("[工作记忆") ? content : `[工作记忆] ${content}`,
+                    timestamp: new Date(record.updated_at || record.created_at || Date.now()),
+                    tokenCount,
+                    relevanceScore: 1,
+                    metadata: {
+                        type: "working_memory",
+                        source: "working_memory",
+                        memory_type: "working",
+                        memory_id: record.id,
+                        memory_key: record.memory_key,
+                        session_id: record.session_id,
+                        status: record.status,
+                        expires_at: record.expires_at,
+                        snapshot_hash: record.metadata?.snapshot_hash,
+                        working_memory: true,
+                    },
+                }));
+                budget -= tokenCount;
+            }
+            packets.push(...selected);
+            this.lastWorkingMemoryRecall = {
+                enabled: true,
+                sessionId: safeSessionId,
+                scanned: records.length,
+                selected: selected.map((packet) => packet.metadata.memory_key),
+                selectedTokens: this.config.workingMemoryBudgetTokens - budget,
+            };
+        } catch (error) {
+            this.lastWorkingMemoryRecall = { enabled: true, sessionId: safeSessionId, error: "working_memory_unavailable" };
+            console.warn("[contextBuilder][working] query unavailable", error?.message || error);
+        }
+    }
+
     // ── Stage 1: Gather ──
     _gather(userQuery, conversationHistory, systemInstructions, customPackets) {
         const packets = [];
@@ -418,11 +743,14 @@ export class ContextBuilder {
         if (Array.isArray(conversationHistory) && conversationHistory.length > 0) {
             const recentHistory = conversationHistory.slice(-this.config.maxHistoryTurns * 2); // 每轮 user+assistant
             for (const msg of recentHistory) {
+                const isSummary = workingMemoryEnabled()
+                    && msg.role === "system"
+                    && String(msg.content || "").startsWith("[上下文压缩摘要");
                 packets.push(new ContextPacket({
-                    content: `${msg.role || "unknown"}: ${msg.content || ""}`,
+                    content: isSummary ? `[历史摘要] ${msg.content || ""}` : `${msg.role || "unknown"}: ${msg.content || ""}`,
                     timestamp: msg.timestamp ? new Date(msg.timestamp) : new Date(),
                     relevanceScore: 0.6, // 历史消息基础相关性
-                    metadata: { type: "conversation_history", role: msg.role },
+                    metadata: { type: isSummary ? "history_summary" : "conversation_history", role: msg.role },
                 }));
             }
         }
@@ -440,6 +768,27 @@ export class ContextBuilder {
     }
 
     // ── Stage 2: Select ──
+    _selectWorkingPackets(packets, availableTokens) {
+        const order = new Map([
+            ["working_current_goal", 0],
+            ["working_constraints", 1],
+            ["working_progress", 2],
+            ["working_next_step", 3],
+        ]);
+        const selected = [];
+        let tokens = 0;
+        const budget = Math.min(availableTokens, this.config.workingMemoryBudgetTokens);
+        const ordered = [...(packets || [])].sort((left, right) =>
+            (order.get(left.metadata?.memory_key) ?? 99) - (order.get(right.metadata?.memory_key) ?? 99));
+        for (const packet of ordered) {
+            if (selected.length >= this.config.workingMemoryMaxItems) break;
+            if (tokens + packet.tokenCount > budget) continue;
+            selected.push(packet);
+            tokens += packet.tokenCount;
+        }
+        return { selected, tokens };
+    }
+
     _select(packets, userQuery, availableTokens) {
         if (packets.length === 0) return [];
 
@@ -449,7 +798,8 @@ export class ContextBuilder {
         // should always see the code the user explicitly attached.
         const systemPackets = packets.filter(p => p.metadata.type === "system_instruction");
         const repoPackets = packets.filter(p => p.metadata.type === "repo");
-        const otherPackets = packets.filter(p => p.metadata.type !== "system_instruction" && p.metadata.type !== "repo");
+        const workingPackets = packets.filter(p => p.metadata.type === "working_memory");
+        const otherPackets = packets.filter(p => p.metadata.type !== "system_instruction" && p.metadata.type !== "repo" && p.metadata.type !== "working_memory");
 
         // 系统指令 + 仓库代码占用的 token
         const systemTokens = systemPackets.reduce((sum, p) => sum + p.tokenCount, 0);
@@ -464,17 +814,23 @@ export class ContextBuilder {
             return selected;
         }
 
+        const working = this._selectWorkingPackets(workingPackets, availableTokens - currentTokens);
+        selected.push(...working.selected);
+        currentTokens += working.tokens;
+
         // 计算综合得分
         const scored = [];
         for (const packet of otherPackets) {
-            // 更新相关性得分（如果还是默认值 0.5）
-            if (packet.relevanceScore === 0.5) {
+            const memoryRecallFinal = memoryTypeAwareScoringEnabled() && packet.metadata?.memoryRecallFinal === true;
+            // A type-aware recall score is already the memory-stage final score;
+            // do not reinterpret it as relevance or add recency a second time.
+            if (!memoryRecallFinal && packet.relevanceScore === 0.5) {
                 packet.relevanceScore = calculateRelevance(packet.content, userQuery);
             }
-            const recency = calculateRecency(packet.timestamp);
-            const combinedScore =
-                this.config.relevanceWeight * packet.relevanceScore +
-                this.config.recencyWeight * recency;
+            const recency = memoryRecallFinal ? 0 : calculateRecency(packet.timestamp);
+            const combinedScore = memoryRecallFinal
+                ? packet.relevanceScore
+                : this.config.relevanceWeight * packet.relevanceScore + this.config.recencyWeight * recency;
 
             // 过滤低于最低相关性阈值的信息
             if (packet.relevanceScore >= this.config.minRelevance) {
@@ -533,10 +889,21 @@ export class ContextBuilder {
         // [Task] — 当前任务
         sections.push("## 当前任务\n" + userQuery);
 
-        // [State] — 上下文状态（记忆 + 笔记）
+        // [State] — 当前工作状态优先；普通 memory 仍表示长期记忆。
+        const workingPackets = [...(byType["working_memory"] || [])];
+        if (workingPackets.length > 0) {
+            sections.push("## [State] 当前工作状态\n" + workingPackets.map(p => p.content).join("\n"));
+        }
         const statePackets = [...(byType["memory"] || [])];
         if (statePackets.length > 0) {
-            sections.push("## 上下文状态\n" + statePackets.map(p => p.content).join("\n"));
+            sections.push(workingPackets.length > 0
+                ? "## 长期记忆（用户过去发生的事件和长期偏好）\n" + statePackets.map(p => p.content).join("\n")
+                : "## 上下文状态\n" + statePackets.map(p => p.content).join("\n"));
+        }
+
+        const summaryPackets = [...(byType["history_summary"] || [])];
+        if (summaryPackets.length > 0) {
+            sections.push("## 历史摘要（之前讨论了什么）\n" + summaryPackets.map(p => p.content).join("\n"));
         }
 
         // [Context] — 对话历史

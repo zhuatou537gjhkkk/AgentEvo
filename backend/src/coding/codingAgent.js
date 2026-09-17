@@ -30,6 +30,7 @@ import { defaultApprovalService } from "./approvals.js";
 import { codingWorkspaceEnabled, codingWriteToolsEnabled, codingBatchReadsEnabled, projectRagReuseEnabled } from "./flags.js";
 import { defaultProjectService } from "./projects.js";
 import { defaultOpScheduler } from "./opScheduler.js";
+import { pushReadObservation } from "./observationFeed.js";
 
 const CODE_BUDGET_DEFAULTS = Object.freeze({
     maxTurns: 8,            // decider calls before the loop halts
@@ -41,9 +42,13 @@ const CODE_BUDGET_DEFAULTS = Object.freeze({
 });
 
 function clampBudget(budget = {}) {
+    // The server resolver may intentionally return `budget: null` when no
+    // per-run override is configured. Treat null like the omitted value so the
+    // bounded coding loop always starts with safe defaults.
+    const source = budget ?? {};
     const out = { ...CODE_BUDGET_DEFAULTS };
     for (const key of Object.keys(CODE_BUDGET_DEFAULTS)) {
-        const value = budget[key];
+        const value = source[key];
         if (Number.isFinite(value)) out[key] = Math.max(1, Math.trunc(value));
     }
     return out;
@@ -56,6 +61,24 @@ function opSignature(op, args) {
 
 function newStepId(stepIndex) {
     return `step_${String(stepIndex + 1).padStart(2, "0")}`;
+}
+
+// A server-side completion guard for the simplest explicit mutation request.
+// This is intentionally independent of the LLM decider: a premature `done`
+// response must never make a create-file task look successful without a write.
+function requiredFileWrite(goal, steps) {
+    const text = String(goal || "");
+    if (!/(创建|新建|新增|create|添加).*(文件|file)/i.test(text)) return null;
+    const pathMatch = text.match(/[`「“\"]([^`」”\"]+)[`」”\"]/)
+        || text.match(/文件\s+([\w./-]+)(?=[，,。\s]|$)/i);
+    const contentMatch = text.match(/(?:(?:只)?写入(?:一行)?|内容(?:为|是)?|content\s*[:：])\s*[:：]?\s*[`「“"]([^`」”"]+)[`」”"]/i)
+        || text.match(/(?:(?:只)?写入(?:一行)?|内容(?:为|是)?|content\s*[:：])\s*[:：]?\s*([^。\n]+?)(?=。|$)/i);
+    if (!pathMatch || !contentMatch) return null;
+    const hasWrite = (steps || []).some((step) => step?.ok === true && ["write_file", "create_file", "apply_patch"].includes(String(step.op)));
+    // "创建一个文件 X" targets a BRAND-NEW path — the runner rejects write_file on a
+    // missing target ("write_file requires an existing file"), so a create intent
+    // must emit create_file or the guard would fail every turn until budget_halted.
+    return hasWrite ? null : { op: "create_file", args: { path: pathMatch[1].trim(), content: `${contentMatch[1]}\n` }, note: "落实用户要求创建文件" };
 }
 
 export class CodeAgentService {
@@ -125,6 +148,7 @@ export class CodeAgentService {
      */
     begin(scope, { run, project, goal, decide, budget = {}, onEvent = null } = {}) {
         const scoped = requireCodingScope(scope, "codingAgent");
+        console.log(`[coding][agent] begin run=${String(run?.id || "")} goal=${JSON.stringify(String(goal || "").slice(0, 160))} decider=${typeof decide}`);
         if (!run?.id) throw codingError("NOT_FOUND", "coding run not found", 404);
         if (!project?.id) throw codingError("NOT_FOUND", "coding project not found", 404);
         if (typeof decide !== "function") {
@@ -150,11 +174,33 @@ export class CodeAgentService {
             transcriptChars: 0,
             summary: null,
             finalResult: null,
+            // R5 — in-memory read observation feed (observationFeed.js). Lets a real
+            // LLM decider see recent read content. NEVER durable / never in steps /
+            // never in transcriptChars — only surfaced via ctx.observations.
+            observations: [],
         };
     }
 
     _emit(session, evt) {
         if (typeof session.onEvent === "function") session.onEvent(evt);
+    }
+
+    /**
+     * R5 — refresh the in-memory run snapshot from the run service after a write
+     * auto-provisioned (or otherwise mutated) the worktree. `capabilityRoot`
+     * (worktrees.js) decides "main vs worktree" purely from the run object it is
+     * handed, so a stale `session.run` captured at begin() would keep reads pinned
+     * to the main checkout even after the worktree exists.
+     */
+    _refreshRunState(session) {
+        try {
+            if (!this.runService || typeof this.runService.getRun !== "function") return;
+            if (!session?.run?.id) return;
+            const fresh = this.runService.getRun(session.scope, session.run.id);
+            if (fresh) session.run = fresh;
+        } catch {
+            // stub/offline runs (tests without a real run service row) → no-op.
+        }
     }
 
     _appendStep(session, step) {
@@ -204,7 +250,12 @@ export class CodeAgentService {
             this._checkBudgets(session);
             if (session.phase !== "running") break;
 
-            const decision = await session.decide(this._ctx(session));
+            const context = this._ctx(session);
+            const requiredWrite = requiredFileWrite(session.goal, session.steps);
+            console.log(`[coding][agent] turn=${session.turnCount} requiredWrite=${requiredWrite ? "yes" : "no"} steps=${session.steps.length}`);
+            const decision = requiredWrite
+                ? { type: "op", ...requiredWrite }
+                : await session.decide(context);
             if (!decision || typeof decision !== "object") {
                 session.phase = "failed";
                 session.haltReason = "invalidDecision";
@@ -329,6 +380,14 @@ export class CodeAgentService {
         // Reads execute immediately and are "observed".
         if (outcome?.effect === "read") {
             this._emit(session, { type: "op.observed", op, path: args.path || null });
+            // R5 — capture a bounded, in-memory snippet so a real LLM decider can
+            // see what it read. runOp returns {ok,effect,op,data} where `data` IS
+            // the read payload (readRunner.js / git.js shapes). Never durable.
+            session.observations = pushReadObservation(session.observations || [], {
+                op,
+                args,
+                data: outcome.data,
+            });
             return { effect: "read", op, ok: outcome.ok !== false };
         }
         // Write/exec: executed right away when server policy auto-approved.
@@ -339,6 +398,10 @@ export class CodeAgentService {
                 artifactId: outcome.artifact?.id || null,
                 op,
             });
+            // A trusted write auto-provisions the run worktree on first use; refresh
+            // the run snapshot so later reads (capabilityRoot) target the worktree
+            // and can actually see the change just written.
+            this._refreshRunState(session);
             return { effect: "write", op, ok: true, kind };
         }
         // Owner decision required → pause the loop with the pending action.
@@ -369,9 +432,22 @@ export class CodeAgentService {
             type: outcome.effect === "read" || kind === "op" ? "op" : "verify",
             op,
             note: note || null,
-            ...(outcome.errorCode ? { errorCode: outcome.errorCode } : {}),
         };
-        if (outcome.errorCode) step.ok = false;
+        // Stamp a definitive ok flag on EVERY executed step. Completion guards
+        // (requiredFileWrite here, inferRequiredFileWrite in llmDecider) treat a
+        // step with no `ok` as "not done" — so an executed write used to look
+        // unfinished and the create-file guard re-fired the SAME write every turn
+        // until the turn budget halted the session (budget_halted / maxTurns).
+        // Executed/observed → ok:true; awaiting owner decision or rejected/errored
+        // → ok:false.
+        if (outcome.errorCode) {
+            step.ok = false;
+            step.errorCode = outcome.errorCode;
+        } else if (outcome.awaiting === true || outcome.ok === false) {
+            step.ok = false;
+        } else {
+            step.ok = true;
+        }
         this._appendStep(session, step);
         this._checkBudgets(session, step);
     }
@@ -425,6 +501,9 @@ export class CodeAgentService {
             projectId: session.scope?.projectId ?? session.project?.id ?? null,
             retrieval: this.retrieval,
             retrievalEnabled: this._retrievalReuseEnabled(),
+            // R5 — recent read-op content (observationFeed.js), rendered to bounded
+            // text snippets. Top-level only: never folded into steps/transcript.
+            observations: Array.isArray(session.observations) ? [...session.observations] : [],
         };
     }
 

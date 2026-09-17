@@ -7,7 +7,7 @@
  *   { name, addVectors(rows), similaritySearch(queryVector, k, filter),
  *     removeByDocument(documentId), clear(projectId), stats(), invalidate() }
  *
- * Two adapters are provided under the same facade:
+ * Three adapters are provided under the same facade:
  *   - DurableVectorStore — per (owner,tenant,project) cosine index whose vectors
  *     are persisted in knowledge_chunks.embedding (JSON float arrays) and
  *     rebuilt lazily from the same DB after a restart (roadmap R4 DoD:
@@ -15,12 +15,27 @@
  *     vector's durable copy is written by the knowledge store first.
  *   - InMemoryVectorStore — plain in-memory cosine store used as the reference /
  *     unit-test adapter and as the "memory adapter" side of dual-read compares.
+ *   - FaissVectorStore — persistent per-scope faiss-node IndexFlatIP derived
+ *     index. It L2-normalizes vectors and hydrates every label through SQLite;
+ *     FlatIP is exact but exhaustive O(N), not an ANN/HNSW implementation.
  *
  * Both are deterministic, network-free, and do NOT embed text: embedding
  * inference is the caller's (embedder) job, keeping storage pure. Scores are
  * cosine similarity in [-1, 1]; retrieval layers map to their own 0..1 score.
  */
-import { normalizeKnowledgeScope, requireKnowledgeProject, getEmbeddedActiveChunks } from "./knowledgeStore.js";
+import {
+    normalizeKnowledgeScope,
+    requireKnowledgeProject,
+    getEmbeddedActiveChunks,
+    getKnowledgeIndexGeneration,
+} from "./knowledgeStore.js";
+import {
+    FaissVectorStore,
+    getFaissVectorStore,
+    invalidateFaissStore,
+    clearFaissStoreCache,
+} from "./faissVectorStore.js";
+import { ragFaissReadEnabled } from "./flags.js";
 
 export const VECTOR_STORE_CONTRACT = Object.freeze([
     "name", "addVectors", "similaritySearch", "removeByDocument", "clear", "stats", "invalidate",
@@ -81,8 +96,9 @@ function projectKey(scope, projectId) {
 /**
  * DB-backed per-project cosine index. Loads active embedded chunks lazily from
  * the knowledge store (so a fresh process rebuilds on first search), then keeps
- * an incremental in-memory cache. Call `invalidate()` after a document write so
- * the next search re-reads durable rows.
+ * an incremental in-memory cache. The generation check is the cross-process
+ * coherence path; invalidate() remains a local fast path for same-process
+ * callers and is not required for correctness.
  */
 export class DurableVectorStore {
     constructor({ scope, projectId, store = null, lazy = true } = {}) {
@@ -96,16 +112,42 @@ export class DurableVectorStore {
         this.lazy = lazy !== false;
         this.entries = [];
         this.loaded = false;
+        this.generation = -1;
         this._version = 0;
     }
 
-    _ensureLoaded() {
-        if (this.loaded) return;
-        const rows = this.store.getEmbeddedActiveChunks(
-            { ownerUserId: this.ownerUserId, tenantId: this.tenantId },
-            this.projectId,
-            { limit: 100000 },
-        );
+    _readGeneration() {
+        const reader = this.store.getKnowledgeIndexGeneration || getKnowledgeIndexGeneration;
+        try {
+            return Number(reader(
+                { ownerUserId: this.ownerUserId, tenantId: this.tenantId },
+                this.projectId,
+            ) || 0);
+        } catch {
+            // A custom unit-test store may only implement the old vector read
+            // seam. Its local behavior remains valid without generation rows.
+            return this.generation < 0 ? 0 : this.generation;
+        }
+    }
+
+    _loadFromDurable(generation) {
+        const reader = this.store.getEmbeddedActiveChunks || getEmbeddedActiveChunks;
+        const rows = [];
+        let afterId = null;
+        const pageSize = 1000;
+        while (true) {
+            const page = reader(
+                { ownerUserId: this.ownerUserId, tenantId: this.tenantId },
+                this.projectId,
+                { afterId, limit: pageSize },
+            ) || [];
+            if (!Array.isArray(page) || page.length === 0) break;
+            rows.push(...page);
+            const ids = page.map((row) => Number(row?.id)).filter((id) => Number.isSafeInteger(id));
+            const lastId = ids.length ? Math.max(...ids) : afterId;
+            if (lastId == null || lastId === afterId || page.length < pageSize) break;
+            afterId = lastId;
+        }
         this.entries = (rows || [])
             .filter((row) => Array.isArray(row.embedding) && row.embedding.length > 0)
             .map((row) => ({
@@ -114,6 +156,11 @@ export class DurableVectorStore {
                 filePath: row.file_path,
                 fileName: row.file_name,
                 chunkIndex: row.chunk_index,
+                chunkLevel: row.chunk_level || "leaf",
+                parentChunkId: row.parent_chunk_id ?? null,
+                pageStart: row.page_start ?? null,
+                pageEnd: row.page_end ?? null,
+                headingPath: row.headingPath || [],
                 startLine: row.start_line,
                 endLine: row.end_line,
                 content: row.content,
@@ -121,13 +168,23 @@ export class DurableVectorStore {
                 vector: toVectorArray(row.embedding),
             }))
             .filter((entry) => entry.vector && entry.vector.length > 0);
+        // Build the replacement array completely before publishing it. A
+        // concurrent query therefore sees either the old or the new snapshot.
         this.loaded = true;
+        this.generation = generation;
         this._version += 1;
+    }
+
+    _ensureLoaded() {
+        const generation = this._readGeneration();
+        if (this.loaded && this.generation === generation) return;
+        this._loadFromDurable(generation);
     }
 
     invalidate() {
         this.loaded = false;
         this.entries = [];
+        this.generation = -1;
         this._version += 1;
     }
 
@@ -152,6 +209,11 @@ export class DurableVectorStore {
                 filePath: row.filePath ?? row.file_path,
                 fileName: row.fileName ?? row.file_name,
                 chunkIndex: row.chunkIndex ?? row.chunk_index,
+                chunkLevel: row.chunkLevel ?? row.chunk_level ?? "leaf",
+                parentChunkId: row.parentChunkId ?? row.parent_chunk_id ?? null,
+                pageStart: row.pageStart ?? row.page_start ?? null,
+                pageEnd: row.pageEnd ?? row.page_end ?? null,
+                headingPath: row.headingPath || [],
                 startLine: row.startLine ?? row.start_line,
                 endLine: row.endLine ?? row.end_line,
                 content: row.content,
@@ -195,6 +257,7 @@ export class DurableVectorStore {
             projectId: this.projectId,
             chunkCount: this.entries.length,
             loaded: this.loaded,
+            generation: this.generation,
             version: this._version,
             dimension: dims.length ? Math.min(...dims) : 0,
             hasEmbeddings: dims.length > 0,
@@ -227,6 +290,18 @@ export function clearDurableStoreCache() {
     storeCache.clear();
 }
 
+/**
+ * Select the durable vector reader at call time. The default remains the
+ * SQLite-backed JavaScript cosine adapter; enabling FAISS is an explicit
+ * server-side canary and never changes the legacy LangChain adapter.
+ */
+export function getConfiguredVectorStore({ scope, projectId, store = null } = {}) {
+    if (ragFaissReadEnabled()) {
+        return getFaissVectorStore({ scope, projectId, store });
+    }
+    return getDurableVectorStore({ scope, projectId, store });
+}
+
 // ────────────────────────── in-memory (reference/memory adapter) ──────────────────────────
 
 /** Deterministic in-memory cosine adapter — also the "memory adapter" in dual-read. */
@@ -252,6 +327,11 @@ export class InMemoryVectorStore {
                 filePath: row.filePath ?? row.file_path,
                 fileName: row.fileName ?? row.file_name,
                 chunkIndex: row.chunkIndex ?? row.chunk_index,
+                chunkLevel: row.chunkLevel ?? row.chunk_level ?? "leaf",
+                parentChunkId: row.parentChunkId ?? row.parent_chunk_id ?? null,
+                pageStart: row.pageStart ?? row.page_start ?? null,
+                pageEnd: row.pageEnd ?? row.page_end ?? null,
+                headingPath: row.headingPath || [],
                 startLine: row.startLine ?? row.start_line,
                 endLine: row.endLine ?? row.end_line,
                 content: row.content,
@@ -298,16 +378,22 @@ export class InMemoryVectorStore {
 
 /**
  * Factory (roadmap R4 #3 facade): `kind: "durable"` returns the shared DB-backed
- * store; `kind: "memory"` returns a fresh in-memory reference store.
+ * store; `kind: "faiss"` returns the shared persistent derived index; and
+ * `kind: "memory"` returns a fresh in-memory reference store.
  */
 export function createVectorStoreAdapter({ kind = "durable", scope = null, projectId = null, store = null } = {}) {
     if (kind === "memory") return new InMemoryVectorStore({ scope, projectId });
     if (kind === "durable") return getDurableVectorStore({ scope, projectId, store });
+    if (kind === "faiss") return getFaissVectorStore({ scope, projectId, store });
     throw new Error(`unknown vector store adapter kind: ${kind}`);
 }
 
+export { FaissVectorStore, getFaissVectorStore, invalidateFaissStore, clearFaissStoreCache };
+
 export default {
     VECTOR_STORE_CONTRACT, cosineSimilarity, toVectorArray,
-    DurableVectorStore, InMemoryVectorStore,
-    getDurableVectorStore, invalidateDurableStore, clearDurableStoreCache, createVectorStoreAdapter,
+    DurableVectorStore, FaissVectorStore, InMemoryVectorStore,
+    getDurableVectorStore, getFaissVectorStore, getConfiguredVectorStore,
+    invalidateFaissStore, clearFaissStoreCache,
+    invalidateDurableStore, clearDurableStoreCache, createVectorStoreAdapter,
 };

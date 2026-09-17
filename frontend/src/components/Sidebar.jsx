@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useChatStore } from '../store/chatStore';
+import { openSettings } from './settings/navigation';
 
 export default function Sidebar({ className = '', onAfterSelect, activeView = 'chat', onViewChange }) {
     const [keyword, setKeyword] = useState('');
@@ -17,7 +18,6 @@ export default function Sidebar({ className = '', onAfterSelect, activeView = 'c
     const renameSession = useChatStore((state) => state.renameSession);
     const deleteSession = useChatStore((state) => state.deleteSession);
     const toggleSessionPin = useChatStore((state) => state.toggleSessionPin);
-    const toggleSettings = useChatStore((state) => state.toggleSettings);
     const toggleEvalDashboard = useChatStore((state) => state.toggleEvalDashboard);
     const toggleObservability = useChatStore((state) => state.toggleObservability);
     const exportCurrentSessionMarkdown = useChatStore((state) => state.exportCurrentSessionMarkdown);
@@ -121,6 +121,9 @@ export default function Sidebar({ className = '', onAfterSelect, activeView = 'c
                     <button type="button" onClick={() => onViewChange?.('observability')} className={`sidebar-nav-item ${activeView === 'observability' ? 'is-active' : ''}`}>
                         <span aria-hidden="true">⌁</span><span>运行观测</span>
                     </button>
+                    <button type="button" onClick={() => onViewChange?.('skills')} className={`sidebar-nav-item ${activeView === 'skills' ? 'is-active' : ''}`}>
+                        <span aria-hidden="true">✦</span><span>技能库</span>
+                    </button>
                 </nav>
 
                 {sessionError && (
@@ -173,7 +176,7 @@ export default function Sidebar({ className = '', onAfterSelect, activeView = 'c
                         <span className="upgrade-link">了解更多 ↗</span>
                     </div>
                     <div className="sidebar-footer-actions">
-                        <button type="button" onClick={toggleSettings}><span aria-hidden="true">⚙</span>设置</button>
+                        <button type="button" onClick={() => openSettings(onViewChange)}><span aria-hidden="true">⚙</span>设置</button>
                         <button type="button" onClick={exportCurrentSessionMarkdown} disabled={isExporting}><span aria-hidden="true">⇩</span>{isExporting ? '导出中' : '导出'}</button>
                     </div>
                 </div>

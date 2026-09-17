@@ -15,7 +15,7 @@ import {
     frameGitDiff,
     worktreeStatusLabel,
 } from '../utils/workspaceModel';
-import { setPendingRepoContext } from './chatStore';
+import { setPendingRepoContext, clearPendingRepoContext, setPendingCodingRunId } from './chatStore';
 
 const EMPTY_VIEWER = {
     path: null,
@@ -31,6 +31,21 @@ const EMPTY_VIEWER = {
 
 function viewerWith(base, patch) {
     return { ...EMPTY_VIEWER, ...base, ...patch };
+}
+
+/** Status letter for one porcelain entry (A 新增 / M 修改 / D 删除 / R 重命名). */
+function runChangeFromEntry(entry) {
+    const x = String((entry && entry.x) || '');
+    const y = String((entry && entry.y) || '');
+    const p = String((entry && entry.path) || '');
+    if (!p) return null;
+    const renameTo = String((entry && entry.renameTo) || '');
+    if (x === '?' && y === '?') return { path: p, status: 'A', isNew: true };
+    if (x === 'R' || renameTo) return { path: renameTo || p, status: 'R', isNew: false, origPath: renameTo ? p : null };
+    const letter = y && y !== ' ' ? y : x;
+    if (letter === 'D') return { path: p, status: 'D', isNew: false };
+    if (letter === 'A') return { path: p, status: 'A', isNew: true };
+    return { path: p, status: 'M', isNew: false };
 }
 
 const initial = {
@@ -85,6 +100,7 @@ const initial = {
     runArtifacts: { items: [], loading: false, error: null },
     runGit: { status: null, loading: false, error: null },
     runDiff: { text: '', filesChanged: [], truncated: false, byteLength: null, loading: false, error: null },
+    runChanges: { runId: null, files: [], loading: false, error: null },
     runFileView: { path: null, lines: [], startLine: 1, lineCount: 0, truncated: false, loading: false, error: null },
     pendingRunOps: {},          // runId → { actionId, approvalId, op, args } live args for a paused action
     lastCommandOutputs: [],     // newest first, capped; live stdout/stderr after an approved exec
@@ -92,6 +108,11 @@ const initial = {
     // attach chip
     attach: null,
     attachLabel: null,
+
+    // Phase 7 / R2 — coding-run delegated to the next chat message. Mirrors the
+    // repo attach chip: sets the chat's pending coding_run_id + shows a removable
+    // panel chip. Auto-cleared when the delegated run turns terminal.
+    codingRunAttach: null,
 
     // toast
     toastKind: null,
@@ -112,6 +133,7 @@ const EMPTY_RUN_CONTROL = {
     runArtifacts: { items: [], loading: false, error: null },
     runGit: { status: null, loading: false, error: null },
     runDiff: { text: '', filesChanged: [], truncated: false, byteLength: null, loading: false, error: null },
+    runChanges: { runId: null, files: [], loading: false, error: null },
     runFileView: { path: null, lines: [], startLine: 1, lineCount: 0, truncated: false, loading: false, error: null },
     pendingRunOps: {},
     lastCommandOutputs: [],
@@ -126,7 +148,9 @@ export const useWorkspaceStore = create((set, get) => {
 
     const fail = (error) => friendlyWorkspaceError(error);
 
-    const resetProjectState = () => set({
+    const resetProjectState = () => {
+        clearPendingRepoContext();
+        return set({
         ...EMPTY_RUN_CONTROL,
         workspace: null,
         openError: null,
@@ -140,7 +164,8 @@ export const useWorkspaceStore = create((set, get) => {
         search: { ...initial.search },
         git: { status: null, error: null },
         diff: { text: '', path: null, staged: false, filesChanged: [], truncated: false, error: null },
-    });
+        });
+    };
 
     const loadProjects = async () => {
         set({ projectsLoading: true, projectsError: null });
@@ -167,6 +192,9 @@ export const useWorkspaceStore = create((set, get) => {
             const facts = body.workspace || null;
             set({ workspace: facts, openingProject: false });
             await get().loadTree('', 2);
+            // 打开即拉一次真实仓库 git 状态，让 FilesSection 的"工作区改动"指示条常驻可用
+            //（agent/其它进程在仓库里留下的改动无需等 land/手动刷新即可看到）。
+            if (facts && facts.isRepo) await get().loadGitStatus();
         } catch (error) {
             set({ openingProject: false, openError: fail(error), workspace: null });
             resetProjectState();
@@ -184,6 +212,17 @@ export const useWorkspaceStore = create((set, get) => {
                 set({ capabilities: body.capabilities || null, capabilitiesError: null });
                 if (body.capabilities?.workspace) {
                     await get().loadProjects();
+                    // 刷新/重登后 workspaceStore 是运行态（不持久化），loadProjects 只会把
+                    // 默认项目塞进 selectedProjectId 却不会打开它。若已有选中项目、项目是
+                    // trusted 且工作区尚未打开，这里自动补一次 openProjectFlow，避免「顶部
+                    // 显示已选中项目、文件树却停留在请先选择并信任项目」的矛盾空态（刷新后
+                    // 死锁：下拉再点同一 id 会被 setSelectedProject 的相同 id 早退吞掉）。
+                    // 未 trusted 的项目不自动打开，保留「信任并打开」按钮让用户显式信任。
+                    const { selectedProjectId: autoId, workspace: currentWorkspace, projects: autoProjects } = get();
+                    const autoProject = autoProjects.find((p) => p.id === autoId);
+                    if (autoId && !currentWorkspace && autoProject?.trusted) {
+                        await get().openProjectFlow(autoId);
+                    }
                 }
             } catch (error) {
                 set({ capabilities: null, capabilitiesError: fail(error) });
@@ -387,6 +426,7 @@ export const useWorkspaceStore = create((set, get) => {
             try {
                 const body = await workspaceApi.listRuns({ projectId: id });
                 set({ runs: { items: body.runs || [], loading: false, error: null } });
+                get().syncCodingRunAttach(body.runs || []);
             } catch (error) {
                 set({ runs: { items: [], loading: false, error: fail(error) } });
             }
@@ -477,6 +517,7 @@ export const useWorkspaceStore = create((set, get) => {
                 const body = await workspaceApi.fetchRun(id);
                 const run = body.run || null;
                 set({ runDetail: run, runDetailLoading: false });
+                get().syncCodingRunAttach(run);
             } catch (error) {
                 set({ runDetailLoading: false, runDetailError: fail(error) });
             }
@@ -485,7 +526,12 @@ export const useWorkspaceStore = create((set, get) => {
                 get().reloadRunApprovals(id),
                 get().reloadRunArtifacts(id),
             ]);
-            get().loadRunEvents(id);
+            // Event replay is an optional capability. Do not request the endpoint
+            // when the server has it disabled (the normal local setup), otherwise
+            // every run refresh produces a noisy, expected 403 in the browser.
+            if (get().capabilities?.eventLog === true) {
+                get().loadRunEvents(id);
+            }
             return get().runDetail;
         },
         async reloadRunActions(runId) {
@@ -634,6 +680,127 @@ export const useWorkspaceStore = create((set, get) => {
                 return null;
             } finally {
                 set({ runOpsBusy: false });
+            }
+        },
+
+        /**
+         * Apply a COMPLETED run's disposable-worktree changes to the REAL project
+         * checkout's working tree (no commit). Server re-checks trust/allowed
+         * roots + applies a conflict-checked patch. Returns the landed summary or
+         * null on failure (toast shows the error).
+         */
+        async landToMain(runId) {
+            const id = String(runId || '');
+            if (!id) return null;
+            set({ runOpsBusy: true });
+            try {
+                const body = await workspaceApi.landRunToMain(id);
+                const c = body?.counts || {};
+                showToast(
+                    `已应用到真实代码工作区（未提交）：新增 ${c.added || 0} · 修改 ${c.modified || 0} · 删除 ${c.deleted || 0}`,
+                    'ok',
+                );
+                await get().loadRuns();
+                return body;
+            } catch (error) {
+                showToast(fail(error), 'error');
+                return null;
+            } finally {
+                set({ runOpsBusy: false });
+            }
+        },
+
+        /**
+         * Land 成功后的真实工作区刷新（由 CodingAgentSection 的 doLand 主动调用）：
+         * 把文件树重置到根目录 depth 2 —— 等价于一次手动刷新能看到的范围。旧版在
+         * landToMain 内部用「当前 treeBase/treeDepth」视口刷新，落在子树/深度之外的
+         * 新文件永远不出现，是"必须手动刷新浏览器才看到文件"的根因。同时重拉真实仓库
+         * git 状态，驱动 FilesSection 的"工作区改动"指示条。与 runChanges 的重拉解耦：
+         * 那是 run 工作树的审查数据，这里只刷真实 checkout。
+         */
+        async refreshAfterLand() {
+            if (!get().selectedProjectId) return;
+            await get().loadTree('', 2);
+            await get().loadGitStatus();
+        },
+
+        /** Lightweight delegated-run status poll (single run fetch; no heavy pulls). */
+        async pollCodingRun(runId) {
+            const id = String(runId || '');
+            if (!id) return null;
+            try {
+                const body = await workspaceApi.fetchRun(id);
+                const run = body?.run || null;
+                if (run) {
+                    set({ runDetail: run });
+                    get().syncCodingRunAttach(run);
+                }
+                return run;
+            } catch (error) {
+                return null;
+            }
+        },
+
+        /**
+         * Build the run's reviewable change list from its disposable worktree:
+         * git.status porcelain → A/M/D/R per file; modified/deleted/renamed files
+         * get their per-file diff hunks, brand-new (untracked) files get their full
+         * content. Uses only existing run-scoped read ops (git.status / git.diff /
+         * read_file at the worktree root) — no new backend surface. Read-only and
+         * independent of the runOpsBusy write gate. `force` bypasses the cached
+         * result (the run finished → re-pull).
+         */
+        async loadRunChanges(runId, { force = false } = {}) {
+            const id = String(runId || '');
+            if (!id) return null;
+            const prev = get().runChanges || {};
+            if (!force && prev.loading) return prev;
+            if (!force && prev.runId === id && (prev.files || []).length > 0) return prev;
+            set({ runChanges: { runId: id, files: [], loading: true, error: null } });
+            try {
+                const statusBody = await workspaceApi.runRunOp(id, 'git.status', {});
+                const entries = Array.isArray(statusBody?.data?.entries) ? statusBody.data.entries : [];
+                const files = [];
+                for (const entry of entries) {
+                    const row = runChangeFromEntry(entry);
+                    if (row) files.push(row);
+                }
+                const BODY_CAP = 15;
+                const capped = files.slice(0, BODY_CAP);
+                for (const f of capped) {
+                    try {
+                        if (f.status === 'A') {
+                            const r = await workspaceApi.runRunOp(id, 'read_file', { path: f.path, start_line: 1, max_lines: 600 });
+                            const d = r?.data || {};
+                            f.body = (Array.isArray(d.lines) ? d.lines : []).join('\n');
+                            f.truncated = d.truncated === true;
+                            f.bodyIsDiff = false;
+                        } else {
+                            const r = await workspaceApi.runRunOp(id, 'git.diff', { path: f.path });
+                            const d = r?.data || {};
+                            f.body = String(d.diff || '');
+                            f.truncated = d.truncated === true;
+                            f.bodyIsDiff = true;
+                            // An un-staged worktree rename can leave an empty plain
+                            // diff even though the target file exists → show content.
+                            if (!f.body && f.status === 'R') {
+                                const rr = await workspaceApi.runRunOp(id, 'read_file', { path: f.path, start_line: 1, max_lines: 600 });
+                                const dd = rr?.data || {};
+                                f.body = (Array.isArray(dd.lines) ? dd.lines : []).join('\n');
+                                f.truncated = dd.truncated === true;
+                                f.bodyIsDiff = false;
+                            }
+                        }
+                    } catch (e) {
+                        f.bodyError = friendlyWorkspaceError(e);
+                    }
+                }
+                const moreCount = files.length > BODY_CAP ? files.length - BODY_CAP : 0;
+                set({ runChanges: { runId: id, files, loading: false, error: null, moreCount } });
+                return files;
+            } catch (error) {
+                set({ runChanges: { runId: id, files: [], loading: false, error: friendlyWorkspaceError(error) } });
+                return [];
             }
         },
 
@@ -846,20 +1013,54 @@ export const useWorkspaceStore = create((set, get) => {
             }
             setPendingRepoContext(ref);
             set({ attach: ref, attachLabel: lineWindowLabel(v.path, start, end) });
+            console.log('[diag:attach] attachCurrentView → setPendingRepoContext:', JSON.stringify(ref).slice(0, 200));
             showToast(`已附加引用 ${lineWindowLabel(v.path, start, end)}，将在下一条消息中作为仓库上下文发送`, 'ok');
         },
         attachWholeFile(path) {
             const id = get().selectedProjectId;
             if (!id || !path) return;
-            const ref = buildRepoContextRef({ projectId: id, path, startLine: 1, endLine: 2000 });
+            const ref = buildRepoContextRef({ projectId: id, path, mode: 'whole_file' });
             if (!ref) return;
             setPendingRepoContext(ref);
-            set({ attach: ref, attachLabel: lineWindowLabel(path, 1, 2000) });
-            showToast(`已附加引用 ${lineWindowLabel(path, 1, 2000)}`, 'ok');
+            set({ attach: ref, attachLabel: `${path}（整文件，Agent 可按需读取）` });
+            showToast(`已附加整文件 ${path}，Agent 将在下一条消息中按需分页读取`, 'ok');
         },
         clearAttach() {
             setPendingRepoContext(null);
             set({ attach: null, attachLabel: null });
+        },
+
+        // ── Phase 7 / R2: delegate a trusted coding run to the next chat message ──
+        // The chat turn drives the run's auto-decider (server-authorized, reads +
+        // writes into the run's disposable worktree, no commands). Only trusted +
+        // ready + non-terminal runs qualify — mirroring resolveCodingRunTask.
+        attachCodingRun(run) {
+            const id = String(run?.id || '');
+            const preset = String(run?.mode || run?.preset || '');
+            const terminal = ['completed', 'failed', 'cancelled'].includes(String(run?.status));
+            if (!id || preset !== 'trusted' || terminal || run?.worktreeStatus !== 'ready') {
+                showToast('仅 trusted 且工作树就绪、非终态的 run 可委托给对话', 'error');
+                return;
+            }
+            setPendingCodingRunId(id);
+            set({ codingRunAttach: { runId: id } });
+            console.log('[diag:attach] attachCodingRun → setPendingCodingRunId:', id);
+            showToast('已委托给对话：下一条聊天消息将驱动该 run 自动改代码（trusted 写入工作树，不跑命令）', 'ok');
+        },
+        clearCodingRunAttach() {
+            setPendingCodingRunId(null);
+            set({ codingRunAttach: null });
+        },
+        /** Clear the delegated-run chip when its run turns terminal (idempotent). */
+        syncCodingRunAttach(runsOrRun) {
+            const attach = get().codingRunAttach;
+            if (!attach?.runId) return;
+            const list = Array.isArray(runsOrRun) ? runsOrRun : (runsOrRun ? [runsOrRun] : []);
+            const hit = list.find((r) => r && String(r?.id) === String(attach.runId));
+            if (hit && ['completed', 'failed', 'cancelled'].includes(String(hit.status))) {
+                setPendingCodingRunId(null);
+                set({ codingRunAttach: null });
+            }
         },
         clearToast() {
             set({ toastKind: null, toastText: null });

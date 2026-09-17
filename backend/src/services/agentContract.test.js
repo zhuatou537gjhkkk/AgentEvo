@@ -218,6 +218,16 @@ describe("toAgentResult / mergeAgentResults — provenance result contract", () 
         results = mergeAgentResults(results, { "1": { text: "a2" } });
         expect(results).toEqual({ "1": { text: "a2" }, "2": { text: "b" } });
     });
+
+    it("explicitly resets stale packets at a new plan generation", () => {
+        const old = { "1": { status: "completed", text: "old output" } };
+        const reset = mergeAgentResults(old, { __reset: true, __generation: 2 });
+        expect(reset).toEqual({ __generation: 2 });
+        expect(mergeAgentResults(reset, { "1": { status: "completed", text: "new output" } })).toEqual({
+            __generation: 2,
+            "1": { status: "completed", text: "new output" },
+        });
+    });
 });
 
 describe("legacy + cross-agent detection", () => {

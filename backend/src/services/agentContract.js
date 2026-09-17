@@ -22,7 +22,11 @@ export const SUBTASK_TYPES = Object.freeze(["agent", "tool", "reasoning"]);
 export const SUBTASK_AGENTS = Object.freeze(["search", "knowledge", "code", "general"]);
 export const SUBTASK_STATUS = Object.freeze([
     "pending", "in_progress", "completed", "blocked", "error", "failed",
-    "skipped", "waiting_approval",
+    "skipped", "waiting_approval", "cancelled", "interrupted",
+]);
+
+export const SUBTASK_TERMINAL = Object.freeze([
+    "completed", "blocked", "error", "failed", "skipped", "cancelled", "interrupted",
 ]);
 
 /** Terminal statuses that a downstream dependency can never satisfy. */
@@ -349,7 +353,31 @@ export function toAgentResult({ agentType, subTaskId, source = null, status = "c
 /** agentResults merge-reducer for LangGraph (per-subTaskId overwrite). */
 export function mergeAgentResults(current = {}, update = null) {
     if (!update || typeof update !== "object") return current;
-    return { ...(current || {}), ...update };
+    // Generation reset is emitted only by the R7 planner before a full replan.
+    // It prevents same task ids in the next plan from inheriting stale outcomes.
+    if (update.__reset === true) return { __generation: Number(update.__generation) || 0 };
+    const merged = { ...(current || {}) };
+    for (const [id, candidate] of Object.entries(update)) {
+        if (id === "__generation") continue;
+        if (!candidate || typeof candidate !== "object") continue;
+        const previous = merged[id];
+        if (!previous || typeof previous !== "object") {
+            merged[id] = candidate;
+            continue;
+        }
+        const previousTerminal = SUBTASK_TERMINAL.includes(previous.status);
+        const candidateTerminal = SUBTASK_TERMINAL.includes(candidate.status);
+        if (previousTerminal && !candidateTerminal) continue;
+        if (previousTerminal && candidateTerminal && previous.status !== candidate.status) {
+            // A terminal result is immutable unless an explicit numeric lifecycle version
+            // proves that the update belongs to a newer dispatch.
+            const pv = Number(previous.lifecycleVersion);
+            const cv = Number(candidate.lifecycleVersion);
+            if (!Number.isFinite(pv) || !Number.isFinite(cv) || cv <= pv) continue;
+        }
+        merged[id] = { ...previous, ...candidate };
+    }
+    return merged;
 }
 
 /** True when a plan carries any cross-agent dependency chain (executable→executable). */
